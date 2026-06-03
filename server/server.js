@@ -41,6 +41,7 @@ try {
   }
 } catch (_) { store = { epoch: crypto.randomUUID(), records: {} }; }
 if (!store.epoch) store.epoch = crypto.randomUUID();
+if (!('branding' in store)) store.branding = null; // {name, short, logo, motto} pushed by the app
 
 let saveTimer = null;
 function save() { if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = null; try { fs.writeFileSync(STORE, JSON.stringify(store)); } catch (_) {} }, 600); }
@@ -54,7 +55,9 @@ if (createPortal) {
   try {
     portal = createPortal({
       all: allEntity, one: oneEntity, getVersion: () => storeVersion, secret: SYNC_TOKEN || 'unibursar-portal',
-      institution: () => ({ name: process.env.INSTITUTION_NAME || 'UniBursar University', short: process.env.INSTITUTION_SHORT || 'UBU', logo: process.env.INSTITUTION_LOGO || '', motto: process.env.INSTITUTION_MOTTO || '' }),
+      institution: () => (store.branding && store.branding.name)
+        ? store.branding
+        : { name: process.env.INSTITUTION_NAME || 'UniBursar University', short: process.env.INSTITUTION_SHORT || 'UBU', logo: process.env.INSTITUTION_LOGO || '', motto: process.env.INSTITUTION_MOTTO || '' },
     });
   } catch (e) { console.error('[UniBursar] portal init failed:', e.message); portal = null; }
 }
@@ -201,6 +204,15 @@ const server = http.createServer(async (req, res) => {
     }
     if (applied) { storeVersion = Date.now(); save(); }
     return send(res, 200, { ok: true, applied, epoch: store.epoch });
+  }
+
+  // the app pushes its institution name + logo so the portal/login page is branded
+  if (p === '/branding' && req.method === 'POST') {
+    if (!tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized.' });
+    const body = await readBody(req);
+    store.branding = { name: body.name || '', short: body.short || '', logo: body.logo || '', motto: body.motto || '' };
+    storeVersion = Date.now(); save();
+    return send(res, 200, { ok: true });
   }
 
   if (p === '/sync/pull' && req.method === 'GET') {

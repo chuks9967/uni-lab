@@ -325,6 +325,7 @@ module.exports = function createPortal(deps) {
 
     if (p === '/' && method === 'GET') { H(res, 200, PAGE); return true; }
     if (p === '/api/version' && method === 'GET') { J(res, 200, { version: getVersion() }); return true; }
+    if (p === '/api/branding' && method === 'GET') { const i = inst(); return J(res, 200, { ok: true, name: i.name, short: i.short, logo: i.logo, motto: i.motto }); }
 
     // ---- installable app assets + public clearance verification (no login) ----
     if (method === 'GET' && p === '/manifest.webmanifest') return S(res, 200, MANIFEST_PORTAL, 'application/manifest+json');
@@ -406,6 +407,13 @@ a{color:var(--brand)}
 .card{background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:0 20px 60px rgba(15,23,42,.12)}
 .lbox{width:380px;max-width:94vw;padding:30px}
 .lbox h1{margin:0 0 2px;font-size:22px;color:var(--navy)}.lbox .sub{color:var(--muted);font-size:13px;margin-bottom:18px}
+.brandhead{display:flex;gap:12px;align-items:center;margin-bottom:4px}
+.blogo{width:58px;height:58px;object-fit:contain;border-radius:14px;background:#fff;border:1px solid var(--line);padding:4px;flex:none}
+.blogo.mono{display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#1e3a8a,#4338ca);color:#fff;font-weight:800;font-size:19px;border:0}
+.uname{font-size:19px;font-weight:800;color:var(--navy);line-height:1.12}
+.umotto{font-size:11px;color:var(--muted);font-style:italic;margin-top:2px}
+.psub{font-size:13px;color:var(--brand);font-weight:700;margin:8px 0 16px}
+.hintbar{font-size:12px;color:var(--muted);text-align:center;margin-top:12px;line-height:1.5}
 .field{margin-bottom:12px}.field label{display:block;font-size:12px;font-weight:600;color:#334155;margin-bottom:5px}
 input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px}
 .btn{background:linear-gradient(135deg,#2563eb,#4338ca);color:#fff;border:0;border-radius:10px;padding:12px;font-weight:700;width:100%;cursor:pointer;font-size:14px}
@@ -442,14 +450,27 @@ function fmt(d){if(!d)return '—';try{return new Date(d).toLocaleDateString('en
 async function api(path,opts={}){opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});if(TOKEN)opts.headers.Authorization='Bearer '+TOKEN;const r=await fetch(path,opts);return r.json();}
 function logout(){TOKEN='';localStorage.removeItem('ubu_token');if(TIMER)clearInterval(TIMER);renderLogin();}
 
-function renderLogin(msg){
+function eh(s){return String(s==null?'':s).replace(/[&<>"]/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[m];});}
+async function renderLogin(msg){
+  let b={};try{b=await(await fetch('/api/branding')).json();}catch(_){}
+  const uname=eh(b.name||'University Portal');
+  const logo=b.logo?'<img class="blogo" src="'+b.logo+'" alt="logo">':'<div class="blogo mono">'+eh((b.short||'UB').slice(0,3))+'</div>';
   document.getElementById('app').innerHTML='';
-  const box=$('<div class="login"><div class="card lbox"><h1>Student & Staff Portal</h1><div class="sub">Sign in to view your fees, payments, receipts and payslips.</div><div class="err"></div><div class="field"><label>Username, matric no, staff no or email</label><input id="lg" autofocus></div><div class="field"><label>Password</label><input id="pw" type="password"></div><button class="btn" id="go">Sign In</button><div class="sub" style="margin-top:14px;text-align:center">Your login is emailed to you after registration.</div><div class="sub" style="margin-top:6px;text-align:center"><a href="/scan">🛡 Staff: open the Clearance Scanner →</a></div></div></div>');
+  const box=$('<div class="login"><div class="card lbox">'
+    +'<div class="brandhead">'+logo+'<div><div class="uname">'+uname+'</div>'+(b.motto?('<div class="umotto">'+eh(b.motto)+'</div>'):'')+'</div></div>'
+    +'<div class="psub">🎓 Student, Staff &amp; Lecturer Portal</div>'
+    +'<div class="err"></div>'
+    +'<div class="field"><label>Matric no · Staff no · Username · Email</label><input id="lg" autofocus autocomplete="username"></div>'
+    +'<div class="field"><label>Password</label><input id="pw" type="password" autocomplete="current-password"></div>'
+    +'<button class="btn" id="go">Sign In</button>'
+    +'<div class="hintbar">Your login is emailed to you after registration. Forgot it? Ask the bursary or registrar to resend your portal login.</div>'
+    +'<div class="sub" style="margin-top:10px;text-align:center"><a href="/scan">🛡 Staff: open the Clearance Scanner →</a></div>'
+    +'</div></div>');
   document.getElementById('app').appendChild(box);
   if(msg){const e=box.querySelector('.err');e.textContent=msg;e.style.display='block';}
   const go=async()=>{const login=box.querySelector('#lg').value.trim();const password=box.querySelector('#pw').value;if(!login||!password)return;const btn=box.querySelector('#go');btn.disabled=true;btn.textContent='Signing in…';const r=await api('/api/login',{method:'POST',body:JSON.stringify({login,password})});btn.disabled=false;btn.textContent='Sign In';if(!r.ok){const e=box.querySelector('.err');e.textContent=r.error||'Login failed.';e.style.display='block';return;}TOKEN=r.token;localStorage.setItem('ubu_token',TOKEN);renderApp();};
   box.querySelector('#go').onclick=go;
-  box.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',e=>{if(e.key==='Enter')go();}));
+  box.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',function(e){if(e.key==='Enter')go();}));
 }
 
 async function renderApp(){
