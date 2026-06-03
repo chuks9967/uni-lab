@@ -1,0 +1,17 @@
+{
+  "name": "unibursar-sync-hub",
+  "version": "1.0.0",
+  "private": true,
+  "description": "UniBursar central sync hub (zero-dependency REST). Optional email relay needs nodemailer.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {},
+  "optionalDependencies": {
+    "nodemailer": "^6.9.16"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
