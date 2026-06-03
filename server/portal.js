@@ -68,6 +68,9 @@ module.exports = function createPortal(deps) {
     for (const s of all('students')) {
       if ([s.portal_username, s.email, s.matric_no].some(v => (v || '').toLowerCase() === q)) return { kind: 'student', row: s, role: 'student' };
     }
+    for (const s of all('students')) {
+      if ([s.parent_portal_username, s.parent_email].some(v => (v || '').toLowerCase() === q)) return { kind: 'parent', row: s, role: 'parent' };
+    }
     for (const s of all('staff')) {
       if (s.is_active === 0) continue;
       if ([s.portal_username, s.email, s.staff_no].some(v => (v || '').toLowerCase() === q)) return { kind: 'staff', row: s, role: s.staff_type === 'lecturer' ? 'lecturer' : 'staff' };
@@ -75,9 +78,10 @@ module.exports = function createPortal(deps) {
     return null;
   }
   function accountById(kind, id) {
-    const entity = kind === 'user' ? 'users' : kind === 'student' ? 'students' : 'staff';
+    const entity = kind === 'user' ? 'users' : (kind === 'student' || kind === 'parent') ? 'students' : 'staff';
     return one(entity, id);
   }
+  function passField(kind, row) { return kind === 'parent' ? row.parent_portal_pass : row.portal_pass; }
 
   // ---- shared computations ----
   const nameOf = (entity, id) => { const r = id ? one(entity, id) : null; return r ? r.name : null; };
@@ -114,11 +118,26 @@ module.exports = function createPortal(deps) {
       const [category, currency] = k.split('|'); const owed = billed[k] - (paid[k] || 0);
       if (owed > 0.001) owingRows.push({ category, currency, billed: billed[k], paid: paid[k] || 0, outstanding: owed });
     }
+    const userName = (uid) => { const u = uid ? one('users', uid) : null; return u ? u.full_name : null; };
+    // exam clearance status: full clearance, else active partial, else not cleared
+    const clr = (() => {
+      const full = all('exam_clearances').find(c => c.student_id === s.id && c.status === 'completed');
+      if (full) return { cleared: true, type: 'full' };
+      const partial = all('partial_clearances').find(p => p.student_id === s.id && p.status === 'active');
+      if (partial) return { cleared: true, type: 'partial', reason: partial.reason };
+      const owes = Object.values(balancesFor(s.id)).some(v => v > 0.001);
+      return { cleared: false, type: null, reason: owes ? 'Outstanding fees not cleared' : 'No examination clearance issued' };
+    })();
+    const validations = all('exam_validations').filter(v => v.student_id === s.id)
+      .map(v => ({ status: v.status, reason: v.reason, exam_type: v.exam_type, date: v.created_at, session: nameOf('academic_sessions', v.session_id), semester: nameOf('semesters', v.semester_id) }))
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)));
     return {
       profile: studentProfile(s),
       balances: balancesFor(s.id),
-      charges: charges.map(c => ({ id: c.id, category: c.category, description: c.description, currency: c.currency, amount: c.amount, date: c.created_at })),
-      payments: pays.map(p => ({ id: p.id, receipt_no: p.receipt_no, category: p.category, currency: p.currency, amount: p.amount, method: p.method, date: p.decided_at || p.created_at, office: ROLE_OFFICE[p.raised_role] || 'Office of the Bursar' })),
+      examClearance: clr,
+      validations,
+      charges: charges.map(c => ({ id: c.id, category: c.category, description: c.description, currency: c.currency, amount: c.amount, date: c.created_at, by: userName(c.created_by) })),
+      payments: pays.map(p => ({ id: p.id, receipt_no: p.receipt_no, category: p.category, currency: p.currency, amount: p.amount, method: p.method, date: p.decided_at || p.created_at, office: ROLE_OFFICE[p.raised_role] || 'Office of the Bursar', collector: userName(p.decided_by || p.raised_by) })),
       outstanding: owingRows,
     };
   }
@@ -344,9 +363,10 @@ module.exports = function createPortal(deps) {
     if (p === '/api/login' && method === 'POST') {
       const body = await readBody();
       const acc = findAccount(body.login);
-      if (!acc || !verifyPass(body.password, acc.row.portal_pass)) return J(res, 200, { ok: false, error: 'Invalid login or password. (Officers: sign in to the desktop app once to activate your portal access.)' });
+      if (!acc || !verifyPass(body.password, passField(acc.kind, acc.row))) return J(res, 200, { ok: false, error: 'Invalid login or password. (Officers: sign in to the desktop app once to activate your portal access.)' });
       const token = sign({ k: acc.kind, id: acc.row.id, role: acc.role, exp: Date.now() + 1000 * 60 * 60 * 12 });
-      const name = acc.kind === 'student' ? `${acc.row.first_name || ''} ${acc.row.last_name || ''}`.trim() : acc.row.full_name;
+      const name = (acc.kind === 'student') ? `${acc.row.first_name || ''} ${acc.row.last_name || ''}`.trim()
+        : (acc.kind === 'parent') ? (acc.row.parent_name || 'Parent/Guardian') : acc.row.full_name;
       return J(res, 200, { ok: true, token, user: { role: acc.role, kind: acc.kind, name } });
     }
 
@@ -361,10 +381,10 @@ module.exports = function createPortal(deps) {
       const t = authOf(req, u); if (!t) return J(res, 401, { ok: false });
       const row = accountById(t.k, t.id); if (!row) return J(res, 401, { ok: false });
       let data;
-      if (t.k === 'student') data = studentData(row);
+      if (t.k === 'student' || t.k === 'parent') { data = studentData(row); data.parentView = t.k === 'parent'; data.parentName = t.k === 'parent' ? (row.parent_name || 'Parent/Guardian') : null; }
       else if (t.k === 'staff') data = staffData(row);
       else data = officerData(row);
-      data.institution = inst().name; data.role = t.role; data.kind = t.k;
+      data.institution = inst().name; data.role = t.role; data.kind = t.k === 'parent' ? 'student' : t.k;
       return J(res, 200, { ok: true, data });
     }
 
@@ -436,6 +456,11 @@ th{background:#f8fafc;font-size:11px;text-transform:uppercase;letter-spacing:.4p
 .muted{color:var(--muted)}.badge{background:#eef2ff;color:#3730a3;border-radius:999px;padding:3px 9px;font-size:11px;font-weight:700}
 .empty{padding:24px;text-align:center;color:var(--muted)}
 .live{font-size:11px;color:#16a34a;margin-left:8px}
+.pbanner{background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe;border-radius:12px;padding:11px 16px;margin-bottom:14px;font-size:13.5px}
+.exbar{border-radius:12px;padding:13px 16px;margin-bottom:14px;font-weight:800;text-align:center;letter-spacing:.3px;font-size:15px}
+.exbar.ok{background:#dcfce7;color:#166534;border:1px solid #86efac}
+.exbar.warn{background:#fef9c3;color:#854d0e;border:1px solid #fde68a}
+.exbar.bad{background:#fee2e2;color:#991b1b;border:1px solid #fca5a5}
 @media(max-width:560px){.top .rl{display:none}}
 </style></head>
 <body>
@@ -492,12 +517,21 @@ function doc(path){window.open(path+(path.includes('?')?'&':'?')+'t='+encodeURIC
 
 function studentView(w,d){
   const p=d.profile;
+  if(d.parentView){w.appendChild($('<div class="pbanner">👨‍👩‍👧 Parent/Guardian view — you are viewing the records of <b>'+(p.full_name||'your ward')+'</b>.</div>'));}
   w.appendChild($('<div class="panel"><div class="prof">'+(p.photo?'<img src="'+p.photo+'">':'<div class="ph">🎓</div>')+'<div><div class="nm">'+p.full_name+'</div><div class="meta">'+(p.matric_no||'Matric pending')+' · '+(p.department||'—')+' · '+(p.level||'—')+'</div><div class="meta">'+(p.faculty||'')+' · '+(p.email||'')+'</div></div></div></div>'));
-  w.appendChild($('<div class="kpis"><div class="kpi"><div class="l">Outstanding Balance</div><div class="v neg">'+mapMoney(d.balances)+'</div></div><div class="kpi"><div class="l">Payments Made</div><div class="v">'+d.payments.length+'</div></div><div class="kpi"><div class="l">Status</div><div class="v" style="font-size:16px;text-transform:capitalize">'+(p.status||'active')+'</div></div></div>'));
-  const stmt=$('<div style="margin-bottom:14px"><button class="btn sm" onclick="doc(\\'/doc/statement\\')">📄 Download full statement (all fees & payments)</button></div>');w.appendChild(stmt);
-  const owe=$('<div class="panel"><h3>Outstanding Fees (charged by all offices)</h3>'+tbl([{t:'Fee Category',f:r=>cap(r.category)},{t:'Currency',f:r=>r.currency},{t:'Billed',r:1,f:r=>money(r.billed,r.currency)},{t:'Paid',r:1,f:r=>money(r.paid,r.currency)},{t:'Outstanding',r:1,f:r=>'<span class=neg>'+money(r.outstanding,r.currency)+'</span>'}],d.outstanding,'You owe nothing. 🎉')+'</div>');w.appendChild(owe);
-  w.appendChild($('<div class="panel"><h3>All Fees & Charges</h3>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Description',f:r=>r.description||cap(r.category)},{t:'Category',f:r=>cap(r.category)},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)}],d.charges,'No charges yet.')+'</div>'));
-  w.appendChild($('<div class="panel"><h3>Payment History & Receipts</h3>'+tbl([{t:'Receipt',f:r=>r.receipt_no||'—'},{t:'Date',f:r=>fmt(r.date)},{t:'For',f:r=>cap(r.category)},{t:'Office',f:r=>r.office},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)},{t:'',r:1,f:r=>r.receipt_no?'<button class="btn sm" onclick="doc(\\'/doc/receipt/'+r.id+'\\')">Receipt</button>':''}],d.payments,'No payments yet.')+'</div>'));
+  // exam clearance status banner
+  var clr=d.examClearance||{};
+  var cls=clr.cleared?(clr.type==='partial'?'warn':'ok'):'bad';
+  var ctxt=clr.cleared?(clr.type==='partial'?'⚠ PARTIALLY CLEARED for exams — you still owe fees':'✓ CLEARED for examinations'):('✗ NOT CLEARED for exams — '+(clr.reason||'no clearance'));
+  w.appendChild($('<div class="exbar '+cls+'">'+ctxt+'</div>'));
+  w.appendChild($('<div class="kpis"><div class="kpi"><div class="l">Outstanding Balance</div><div class="v neg">'+mapMoney(d.balances)+'</div></div><div class="kpi"><div class="l">Total Paid</div><div class="v">'+d.payments.length+' receipt(s)</div></div><div class="kpi"><div class="l">Exam Status</div><div class="v" style="font-size:15px">'+(clr.cleared?(clr.type==='partial'?'Partial':'Cleared'):'Not cleared')+'</div></div></div>'));
+  w.appendChild($('<div style="margin-bottom:14px"><button class="btn sm" onclick="doc(\\'/doc/statement\\')">📄 Download full statement (all fees & payments)</button></div>'));
+  w.appendChild($('<div class="panel"><h3>Outstanding Fees (charged by all offices)</h3>'+tbl([{t:'Fee Category',f:r=>cap(r.category)},{t:'Currency',f:r=>r.currency},{t:'Billed',r:1,f:r=>money(r.billed,r.currency)},{t:'Paid',r:1,f:r=>money(r.paid,r.currency)},{t:'Outstanding',r:1,f:r=>'<span class=neg>'+money(r.outstanding,r.currency)+'</span>'}],d.outstanding,'You owe nothing. 🎉')+'</div>'));
+  w.appendChild($('<div class="panel"><h3>All Fees & Charges</h3>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Description',f:r=>r.description||cap(r.category)},{t:'Category',f:r=>cap(r.category)},{t:'Set By',f:r=>r.by||'—'},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)}],d.charges,'No charges yet.')+'</div>'));
+  w.appendChild($('<div class="panel"><h3>Payment History &amp; Receipts</h3>'+tbl([{t:'Receipt',f:r=>r.receipt_no||'—'},{t:'Date',f:r=>fmt(r.date)},{t:'For',f:r=>cap(r.category)},{t:'Collected By',f:r=>(r.collector?r.collector+'<br>':'')+'<span class="muted" style="font-size:11px">'+(r.office||'')+'</span>'},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)},{t:'',r:1,f:r=>r.receipt_no?'<button class="btn sm" onclick="doc(\\'/doc/receipt/'+r.id+'\\')">Receipt</button>':''}],d.payments,'No payments yet.')+'</div>'));
+  if(d.validations&&d.validations.length){
+    w.appendChild($('<div class="panel"><h3>Exam Validation History</h3>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Type',f:r=>cap(r.exam_type||'exam')},{t:'Session',f:r=>(r.session||'—')+(r.semester?(' · '+r.semester):'')},{t:'Result',f:r=>'<span class="'+(r.status==='valid'?'pos':'neg')+'" style="font-weight:800">'+(r.status==='valid'?'CLEARED':'DENIED')+'</span>'},{t:'Reason',f:r=>r.reason||'—'}],d.validations,'No validations yet.')+'</div>'));
+  }
 }
 function staffView(w,d){
   const p=d.profile;
