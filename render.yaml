@@ -1,0 +1,27 @@
+# Render.com Blueprint for the UniBursar Sync Hub.
+# In Render: New + → "Blueprint" → connect this repo → it reads this file.
+# (Or deploy manually as a Web Service with Root Directory = server.)
+services:
+  - type: web
+    name: unibursar-sync-hub
+    runtime: node
+    rootDir: server          # only the lightweight server folder is deployed
+    plan: free               # upgrade to "starter" to add a persistent disk (see below)
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+    # --- Optional persistence (paid plan only) -------------------------
+    # On the free plan the data store is ephemeral and clients automatically
+    # re-seed the hub after a restart. For permanent server-side storage,
+    # switch plan to "starter", then uncomment the disk + DATA_DIR below:
+    # disk:
+    #   name: unibursar-data
+    #   mountPath: /var/data
+    #   sizeGB: 1
+    # envVars:
+    #   - key: DATA_DIR
+    #     value: /var/data
