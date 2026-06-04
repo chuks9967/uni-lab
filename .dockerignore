@@ -1,0 +1,13 @@
+# Keep the image lean and clean — the hub stores live data on the mounted volume
+# (DATA_DIR), never inside the image.
+data/
+node_modules/
+*.md
+render.yaml
+fly.toml
+Dockerfile
+.dockerignore
+.git
+.gitignore
+.env
+*.log
