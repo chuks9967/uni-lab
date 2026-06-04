@@ -137,8 +137,16 @@ module.exports = function createPortal(deps) {
       .map(v => ({ status: v.status, reason: v.reason, exam_type: v.exam_type, date: v.created_at, session: nameOf('academic_sessions', v.session_id), semester: nameOf('semesters', v.semester_id) }))
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
     const i = inst();
+    // segment by office so the student sees exactly who they owe (and who collected)
+    const roleOf = (uid) => { const u = uid ? one('users', uid) : null; return u ? u.role : null; };
+    const offices = {};
+    const bucket = (role) => { const k = role || 'accountant'; offices[k] = offices[k] || { role: k, office: ROLE_OFFICE[k] || 'Office of the Bursar', charged: {}, paid: {}, owing: {} }; return offices[k]; };
+    for (const c of charges) { const b = bucket(roleOf(c.created_by) || 'accountant'); b.charged[c.currency] = (b.charged[c.currency] || 0) + c.amount; }
+    for (const pmt of pays) { const b = bucket(pmt.raised_role || 'accountant'); b.paid[pmt.currency] = (b.paid[pmt.currency] || 0) + pmt.amount; }
+    for (const k of Object.keys(offices)) { const o = offices[k]; for (const cur of new Set([...Object.keys(o.charged), ...Object.keys(o.paid)])) { const owe = (o.charged[cur] || 0) - (o.paid[cur] || 0); if (owe > 0.001) o.owing[cur] = owe; } }
     return {
       profile: studentProfile(s),
+      byOffice: Object.values(offices),
       currentSession: i.session || nameOf('academic_sessions', s.current_session_id) || '',
       currentSemester: i.semester || '',
       balances: balancesFor(s.id),
@@ -167,31 +175,36 @@ module.exports = function createPortal(deps) {
     return { profile: staffProfile(s), payslips: slips };
   }
 
-  function officerData(u) {
+  function officerData(u, period) {
     const role = u.role;
-    const completed = all('payments').filter(p => p.status === 'completed');
-    const out = { profile: { id: u.id, full_name: u.full_name, role, email: u.email } };
+    const inP = (r) => (!period || !period.session || (r.session_id || '') === period.session) && (!period || !period.semester || (r.semester_id || '') === period.semester);
+    const completed = all('payments').filter(p => p.status === 'completed' && inP(p));
+    const out = {
+      profile: { id: u.id, full_name: u.full_name, role, email: u.email },
+      periods: { sessions: all('academic_sessions').map(s => ({ id: s.id, name: s.name })), semesters: all('semesters').map(s => ({ id: s.id, name: s.name, session_id: s.session_id })) },
+      period: period || {},
+    };
     if (role === 'accountant' || role === 'admin') {
       const collected = {}; const billed = {}; const expenses = {};
       for (const p of completed) collected[p.currency] = (collected[p.currency] || 0) + p.amount;
-      for (const c of all('charges')) billed[c.currency] = (billed[c.currency] || 0) + c.amount;
-      for (const e of all('expenses')) expenses[e.currency] = (expenses[e.currency] || 0) + e.amount;
+      for (const c of all('charges').filter(inP)) billed[c.currency] = (billed[c.currency] || 0) + c.amount;
+      for (const e of all('expenses').filter(inP)) expenses[e.currency] = (expenses[e.currency] || 0) + e.amount;
       const students = all('students').filter(s => s.status !== 'alumni');
       let debtors = 0; for (const s of students) if (Object.values(balancesFor(s.id)).some(v => v > 0.001)) debtors++;
       out.kind = 'finance';
       out.cards = { collected, billed, expenses, students: students.length, debtors };
-      out.recent = completed.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 20)
+      out.recent = completed.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 40)
         .map(p => ({ receipt_no: p.receipt_no, student: studentName(p.student_id), category: p.category, amount: p.amount, currency: p.currency, date: p.decided_at || p.created_at }));
-    } else if (role === 'registrar') {
+    } else if (role === 'registrar' || role === 'student_affairs') {
       out.kind = 'registrar';
-      out.collected = {}; const cat = {};
+      out.collected = {};
       for (const p of completed) if (p.raised_by === u.id || p.decided_by === u.id) { out.collected[p.currency] = (out.collected[p.currency] || 0) + p.amount; }
-      const ids = [...new Set(all('charges').filter(c => c.created_by === u.id).map(c => c.student_id))];
+      const ids = [...new Set(all('charges').filter(c => c.created_by === u.id && inP(c)).map(c => c.student_id))];
       out.students = ids.map(sid => billedSummary(sid, u.id)).filter(Boolean);
     } else if (role === 'dean') {
       out.kind = 'dean'; out.collected = {}; out.expenses = {};
       for (const p of completed) if (p.raised_by === u.id || p.decided_by === u.id) out.collected[p.currency] = (out.collected[p.currency] || 0) + p.amount;
-      for (const e of all('expenses')) if (e.recorded_by === u.id) out.expenses[e.currency] = (out.expenses[e.currency] || 0) + e.amount;
+      for (const e of all('expenses').filter(e => e.recorded_by === u.id && inP(e))) out.expenses[e.currency] = (out.expenses[e.currency] || 0) + e.amount;
       const inFac = all('students').filter(s => s.faculty_id === u.faculty_id && s.status !== 'alumni');
       out.debtors = [];
       for (const s of inFac) {
@@ -201,7 +214,7 @@ module.exports = function createPortal(deps) {
         const owing = {}; for (const k of Object.keys(bal)) if (bal[k] > 0.001) owing[k] = bal[k];
         if (Object.keys(owing).length) out.debtors.push({ full_name: studentName(s.id), matric_no: s.matric_no, department: nameOf('departments', s.department_id), owing });
       }
-    } else { // student_affairs
+    } else { // student_affairs (no collections role) — clearance + discipline summary
       out.kind = 'affairs';
       const aps = all('clearance_approvals').filter(a => a.office === 'student_affairs');
       out.clearance = { pending: aps.filter(a => a.status === 'pending').length, approved: aps.filter(a => a.status === 'approved').length, denied: aps.filter(a => a.status === 'denied').length };
@@ -337,6 +350,23 @@ module.exports = function createPortal(deps) {
     return docShell((s.staff_type === 'lecturer' ? 'Lecturer' : 'Staff') + ' Payslip', body);
   }
 
+  function moneyMapHTML(m) { const e = Object.entries(m || {}); return e.length ? e.map(([c, v]) => money(v, c)).join(' · ') : money(0); }
+  function officerReportHTML(data, periodLabel) {
+    const ROLE = { finance: 'Bursary / Administration', registrar: data.role === 'student_affairs' ? 'Student Affairs' : 'Registrar', dean: 'Faculty Head', affairs: 'Student Affairs' };
+    let body = `<div class="grid"><div class="f"><span>Officer</span><b>${esc(data.profile.full_name)}</b></div><div class="f"><span>Role</span><b>${esc(data.role)}</b></div><div class="f"><span>Period</span><b>${esc(periodLabel || 'All time')}</b></div><div class="f"><span>Generated</span><b>${fmtDate(new Date().toISOString())}</b></div></div>`;
+    if (data.kind === 'finance') {
+      body += `<div class="bar">Summary (per currency)</div><table><tbody><tr><td>Collected</td><td class="r">${moneyMapHTML(data.cards.collected)}</td></tr><tr><td>Billed</td><td class="r">${moneyMapHTML(data.cards.billed)}</td></tr><tr><td>Expenses</td><td class="r">${moneyMapHTML(data.cards.expenses)}</td></tr><tr><td>Students</td><td class="r">${data.cards.students}</td></tr><tr><td>Debtors</td><td class="r">${data.cards.debtors}</td></tr></tbody></table>`;
+      body += `<div class="bar">Recent Payments</div><table><thead><tr><th>Receipt</th><th>Student</th><th>For</th><th>Date</th><th class="r">Amount</th></tr></thead><tbody>${(data.recent || []).map(p => `<tr><td>${esc(p.receipt_no || '—')}</td><td>${esc(p.student)}</td><td>${esc(p.category)}</td><td>${fmtDate(p.date)}</td><td class="r">${money(p.amount, p.currency)}</td></tr>`).join('') || '<tr><td colspan=5>No payments.</td></tr>'}</tbody></table>`;
+    } else if (data.kind === 'registrar') {
+      body += `<div class="bar">My Collections</div><div class="tot">${moneyMapHTML(data.collected)}</div>`;
+      body += `<div class="bar">Students I Billed</div><table><thead><tr><th>Name</th><th>Matric</th><th class="r">Paid</th><th class="r">Owing</th></tr></thead><tbody>${(data.students || []).map(r => `<tr><td>${esc(r.full_name)}</td><td>${esc(r.matric_no || '—')}</td><td class="r">${moneyMapHTML(r.paid)}</td><td class="r neg">${moneyMapHTML(r.owing)}</td></tr>`).join('') || '<tr><td colspan=4>None.</td></tr>'}</tbody></table>`;
+    } else if (data.kind === 'dean') {
+      body += `<div class="bar">Faculty Collections / Expenditure</div><table><tbody><tr><td>Collected</td><td class="r">${moneyMapHTML(data.collected)}</td></tr><tr><td>Expenditure</td><td class="r">${moneyMapHTML(data.expenses)}</td></tr></tbody></table>`;
+      body += `<div class="bar">Students Owing Faculty Fees</div><table><thead><tr><th>Name</th><th>Matric</th><th class="r">Owing</th></tr></thead><tbody>${(data.debtors || []).map(r => `<tr><td>${esc(r.full_name)}</td><td>${esc(r.matric_no || '—')}</td><td class="r neg">${moneyMapHTML(r.owing)}</td></tr>`).join('') || '<tr><td colspan=3>None.</td></tr>'}</tbody></table>`;
+    }
+    return docShell((ROLE[data.kind] || 'Officer') + ' Report', body);
+  }
+
   // ---------------------------- HTTP ----------------------------
   function J(res, code, obj) { const b = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(b); return true; }
   function H(res, code, html) { res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(html); return true; }
@@ -399,6 +429,21 @@ module.exports = function createPortal(deps) {
       return J(res, 200, { ok: true, user: { role: t.role, kind: t.k, name } });
     }
 
+    if (p === '/api/officer-report' && method === 'GET') {
+      const t = authOf(req, u); if (!t || t.k !== 'user') return J(res, 401, { ok: false });
+      const row = accountById('user', t.id); if (!row) return J(res, 401, { ok: false });
+      const data = officerData(row, { session: u.searchParams.get('session') || '', semester: u.searchParams.get('semester') || '' });
+      data.role = t.role; data.institution = inst().name;
+      return J(res, 200, { ok: true, data });
+    }
+    if (p === '/api/students' && method === 'GET') {
+      const t = authOf(req, u); if (!t || t.k !== 'user') return J(res, 401, { ok: false });
+      const q = (u.searchParams.get('q') || '').toLowerCase();
+      const rows = all('students').filter(s => s.status !== 'alumni' && (!q || (`${s.first_name || ''} ${s.last_name || ''}`.toLowerCase().includes(q) || (s.matric_no || '').toLowerCase().includes(q)))).slice(0, 25)
+        .map(s => ({ id: s.id, name: `${s.first_name || ''} ${s.last_name || ''}`.trim(), matric: s.matric_no, department: nameOf('departments', s.department_id) }));
+      return J(res, 200, { ok: true, students: rows });
+    }
+
     if (p === '/api/data' && method === 'GET') {
       const t = authOf(req, u); if (!t) return J(res, 401, { ok: false });
       const row = accountById(t.k, t.id); if (!row) return J(res, 401, { ok: false });
@@ -429,6 +474,16 @@ module.exports = function createPortal(deps) {
         if (t.k === 'staff' && slip.staff_id !== t.id) return H(res, 403, '<p>Not authorised.</p>');
         if (studentish) return H(res, 403, '<p>Not authorised.</p>');
         return H(res, 200, payslipHTML(slip));
+      }
+      if (type === 'officer-report' && t.k === 'user') {
+        const row = accountById('user', t.id); if (!row) return H(res, 404, '<p>Not found.</p>');
+        const ss = u.searchParams.get('session') || ''; const sm = u.searchParams.get('semester') || '';
+        const label = (ss ? (nameOf('academic_sessions', ss) || 'session') : 'All sessions') + ' · ' + (sm ? (nameOf('semesters', sm) || 'semester') : 'All semesters');
+        return H(res, 200, officerReportHTML(officerData(row, { session: ss, semester: sm }), label));
+      }
+      if (type === 'student-statement' && t.k === 'user') {
+        const s = one('students', id); if (!s) return H(res, 404, '<p>Student not found.</p>');
+        return H(res, 200, statementHTML(s));
       }
       if (type === 'result') {
         const r = one('results', id);
@@ -572,7 +627,11 @@ function studentView(w,d){
     +'<div class="kpi"><div class="l">Exam Status</div><div class="v" style="font-size:15px">'+(clr.cleared?(clr.type==='partial'?'Partial':'Cleared'):'Not cleared')+'</div></div>'
     +'</div>'));
   w.appendChild($('<div style="margin-bottom:14px"><button class="btn sm" onclick="doc(\\'/doc/statement\\')">📄 Download full statement (all fees & payments)</button></div>'));
-  w.appendChild($('<div class="panel"><h3>Outstanding Fees (charged by all offices)</h3>'+tbl([{t:'Fee Category',f:r=>cap(r.category)},{t:'Currency',f:r=>r.currency},{t:'Billed',r:1,f:r=>money(r.billed,r.currency)},{t:'Paid',r:1,f:r=>money(r.paid,r.currency)},{t:'Outstanding',r:1,f:r=>'<span class=neg>'+money(r.outstanding,r.currency)+'</span>'}],d.outstanding,'You owe nothing. 🎉')+'</div>'));
+  // who you owe — segmented by office
+  if(d.byOffice&&d.byOffice.length){
+    w.appendChild($('<div class="panel"><h3>Who You Owe — by Office</h3>'+tbl([{t:'Office',f:r=>r.office},{t:'Charged',r:1,f:r=>mapMoney(r.charged)},{t:'Paid',r:1,f:r=>mapMoney(r.paid)},{t:'Outstanding',r:1,f:r=>Object.keys(r.owing).length?'<span class=neg>'+mapMoney(r.owing)+'</span>':'<span class=pos>Cleared</span>'}],d.byOffice,'No charges.')+'</div>'));
+  }
+  w.appendChild($('<div class="panel"><h3>Outstanding Fees (all offices)</h3>'+tbl([{t:'Fee Category',f:r=>cap(r.category)},{t:'Currency',f:r=>r.currency},{t:'Billed',r:1,f:r=>money(r.billed,r.currency)},{t:'Paid',r:1,f:r=>money(r.paid,r.currency)},{t:'Outstanding',r:1,f:r=>'<span class=neg>'+money(r.outstanding,r.currency)+'</span>'}],d.outstanding,'You owe nothing. 🎉')+'</div>'));
   w.appendChild($('<div class="panel"><h3>All Fees &amp; Charges</h3>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Description',f:r=>(r.description||cap(r.category))+' '+(r.rollover?'<span class="badge" style="background:#fef3c7;color:#92400e">Rollover'+(r.rolled_from?' · '+eh(r.rolled_from):'')+'</span>':'<span class="badge" style="background:#dbeafe;color:#1e40af">Current</span>')},{t:'Category',f:r=>cap(r.category)},{t:'Set By',f:r=>r.by||'—'},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)}],d.charges,'No charges yet.')+'</div>'));
   w.appendChild($('<div class="panel"><h3>Payment History &amp; Receipts</h3>'+tbl([{t:'Receipt',f:r=>r.receipt_no||'—'},{t:'Date',f:r=>fmt(r.date)},{t:'For',f:r=>cap(r.category)},{t:'Collected By',f:r=>(r.collector?eh(r.collector)+'<br>':'')+'<span class="muted" style="font-size:11px">'+eh(r.office||'')+'</span>'},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)},{t:'',r:1,f:r=>r.receipt_no?'<button class="btn sm" onclick="doc(\\'/doc/receipt/'+r.id+'\\')">Receipt</button>':''}],d.payments,'No payments yet.')+'</div>'));
   // results — uploaded by the registrar/admin per level + semester
@@ -587,7 +646,37 @@ function staffView(w,d){
   w.appendChild($('<div class="kpis"><div class="kpi"><div class="l">Base / Default Pay</div><div class="v">'+money(p.base_salary,p.currency)+'</div></div><div class="kpi"><div class="l">Payslips</div><div class="v">'+d.payslips.length+'</div></div><div class="kpi"><div class="l">Bank</div><div class="v" style="font-size:15px">'+(p.bank_name||'—')+'</div></div></div>'));
   w.appendChild($('<div class="panel"><h3>My Payslips</h3>'+tbl([{t:'Period',f:r=>r.period||'—'},{t:'Type',f:r=>cap(r.run_type||'staff')},{t:'Status',f:r=>'<span class="badge">'+cap(r.status||'draft')+'</span>'},{t:'Net Pay',r:1,f:r=>money(r.net,r.currency)},{t:'',r:1,f:r=>'<button class="btn sm" onclick="doc(\\'/doc/payslip/'+r.id+'\\')">Payslip</button>'}],d.payslips,'No payslips yet.')+'</div>'));
 }
+function officerControls(w,d){
+  var per=d.period||{};var ps=d.periods||{sessions:[],semesters:[]};
+  var sessOpts='<option value="">All sessions</option>'+ps.sessions.map(function(s){return '<option value="'+s.id+'"'+(s.id===per.session?' selected':'')+'>'+eh(s.name)+'</option>';}).join('');
+  var semOpts='<option value="">All semesters</option>'+ps.semesters.filter(function(sm){return !per.session||sm.session_id===per.session;}).map(function(sm){return '<option value="'+sm.id+'"'+(sm.id===per.semester?' selected':'')+'>'+eh(sm.name)+'</option>';}).join('');
+  var bar=$('<div class="panel"><div style="padding:14px 16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">'
+    +'<b>📊 Report period:</b> <select id="of-sess">'+sessOpts+'</select> <select id="of-sem">'+semOpts+'</select>'
+    +'<button class="btn sm" id="of-dl" style="width:auto">📄 Download this report</button>'
+    +'<span style="flex:1"></span>'
+    +'<input id="of-find" placeholder="🔎 Find a student to download their statement…" style="min-width:240px;width:auto">'
+    +'</div><div id="of-find-res" style="padding:0 16px 14px"></div></div>');
+  w.appendChild(bar);
+  var sess=bar.querySelector('#of-sess'),sem=bar.querySelector('#of-sem');
+  function reload(){officerReload(sess.value,sem.value);}
+  sess.onchange=function(){officerReload(sess.value,'');};
+  sem.onchange=reload;
+  bar.querySelector('#of-dl').onclick=function(){doc('/doc/officer-report?session='+encodeURIComponent(sess.value)+'&semester='+encodeURIComponent(sem.value));};
+  var find=bar.querySelector('#of-find'),fres=bar.querySelector('#of-find-res');var ft;
+  find.addEventListener('input',function(){clearTimeout(ft);ft=setTimeout(async function(){
+    var q=find.value.trim();fres.innerHTML='';if(q.length<2)return;
+    var r=await api('/api/students?q='+encodeURIComponent(q));
+    (r.students||[]).forEach(function(s){var c=$('<div class="ev-card" style="display:flex;gap:10px;align-items:center;padding:8px 10px;border:1px solid #e6eaf0;border-radius:10px;margin-top:6px;cursor:pointer"><div style="flex:1"><b>'+eh(s.name)+'</b><div class="muted" style="font-size:12px">'+eh(s.matric||'—')+' · '+eh(s.department||'—')+'</div></div><span class="badge">Statement →</span></div>');c.onclick=function(){doc('/doc/student-statement/'+s.id);};fres.appendChild(c);});
+    if(!(r.students||[]).length)fres.innerHTML='<div class="muted">No match.</div>';
+  },200);});
+}
+function officerReload(session,semester){
+  api('/api/officer-report?session='+encodeURIComponent(session||'')+'&semester='+encodeURIComponent(semester||'')).then(function(r){
+    if(!r.ok)return;var d=r.data;var w=document.querySelector('.wrap');w.innerHTML='';officerView(w,d);
+  });
+}
 function officerView(w,d){
+  officerControls(w,d);
   if(d.kind==='finance'){
     w.appendChild($('<div class="kpis">'+kpi('Collected',mapMoney(d.cards.collected))+kpi('Billed',mapMoney(d.cards.billed))+kpi('Expenses',mapMoney(d.cards.expenses))+kpi('Students',d.cards.students)+kpi('Debtors',d.cards.debtors)+'</div>'));
     w.appendChild($('<div class="panel"><h3>Recent Payments</h3>'+tbl([{t:'Receipt',f:r=>r.receipt_no||'—'},{t:'Student',f:r=>r.student},{t:'For',f:r=>cap(r.category)},{t:'Date',f:r=>fmt(r.date)},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)}],d.recent,'No payments.')+'</div>'));
