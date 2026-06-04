@@ -399,10 +399,10 @@ module.exports = function createPortal(deps) {
       const t = authOf(req, u); if (!t) return J(res, 401, { ok: false });
       const row = accountById(t.k, t.id); if (!row) return J(res, 401, { ok: false });
       let data;
-      if (t.k === 'student' || t.k === 'parent') { data = studentData(row); data.parentView = t.k === 'parent'; data.parentName = t.k === 'parent' ? (row.parent_name || 'Parent/Guardian') : null; }
-      else if (t.k === 'staff') data = staffData(row);
-      else data = officerData(row);
-      data.institution = inst().name; data.role = t.role; data.kind = t.k === 'parent' ? 'student' : t.k;
+      if (t.k === 'student' || t.k === 'parent') { data = studentData(row); data.parentView = t.k === 'parent'; data.parentName = t.k === 'parent' ? (row.parent_name || 'Parent/Guardian') : null; data.kind = 'student'; }
+      else if (t.k === 'staff') { data = staffData(row); data.kind = 'staff'; }
+      else { data = officerData(row); } // officerData already sets data.kind = finance | registrar | dean | affairs
+      data.institution = inst().name; data.role = t.role;
       return J(res, 200, { ok: true, data });
     }
 
@@ -576,9 +576,12 @@ function officerView(w,d){
   } else if(d.kind==='dean'){
     w.appendChild($('<div class="kpis">'+kpi('Faculty Collections',mapMoney(d.collected))+kpi('My Expenditure',mapMoney(d.expenses))+kpi('Students Owing',d.debtors.length)+'</div>'));
     w.appendChild($('<div class="panel"><h3>Students Owing Faculty Fees</h3>'+tbl([{t:'Name',f:r=>r.full_name},{t:'Matric',f:r=>r.matric_no||'—'},{t:'Department',f:r=>r.department||'—'},{t:'Owing',r:1,f:r=>'<span class=neg>'+mapMoney(r.owing)+'</span>'}],d.debtors,'No student owes faculty fees.')+'</div>'));
-  } else {
+  } else if(d.kind==='affairs'&&d.clearance){
     w.appendChild($('<div class="kpis">'+kpi('Clearance Pending',d.clearance.pending)+kpi('Approved',d.clearance.approved)+kpi('Misconduct (open)',d.misconduct.open)+kpi('Misconduct (total)',d.misconduct.total)+'</div>'));
     w.appendChild($('<div class="panel"><h3>Student Affairs</h3><div class="empty">Clearance approvals and discipline are summarised above. Use the desktop app to action items.</div></div>'));
+  } else {
+    w.appendChild($('<div class="panel"><div class="prof"><div class="ph">👤</div><div><div class="nm">'+((d.profile&&d.profile.full_name)||'Welcome')+'</div><div class="meta" style="text-transform:capitalize">'+(d.role||'staff')+' account</div></div></div></div>'));
+    w.appendChild($('<div class="panel"><h3>Dashboard</h3><div class="empty">You are signed in. Your reports and tools are available in the desktop app.</div></div>'));
   }
 }
 function kpi(l,v){return '<div class="kpi"><div class="l">'+l+'</div><div class="v">'+v+'</div></div>';}
