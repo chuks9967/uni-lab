@@ -17,7 +17,12 @@ function money(a, c) { const n = Number(a || 0).toLocaleString('en-US', { minimu
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m])); }
 function fmtDate(d) { if (!d) return '—'; try { return new Date(d).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }); } catch (_) { return '—'; } }
 
-// pure-Node scrypt verify (matches electron/services/portalcreds.js)
+// pure-Node scrypt hash/verify (matches electron/services/portalcreds.js)
+function hashPass(password) {
+  const salt = crypto.randomBytes(16);
+  const h = crypto.scryptSync(String(password), salt, 32);
+  return `s2$${salt.toString('hex')}$${h.toString('hex')}`;
+}
 function verifyPass(password, stored) {
   try {
     const [tag, saltHex, hashHex] = String(stored || '').split('$');
@@ -36,7 +41,7 @@ function numWords(num) { num = Math.floor(Number(num) || 0); if (num === 0) retu
 function amountWords(a, c) { const whole = Math.floor(Number(a) || 0); const k = Math.round((Number(a) - whole) * 100); let s = `${numWords(whole)} ${WORD_CCY[c] || c}`; if (k > 0) s += ` and ${numWords(k)}/100`; return s + ' only'; }
 
 module.exports = function createPortal(deps) {
-  const { all, one, getVersion, secret, institution } = deps;
+  const { all, one, getVersion, secret, institution, update } = deps;
   const KEY = secret || 'unibursar-portal';
 
   // ---- token (HMAC-signed, stateless) ----
@@ -370,6 +375,19 @@ module.exports = function createPortal(deps) {
       return J(res, 200, { ok: true, token, user: { role: acc.role, kind: acc.kind, name } });
     }
 
+    if (p === '/api/reset-password' && method === 'POST') {
+      const t = authOf(req, u); if (!t) return J(res, 401, { ok: false });
+      const row = accountById(t.k, t.id); if (!row) return J(res, 401, { ok: false });
+      const body = await readBody();
+      if (!verifyPass(body.oldPassword, passField(t.k, row))) return J(res, 200, { ok: false, error: 'Your current password is incorrect.' });
+      if (!body.newPassword || String(body.newPassword).length < 5) return J(res, 200, { ok: false, error: 'New password must be at least 5 characters.' });
+      if (typeof update !== 'function') return J(res, 200, { ok: false, error: 'Password reset is unavailable on this server.' });
+      const field = t.k === 'parent' ? 'parent_portal_pass' : 'portal_pass';
+      const entity = (t.k === 'student' || t.k === 'parent') ? 'students' : (t.k === 'user' ? 'users' : 'staff');
+      const done = update(entity, t.id, { [field]: hashPass(body.newPassword) });
+      return J(res, 200, { ok: !!done, error: done ? null : 'Could not save the new password.' });
+    }
+
     if (p === '/api/me' && method === 'GET') {
       const t = authOf(req, u); if (!t) return J(res, 401, { ok: false });
       const row = accountById(t.k, t.id); if (!row) return J(res, 401, { ok: false });
@@ -474,6 +492,15 @@ function mapMoney(m){const e=Object.entries(m||{});return e.length?e.map(([c,v])
 function fmt(d){if(!d)return '—';try{return new Date(d).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'});}catch(_){return '—';}}
 async function api(path,opts={}){opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});if(TOKEN)opts.headers.Authorization='Bearer '+TOKEN;const r=await fetch(path,opts);return r.json();}
 function logout(){TOKEN='';localStorage.removeItem('ubu_token');if(TIMER)clearInterval(TIMER);renderLogin();}
+async function changePassword(){
+  const o=prompt('Enter your CURRENT password:'); if(o===null)return;
+  const n=prompt('Enter your NEW password (at least 5 characters):'); if(n===null)return;
+  if(!n||n.length<5){alert('New password must be at least 5 characters.');return;}
+  const c2=prompt('Confirm your NEW password:'); if(c2===null)return;
+  if(n!==c2){alert('The new passwords do not match.');return;}
+  const r=await api('/api/reset-password',{method:'POST',body:JSON.stringify({oldPassword:o,newPassword:n})});
+  alert(r.ok?'✓ Password changed. Use your new password next time you sign in. It also updates on the school system.':(r.error||'Could not change password.'));
+}
 
 function eh(s){return String(s==null?'':s).replace(/[&<>"]/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[m];});}
 async function renderLogin(msg){
@@ -503,7 +530,7 @@ async function renderApp(){
   if(!r.ok){return logout();}
   const d=r.data;
   const app=document.getElementById('app');app.innerHTML='';
-  app.appendChild($('<div class="top"><div class="nm">'+(d.institution||'UniBursar')+'</div><div class="rl">'+(d.profile&&d.profile.full_name?d.profile.full_name+' · ':'')+d.role+' <span class="live">● live</span></div><button class="btn sm ghost" style="margin-left:14px" onclick="logout()">Sign out</button></div>'));
+  app.appendChild($('<div class="top"><div class="nm">'+(d.institution||'UniBursar')+'</div><div class="rl">'+(d.profile&&d.profile.full_name?d.profile.full_name+' · ':'')+d.role+' <span class="live">● live</span></div><button class="btn sm ghost" style="margin-left:14px" onclick="changePassword()">🔑 Password</button><button class="btn sm ghost" style="margin-left:8px" onclick="logout()">Sign out</button></div>'));
   const w=$('<div class="wrap"></div>');app.appendChild(w);
   if(d.kind==='student')studentView(w,d);
   else if(d.kind==='staff')staffView(w,d);

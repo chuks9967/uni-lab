@@ -55,6 +55,14 @@ if (createPortal) {
   try {
     portal = createPortal({
       all: allEntity, one: oneEntity, getVersion: () => storeVersion, secret: SYNC_TOKEN || 'unibursar-portal',
+      // portal writes (e.g. password reset) update the store and bump updated_at so the
+      // change syncs back to the desktop app on the next /sync/pull
+      update: (entity, id, patch) => {
+        const rec = store.records[entity + ':' + id];
+        if (!rec || !rec.row) return false;
+        Object.assign(rec.row, patch); const now = new Date().toISOString(); rec.row.updated_at = now; rec.updated_at = now;
+        storeVersion = Date.now(); save(); return true;
+      },
       institution: () => (store.branding && store.branding.name)
         ? store.branding
         : { name: process.env.INSTITUTION_NAME || 'UniBursar University', short: process.env.INSTITUTION_SHORT || 'UBU', logo: process.env.INSTITUTION_LOGO || '', motto: process.env.INSTITUTION_MOTTO || '' },
