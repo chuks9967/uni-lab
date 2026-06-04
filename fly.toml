@@ -1,36 +1,31 @@
-# Fly.io config for the UniBursar cloud hub — ALWAYS ON + PERSISTENT (free volume).
+# fly.toml app configuration file generated for uni-lab on 2026-06-04T13:17:43Z
 #
-# IMPORTANT: do NOT use `fly launch` (its source scanner fails with
-# "Could not detect runtime or Dockerfile"). Use `fly deploy`, which builds
-# straight from this file + the Dockerfile. Run every command from THIS folder
-# (the one containing server.js, portal.js, package.json, Dockerfile, fly.toml):
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
-#   fly apps create uni-lab
-#   fly volumes create unibursar_data --size 1 --region iad -a uni-lab -y
-#   fly secrets set SYNC_TOKEN=PUT-A-LONG-RANDOM-STRING -a uni-lab
-#   fly deploy -a uni-lab
-#   fly status -a uni-lab        # shows your https URL
-#
-# Set `app` below to the SAME name you created (uni-lab), and keep the volume in
-# the SAME region as `primary_region`.
 
-app = "uni-lab"                   # <-- the app name you created with `fly apps create`
-primary_region = "iad"            # pick the region nearest your users (keep the volume here too)
+app = 'uni-lab'
+primary_region = 'iad'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  PORT = "8080"
-  DATA_DIR = "/data"              # persisted on the mounted volume below
+  DATA_DIR = '/data'
+  PORT = '8080'
+
+[[mounts]]
+  source = 'unibursar_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = false      # never sleep — always on
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
 
-[[mounts]]
-  source = "unibursar_data"       # the volume created above
-  destination = "/data"
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
