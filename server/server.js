@@ -218,7 +218,7 @@ const server = http.createServer(async (req, res) => {
   if (p === '/branding' && req.method === 'POST') {
     if (!tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized.' });
     const body = await readBody(req);
-    store.branding = { name: body.name || '', short: body.short || '', logo: body.logo || '', motto: body.motto || '' };
+    store.branding = { name: body.name || '', short: body.short || '', logo: body.logo || '', motto: body.motto || '', session: body.session || '', semester: body.semester || '' };
     storeVersion = Date.now(); save();
     return send(res, 200, { ok: true });
   }

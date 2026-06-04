@@ -136,12 +136,16 @@ module.exports = function createPortal(deps) {
     const validations = all('exam_validations').filter(v => v.student_id === s.id)
       .map(v => ({ status: v.status, reason: v.reason, exam_type: v.exam_type, date: v.created_at, session: nameOf('academic_sessions', v.session_id), semester: nameOf('semesters', v.semester_id) }))
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    const i = inst();
     return {
       profile: studentProfile(s),
+      currentSession: i.session || nameOf('academic_sessions', s.current_session_id) || '',
+      currentSemester: i.semester || '',
       balances: balancesFor(s.id),
       examClearance: clr,
       validations,
-      charges: charges.map(c => ({ id: c.id, category: c.category, description: c.description, currency: c.currency, amount: c.amount, date: c.created_at, by: userName(c.created_by) })),
+      results: all('results').filter(r => r.student_id === s.id).map(r => ({ id: r.id, title: r.title, level: nameOf('levels', r.level_id), semester: nameOf('semesters', r.semester_id), session: nameOf('academic_sessions', r.session_id), gpa: r.gpa, remark: r.remark, mime: r.mime, date: r.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
+      charges: charges.map(c => ({ id: c.id, category: c.category, description: c.description, currency: c.currency, amount: c.amount, date: c.created_at, by: userName(c.created_by), rollover: !!c.is_rolled_over, rolled_from: nameOf('academic_sessions', c.rolled_from_session) })),
       payments: pays.map(p => ({ id: p.id, receipt_no: p.receipt_no, category: p.category, currency: p.currency, amount: p.amount, method: p.method, date: p.decided_at || p.created_at, office: ROLE_OFFICE[p.raised_role] || 'Office of the Bursar', collector: userName(p.decided_by || p.raised_by) })),
       outstanding: owingRows,
     };
@@ -410,20 +414,30 @@ module.exports = function createPortal(deps) {
     if (p.startsWith('/doc/') && method === 'GET') {
       const t = authOf(req, u); if (!t) return H(res, 401, '<p>Session expired. Please sign in again.</p>');
       const parts = p.split('/'); const type = parts[2]; const id = parts[3];
-      if (type === 'statement' && t.k === 'student') { const s = accountById('student', t.id); return H(res, 200, statementHTML(s)), true; }
+      const studentish = (t.k === 'student' || t.k === 'parent'); // both view the student record
+      if (type === 'statement' && studentish) { return H(res, 200, statementHTML(accountById('student', t.id))); }
       if (type === 'receipt') {
         const pay = one('payments', id);
         if (!pay) return H(res, 404, '<p>Receipt not found.</p>');
-        if (t.k === 'student' && pay.student_id !== t.id) return H(res, 403, '<p>Not authorised.</p>');
+        if (studentish && pay.student_id !== t.id) return H(res, 403, '<p>Not authorised.</p>');
         if (t.k === 'staff') return H(res, 403, '<p>Not authorised.</p>');
-        return H(res, 200, receiptHTML(pay)), true;
+        return H(res, 200, receiptHTML(pay));
       }
       if (type === 'payslip') {
         const slip = one('payslips', id);
         if (!slip) return H(res, 404, '<p>Payslip not found.</p>');
         if (t.k === 'staff' && slip.staff_id !== t.id) return H(res, 403, '<p>Not authorised.</p>');
-        if (t.k === 'student') return H(res, 403, '<p>Not authorised.</p>');
-        return H(res, 200, payslipHTML(slip)), true;
+        if (studentish) return H(res, 403, '<p>Not authorised.</p>');
+        return H(res, 200, payslipHTML(slip));
+      }
+      if (type === 'result') {
+        const r = one('results', id);
+        if (!r || !r.file) return H(res, 404, '<p>Result not found.</p>');
+        if (studentish && r.student_id !== t.id) return H(res, 403, '<p>Not authorised.</p>');
+        if (t.k === 'staff') return H(res, 403, '<p>Not authorised.</p>');
+        const buf = Buffer.from(r.file, 'base64');
+        res.writeHead(200, { 'Content-Type': r.mime || 'application/octet-stream', 'Content-Disposition': 'inline; filename="' + (r.filename || 'result') + '"' });
+        res.end(buf); return true;
       }
       return H(res, 404, '<p>Not found.</p>');
     }
@@ -551,11 +565,18 @@ function studentView(w,d){
   var cls=clr.cleared?(clr.type==='partial'?'warn':'ok'):'bad';
   var ctxt=clr.cleared?(clr.type==='partial'?'⚠ PARTIALLY CLEARED for exams — you still owe fees':'✓ CLEARED for examinations'):('✗ NOT CLEARED for exams — '+(clr.reason||'no clearance'));
   w.appendChild($('<div class="exbar '+cls+'">'+ctxt+'</div>'));
-  w.appendChild($('<div class="kpis"><div class="kpi"><div class="l">Outstanding Balance</div><div class="v neg">'+mapMoney(d.balances)+'</div></div><div class="kpi"><div class="l">Total Paid</div><div class="v">'+d.payments.length+' receipt(s)</div></div><div class="kpi"><div class="l">Exam Status</div><div class="v" style="font-size:15px">'+(clr.cleared?(clr.type==='partial'?'Partial':'Cleared'):'Not cleared')+'</div></div></div>'));
+  w.appendChild($('<div class="kpis">'
+    +'<div class="kpi"><div class="l">Outstanding Balance</div><div class="v neg">'+mapMoney(d.balances)+'</div></div>'
+    +'<div class="kpi"><div class="l">Session</div><div class="v" style="font-size:16px">'+eh(d.currentSession||'—')+'</div></div>'
+    +'<div class="kpi"><div class="l">Semester</div><div class="v" style="font-size:16px">'+eh(d.currentSemester||'—')+'</div></div>'
+    +'<div class="kpi"><div class="l">Exam Status</div><div class="v" style="font-size:15px">'+(clr.cleared?(clr.type==='partial'?'Partial':'Cleared'):'Not cleared')+'</div></div>'
+    +'</div>'));
   w.appendChild($('<div style="margin-bottom:14px"><button class="btn sm" onclick="doc(\\'/doc/statement\\')">📄 Download full statement (all fees & payments)</button></div>'));
   w.appendChild($('<div class="panel"><h3>Outstanding Fees (charged by all offices)</h3>'+tbl([{t:'Fee Category',f:r=>cap(r.category)},{t:'Currency',f:r=>r.currency},{t:'Billed',r:1,f:r=>money(r.billed,r.currency)},{t:'Paid',r:1,f:r=>money(r.paid,r.currency)},{t:'Outstanding',r:1,f:r=>'<span class=neg>'+money(r.outstanding,r.currency)+'</span>'}],d.outstanding,'You owe nothing. 🎉')+'</div>'));
-  w.appendChild($('<div class="panel"><h3>All Fees & Charges</h3>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Description',f:r=>r.description||cap(r.category)},{t:'Category',f:r=>cap(r.category)},{t:'Set By',f:r=>r.by||'—'},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)}],d.charges,'No charges yet.')+'</div>'));
-  w.appendChild($('<div class="panel"><h3>Payment History &amp; Receipts</h3>'+tbl([{t:'Receipt',f:r=>r.receipt_no||'—'},{t:'Date',f:r=>fmt(r.date)},{t:'For',f:r=>cap(r.category)},{t:'Collected By',f:r=>(r.collector?r.collector+'<br>':'')+'<span class="muted" style="font-size:11px">'+(r.office||'')+'</span>'},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)},{t:'',r:1,f:r=>r.receipt_no?'<button class="btn sm" onclick="doc(\\'/doc/receipt/'+r.id+'\\')">Receipt</button>':''}],d.payments,'No payments yet.')+'</div>'));
+  w.appendChild($('<div class="panel"><h3>All Fees &amp; Charges</h3>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Description',f:r=>(r.description||cap(r.category))+' '+(r.rollover?'<span class="badge" style="background:#fef3c7;color:#92400e">Rollover'+(r.rolled_from?' · '+eh(r.rolled_from):'')+'</span>':'<span class="badge" style="background:#dbeafe;color:#1e40af">Current</span>')},{t:'Category',f:r=>cap(r.category)},{t:'Set By',f:r=>r.by||'—'},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)}],d.charges,'No charges yet.')+'</div>'));
+  w.appendChild($('<div class="panel"><h3>Payment History &amp; Receipts</h3>'+tbl([{t:'Receipt',f:r=>r.receipt_no||'—'},{t:'Date',f:r=>fmt(r.date)},{t:'For',f:r=>cap(r.category)},{t:'Collected By',f:r=>(r.collector?eh(r.collector)+'<br>':'')+'<span class="muted" style="font-size:11px">'+eh(r.office||'')+'</span>'},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)},{t:'',r:1,f:r=>r.receipt_no?'<button class="btn sm" onclick="doc(\\'/doc/receipt/'+r.id+'\\')">Receipt</button>':''}],d.payments,'No payments yet.')+'</div>'));
+  // results — uploaded by the registrar/admin per level + semester
+  w.appendChild($('<div class="panel"><h3>📑 My Results</h3>'+tbl([{t:'Level',f:r=>eh(r.level||'—')},{t:'Semester',f:r=>eh(r.semester||'—')},{t:'Session',f:r=>eh(r.session||'—')},{t:'Title',f:r=>eh(r.title||'Result')},{t:'GPA',f:r=>eh(r.gpa||'—')},{t:'',r:1,f:r=>'<button class="btn sm" onclick="doc(\\'/doc/result/'+r.id+'\\')">View / Download</button>'}],d.results,'No results uploaded yet.')+'</div>'));
   if(d.validations&&d.validations.length){
     w.appendChild($('<div class="panel"><h3>Exam Validation History</h3>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Type',f:r=>cap(r.exam_type||'exam')},{t:'Session',f:r=>(r.session||'—')+(r.semester?(' · '+r.semester):'')},{t:'Result',f:r=>'<span class="'+(r.status==='valid'?'pos':'neg')+'" style="font-weight:800">'+(r.status==='valid'?'CLEARED':'DENIED')+'</span>'},{t:'Reason',f:r=>r.reason||'—'}],d.validations,'No validations yet.')+'</div>'));
   }
