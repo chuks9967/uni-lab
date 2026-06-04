@@ -220,6 +220,16 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, { ok: true, applied, epoch: store.epoch });
   }
 
+  // Admin factory-reset: wipe the central store so the online portal is emptied too.
+  if (p === '/sync/reset' && req.method === 'POST') {
+    if (!tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized.' });
+    const body = await readBody(req);
+    if (!body || body.confirm !== 'RESET') return send(res, 400, { ok: false, error: 'confirm required' });
+    store = { epoch: crypto.randomUUID(), records: {}, branding: store.branding };
+    storeVersion = Date.now(); save();
+    return send(res, 200, { ok: true });
+  }
+
   // the app pushes its institution name + logo so the portal/login page is branded
   if (p === '/branding' && req.method === 'POST') {
     if (!tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized.' });
