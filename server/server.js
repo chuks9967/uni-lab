@@ -249,3 +249,23 @@ server.on('error', (e) => {
   console.error('Server error:', e.message); process.exit(1);
 });
 server.listen(PORT, () => console.log(`UniBursar hub [build ${BUILD}] listening on http://0.0.0.0:${PORT}  portal=${!!portal}  (data: ${STORE})`));
+
+// Keep a free-tier cloud instance awake so students always reach the portal even
+// when no desktop is online. Render exposes RENDER_EXTERNAL_URL; you can also set
+// KEEPALIVE_URL. Pinging our own public /health every ~10 min (< the ~15 min idle
+// cut-off) prevents the host from spinning the service down.
+const KEEPALIVE_URL = process.env.KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL || '';
+if (KEEPALIVE_URL) {
+  const https = require('https');
+  const ping = () => {
+    try {
+      const u = new URL('/health', KEEPALIVE_URL);
+      const lib = u.protocol === 'https:' ? https : http;
+      const req = lib.get(u, (r) => r.resume());
+      req.on('error', () => {});
+      req.setTimeout(15000, () => req.destroy());
+    } catch (_) {}
+  };
+  setInterval(ping, 10 * 60 * 1000);
+  console.log('[UniBursar] keepalive: pinging ' + KEEPALIVE_URL + ' every 10 min to stay always-on');
+}

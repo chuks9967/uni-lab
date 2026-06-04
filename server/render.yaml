@@ -1,0 +1,27 @@
+# Render Blueprint for the UniBursar cloud hub.
+# In Render: New → Blueprint → connect the repo → it reads this file.
+# The hub is zero-dependency Node, so it deploys in seconds.
+#
+# After deploy: open the service → Environment → copy the generated SYNC_TOKEN,
+# then enter the SAME token (and the service URL) in every desktop app
+# (Administration → Sync).
+services:
+  - type: web
+    name: unibursar-hub
+    runtime: node
+    plan: free                 # free tier; self-keepalive keeps it awake
+    rootDir: server            # run from the server/ folder
+    buildCommand: npm install  # no real deps — instant
+    startCommand: node server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: SYNC_TOKEN
+        generateValue: true     # Render makes a strong secret — copy it into the apps
+      # RENDER_EXTERNAL_URL is injected automatically, so the server self-pings
+      # every 10 min and never sleeps. Nothing else to set.
+      #
+      # To keep cloud data permanent across restarts you must move to a PAID
+      # instance and add a Disk, then set DATA_DIR to the mount path, e.g.:
+      # - key: DATA_DIR
+      #   value: /var/data

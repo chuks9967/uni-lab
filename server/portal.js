@@ -153,6 +153,9 @@ module.exports = function createPortal(deps) {
       examClearance: clr,
       validations,
       results: all('results').filter(r => r.student_id === s.id).map(r => ({ id: r.id, title: r.title, level: nameOf('levels', r.level_id), semester: nameOf('semesters', r.semester_id), session: nameOf('academic_sessions', r.session_id), gpa: r.gpa, remark: r.remark, mime: r.mime, date: r.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
+      documents: all('portal_documents').filter(d => (!d.faculty_id || d.faculty_id === s.faculty_id) && (!d.department_id || d.department_id === s.department_id) && (!d.level_id || d.level_id === s.level_id))
+        .map(d => ({ id: d.id, title: d.title, category: d.category, office: d.office, by: userName(d.uploaded_by), mime: d.mime, date: d.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
+      misconduct: all('misconducts').filter(m => m.student_id === s.id && !m.deleted).map(m => ({ offense: m.offense, severity: m.severity, action: m.action, fine: m.penalty_amount || 0, currency: m.currency, status: m.status, date: m.occurred_at || m.created_at, note: m.resolution_note || m.description || '' })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       charges: charges.map(c => ({ id: c.id, category: c.category, description: c.description, currency: c.currency, amount: c.amount, date: c.created_at, by: userName(c.created_by), rollover: !!c.is_rolled_over, rolled_from: nameOf('academic_sessions', c.rolled_from_session) })),
       payments: pays.map(p => ({ id: p.id, receipt_no: p.receipt_no, category: p.category, currency: p.currency, amount: p.amount, method: p.method, date: p.decided_at || p.created_at, office: ROLE_OFFICE[p.raised_role] || 'Office of the Bursar', collector: userName(p.decided_by || p.raised_by) })),
       outstanding: owingRows,
@@ -494,6 +497,13 @@ module.exports = function createPortal(deps) {
         res.writeHead(200, { 'Content-Type': r.mime || 'application/octet-stream', 'Content-Disposition': 'inline; filename="' + (r.filename || 'result') + '"' });
         res.end(buf); return true;
       }
+      if (type === 'portal-document' || type === 'document') {
+        const d = one('portal_documents', id);
+        if (!d || !d.file) return H(res, 404, '<p>Document not found.</p>');
+        const buf = Buffer.from(d.file, 'base64');
+        res.writeHead(200, { 'Content-Type': d.mime || 'application/octet-stream', 'Content-Disposition': 'inline; filename="' + (d.filename || 'document') + '"' });
+        res.end(buf); return true;
+      }
       return H(res, 404, '<p>Not found.</p>');
     }
     return false;
@@ -636,6 +646,14 @@ function studentView(w,d){
   w.appendChild($('<div class="panel"><h3>Payment History &amp; Receipts</h3>'+tbl([{t:'Receipt',f:r=>r.receipt_no||'—'},{t:'Date',f:r=>fmt(r.date)},{t:'For',f:r=>cap(r.category)},{t:'Collected By',f:r=>(r.collector?eh(r.collector)+'<br>':'')+'<span class="muted" style="font-size:11px">'+eh(r.office||'')+'</span>'},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)},{t:'',r:1,f:r=>r.receipt_no?'<button class="btn sm" onclick="doc(\\'/doc/receipt/'+r.id+'\\')">Receipt</button>':''}],d.payments,'No payments yet.')+'</div>'));
   // results — uploaded by the registrar/admin per level + semester
   w.appendChild($('<div class="panel"><h3>📑 My Results</h3>'+tbl([{t:'Level',f:r=>eh(r.level||'—')},{t:'Semester',f:r=>eh(r.semester||'—')},{t:'Session',f:r=>eh(r.session||'—')},{t:'Title',f:r=>eh(r.title||'Result')},{t:'GPA',f:r=>eh(r.gpa||'—')},{t:'',r:1,f:r=>'<button class="btn sm" onclick="doc(\\'/doc/result/'+r.id+'\\')">View / Download</button>'}],d.results,'No results uploaded yet.')+'</div>'));
+  // university documents (calendar, timetable, handbook…) — students download these; each shows the office that issued it
+  w.appendChild($('<div class="panel"><h3>📂 University Documents</h3>'+tbl([{t:'Title',f:r=>eh(r.title||'Document')},{t:'Type',f:r=>'<span class="badge">'+eh(r.category||'Document')+'</span>'},{t:'From Office',f:r=>eh(r.office||'—')+(r.by?'<br><span class="muted" style="font-size:11px">'+eh(r.by)+'</span>':'')},{t:'Date',f:r=>fmt(r.date)},{t:'',r:1,f:r=>'<button class="btn sm" onclick="doc(\\'/doc/portal-document/'+r.id+'\\')">Download</button>'}],d.documents,'No documents published yet.')+'</div>'));
+  // disciplinary / misconduct records — so students see when they've been flagged
+  if(d.misconduct&&d.misconduct.length){
+    var sevBadge=function(s){var c=s==='severe'?'background:#fee2e2;color:#991b1b':s==='major'?'background:#fef3c7;color:#92400e':'background:#e5e7eb;color:#374151';return '<span class="badge" style="'+c+'">'+cap(s||'minor')+'</span>';};
+    var stBadge=function(s){var c=s==='resolved'?'background:#dcfce7;color:#166534':'background:#fee2e2;color:#991b1b';return '<span class="badge" style="'+c+'">'+cap(s||'open')+'</span>';};
+    w.appendChild($('<div class="panel"><h3>⚖️ Disciplinary Records</h3>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Offense',f:r=>eh(r.offense||'—')},{t:'Severity',f:r=>sevBadge(r.severity)},{t:'Action',f:r=>cap(r.action||'—')},{t:'Fine',r:1,f:r=>r.fine>0?money(r.fine,r.currency):'—'},{t:'Status',f:r=>stBadge(r.status)},{t:'Note',f:r=>eh(r.note||'—')}],d.misconduct,'No misconduct on record.')+'</div>'));
+  }
   if(d.validations&&d.validations.length){
     w.appendChild($('<div class="panel"><h3>Exam Validation History</h3>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Type',f:r=>cap(r.exam_type||'exam')},{t:'Session',f:r=>(r.session||'—')+(r.semester?(' · '+r.semester):'')},{t:'Result',f:r=>'<span class="'+(r.status==='valid'?'pos':'neg')+'" style="font-weight:800">'+(r.status==='valid'?'CLEARED':'DENIED')+'</span>'},{t:'Reason',f:r=>r.reason||'—'}],d.validations,'No validations yet.')+'</div>'));
   }
