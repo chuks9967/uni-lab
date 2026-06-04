@@ -178,9 +178,34 @@ module.exports = function createPortal(deps) {
     return { profile: staffProfile(s), payslips: slips };
   }
 
+  // Build a period filter from query params: basis = day|week|month|semester|session|all
+  function parsePeriod(sp) {
+    const basis = sp.get('basis') || (sp.get('session') || sp.get('semester') ? 'session' : 'all');
+    return { basis, day: sp.get('day') || '', weekStart: sp.get('weekStart') || '', month: sp.get('month') || '', session: sp.get('session') || '', semester: sp.get('semester') || '' };
+  }
+  function periodLabel(period) {
+    if (!period) return 'All time';
+    switch (period.basis) {
+      case 'day': return period.day ? 'On ' + period.day : 'Daily';
+      case 'week': return period.weekStart ? 'Week of ' + period.weekStart : 'Weekly';
+      case 'month': return period.month ? 'Month of ' + period.month : 'Monthly';
+      case 'semester': return (period.session ? (nameOf('academic_sessions', period.session) || 'session') : 'All sessions') + ' · ' + (period.semester ? (nameOf('semesters', period.semester) || 'semester') : 'All semesters');
+      case 'session': return period.session ? (nameOf('academic_sessions', period.session) || 'Session') : 'All sessions';
+      default: return 'All time';
+    }
+  }
+
   function officerData(u, period) {
     const role = u.role;
-    const inP = (r) => (!period || !period.session || (r.session_id || '') === period.session) && (!period || !period.semester || (r.semester_id || '') === period.semester);
+    const dstr = (r) => String(r.decided_at || r.created_at || '');
+    const inP = (r) => {
+      if (!period || !period.basis || period.basis === 'all') return true;
+      if (period.basis === 'day') return !period.day || dstr(r).slice(0, 10) === period.day;
+      if (period.basis === 'week') { if (!period.weekStart) return true; const e = new Date(period.weekStart + 'T00:00:00'); e.setDate(e.getDate() + 7); const end = e.toISOString().slice(0, 10); const d = dstr(r).slice(0, 10); return d >= period.weekStart && d < end; }
+      if (period.basis === 'month') return !period.month || dstr(r).slice(0, 7) === period.month;
+      // session / semester
+      return (!period.session || (r.session_id || '') === period.session) && (!period.semester || (r.semester_id || '') === period.semester);
+    };
     const completed = all('payments').filter(p => p.status === 'completed' && inP(p));
     const out = {
       profile: { id: u.id, full_name: u.full_name, role, email: u.email },
@@ -435,7 +460,7 @@ module.exports = function createPortal(deps) {
     if (p === '/api/officer-report' && method === 'GET') {
       const t = authOf(req, u); if (!t || t.k !== 'user') return J(res, 401, { ok: false });
       const row = accountById('user', t.id); if (!row) return J(res, 401, { ok: false });
-      const data = officerData(row, { session: u.searchParams.get('session') || '', semester: u.searchParams.get('semester') || '' });
+      const data = officerData(row, parsePeriod(u.searchParams));
       data.role = t.role; data.institution = inst().name;
       return J(res, 200, { ok: true, data });
     }
@@ -480,9 +505,8 @@ module.exports = function createPortal(deps) {
       }
       if (type === 'officer-report' && t.k === 'user') {
         const row = accountById('user', t.id); if (!row) return H(res, 404, '<p>Not found.</p>');
-        const ss = u.searchParams.get('session') || ''; const sm = u.searchParams.get('semester') || '';
-        const label = (ss ? (nameOf('academic_sessions', ss) || 'session') : 'All sessions') + ' · ' + (sm ? (nameOf('semesters', sm) || 'semester') : 'All semesters');
-        return H(res, 200, officerReportHTML(officerData(row, { session: ss, semester: sm }), label));
+        const period = parsePeriod(u.searchParams);
+        return H(res, 200, officerReportHTML(officerData(row, period), periodLabel(period)));
       }
       if (type === 'student-statement' && t.k === 'user') {
         const s = one('students', id); if (!s) return H(res, 404, '<p>Student not found.</p>');
@@ -666,20 +690,44 @@ function staffView(w,d){
 }
 function officerControls(w,d){
   var per=d.period||{};var ps=d.periods||{sessions:[],semesters:[]};
-  var sessOpts='<option value="">All sessions</option>'+ps.sessions.map(function(s){return '<option value="'+s.id+'"'+(s.id===per.session?' selected':'')+'>'+eh(s.name)+'</option>';}).join('');
-  var semOpts='<option value="">All semesters</option>'+ps.semesters.filter(function(sm){return !per.session||sm.session_id===per.session;}).map(function(sm){return '<option value="'+sm.id+'"'+(sm.id===per.semester?' selected':'')+'>'+eh(sm.name)+'</option>';}).join('');
+  var today=new Date().toISOString().slice(0,10);var thisMonth=today.slice(0,7);
+  function o(v,l,sel){return '<option value="'+v+'"'+(sel?' selected':'')+'>'+l+'</option>';}
+  var basis=per.basis||'all';
+  var basisOpts=[['all','All time'],['day','Daily'],['week','Weekly'],['month','Monthly'],['semester','Semester'],['session','Session']].map(function(x){return o(x[0],x[1],basis===x[0]);}).join('');
+  var sessOpts='<option value="">All sessions</option>'+ps.sessions.map(function(s){return o(s.id,eh(s.name),s.id===per.session);}).join('');
+  var semOpts='<option value="">All semesters</option>'+ps.semesters.map(function(sm){return o(sm.id,eh(sm.name),sm.id===per.semester);}).join('');
   var bar=$('<div class="panel"><div style="padding:14px 16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">'
-    +'<b>📊 Report period:</b> <select id="of-sess">'+sessOpts+'</select> <select id="of-sem">'+semOpts+'</select>'
-    +'<button class="btn sm" id="of-dl" style="width:auto">📄 Download this report</button>'
+    +'<b>📊 Report:</b> <select id="of-basis">'+basisOpts+'</select> <span id="of-valwrap"></span>'
+    +'<button class="btn sm" id="of-dl" style="width:auto">📄 Download</button>'
     +'<span style="flex:1"></span>'
-    +'<input id="of-find" placeholder="🔎 Find a student to download their statement…" style="min-width:240px;width:auto">'
+    +'<input id="of-find" placeholder="🔎 Find a student…" style="min-width:220px;width:auto">'
     +'</div><div id="of-find-res" style="padding:0 16px 14px"></div></div>');
   w.appendChild(bar);
-  var sess=bar.querySelector('#of-sess'),sem=bar.querySelector('#of-sem');
-  function reload(){officerReload(sess.value,sem.value);}
-  sess.onchange=function(){officerReload(sess.value,'');};
-  sem.onchange=reload;
-  bar.querySelector('#of-dl').onclick=function(){doc('/doc/officer-report?session='+encodeURIComponent(sess.value)+'&semester='+encodeURIComponent(sem.value));};
+  var basisSel=bar.querySelector('#of-basis'),valwrap=bar.querySelector('#of-valwrap');
+  function buildVal(){
+    var b=basisSel.value;
+    if(b==='day')valwrap.innerHTML='<input type="date" id="of-day" value="'+(per.day||today)+'">';
+    else if(b==='week')valwrap.innerHTML='week of <input type="date" id="of-week" value="'+(per.weekStart||today)+'">';
+    else if(b==='month')valwrap.innerHTML='<input type="month" id="of-month" value="'+(per.month||thisMonth)+'">';
+    else if(b==='session')valwrap.innerHTML='<select id="of-sess">'+sessOpts+'</select>';
+    else if(b==='semester')valwrap.innerHTML='<select id="of-sess">'+sessOpts+'</select> <select id="of-sem">'+semOpts+'</select>';
+    else valwrap.innerHTML='';
+    Array.prototype.forEach.call(valwrap.querySelectorAll('input,select'),function(el){el.onchange=apply;});
+  }
+  function gather(){
+    var b=basisSel.value,p={basis:b},e;
+    if(b==='day'){e=valwrap.querySelector('#of-day');p.day=e?e.value:today;}
+    else if(b==='week'){e=valwrap.querySelector('#of-week');p.weekStart=e?e.value:today;}
+    else if(b==='month'){e=valwrap.querySelector('#of-month');p.month=e?e.value:thisMonth;}
+    else if(b==='session'){e=valwrap.querySelector('#of-sess');p.session=e?e.value:'';}
+    else if(b==='semester'){var s=valwrap.querySelector('#of-sess'),m=valwrap.querySelector('#of-sem');p.session=s?s.value:'';p.semester=m?m.value:'';}
+    return p;
+  }
+  function qstr(p){return Object.keys(p).map(function(k){return k+'='+encodeURIComponent(p[k]||'');}).join('&');}
+  function apply(){officerReload(gather());}
+  basisSel.onchange=function(){buildVal();apply();};
+  buildVal();
+  bar.querySelector('#of-dl').onclick=function(){doc('/doc/officer-report?'+qstr(gather()));};
   var find=bar.querySelector('#of-find'),fres=bar.querySelector('#of-find-res');var ft;
   find.addEventListener('input',function(){clearTimeout(ft);ft=setTimeout(async function(){
     var q=find.value.trim();fres.innerHTML='';if(q.length<2)return;
@@ -688,8 +736,9 @@ function officerControls(w,d){
     if(!(r.students||[]).length)fres.innerHTML='<div class="muted">No match.</div>';
   },200);});
 }
-function officerReload(session,semester){
-  api('/api/officer-report?session='+encodeURIComponent(session||'')+'&semester='+encodeURIComponent(semester||'')).then(function(r){
+function officerReload(period){
+  var qs=Object.keys(period||{}).map(function(k){return k+'='+encodeURIComponent(period[k]||'');}).join('&');
+  api('/api/officer-report?'+qs).then(function(r){
     if(!r.ok)return;var d=r.data;var w=document.querySelector('.wrap');w.innerHTML='';officerView(w,d);
   });
 }
