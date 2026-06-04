@@ -42,7 +42,11 @@ function amountWords(a, c) { const whole = Math.floor(Number(a) || 0); const k =
 
 module.exports = function createPortal(deps) {
   const { all, one, getVersion, secret, institution, update } = deps;
-  const KEY = secret || 'unibursar-portal';
+  // The session-token signing key. If no shared secret is configured we use a
+  // strong RANDOM per-process key (never the old public default), so portal
+  // tokens can never be forged. Set a SYNC_TOKEN to keep sessions across restarts.
+  const KEY = (secret && String(secret).length >= 8) ? secret : crypto.randomBytes(32).toString('hex');
+  if (!(secret && String(secret).length >= 8)) { try { console.warn('[UniBursar] No strong SYNC_TOKEN set — using a random session key (logins reset on restart). Set SYNC_TOKEN for persistent, secure sessions.'); } catch (_) {} }
 
   // ---- token (HMAC-signed, stateless) ----
   function sign(payload) {
@@ -181,7 +185,7 @@ module.exports = function createPortal(deps) {
   // Build a period filter from query params: basis = day|week|month|semester|session|all
   function parsePeriod(sp) {
     const basis = sp.get('basis') || (sp.get('session') || sp.get('semester') ? 'session' : 'all');
-    return { basis, day: sp.get('day') || '', weekStart: sp.get('weekStart') || '', month: sp.get('month') || '', session: sp.get('session') || '', semester: sp.get('semester') || '' };
+    return { basis, day: sp.get('day') || '', weekStart: sp.get('weekStart') || '', month: sp.get('month') || '', session: sp.get('session') || '', semester: sp.get('semester') || '', office: sp.get('office') || '' };
   }
   function periodLabel(period) {
     if (!period) return 'All time';
@@ -208,7 +212,7 @@ module.exports = function createPortal(deps) {
     };
     const completed = all('payments').filter(p => p.status === 'completed' && inP(p));
     const out = {
-      profile: { id: u.id, full_name: u.full_name, role, email: u.email },
+      profile: { id: u.id, full_name: u.full_name, role, email: u.email, photo: u.photo || '' },
       periods: { sessions: all('academic_sessions').map(s => ({ id: s.id, name: s.name })), semesters: all('semesters').map(s => ({ id: s.id, name: s.name, session_id: s.session_id })) },
       period: period || {},
     };
@@ -220,9 +224,27 @@ module.exports = function createPortal(deps) {
       const students = all('students').filter(s => s.status !== 'alumni');
       let debtors = 0; for (const s of students) if (Object.values(balancesFor(s.id)).some(v => v > 0.001)) debtors++;
       out.kind = 'finance';
+      out.canPickOffice = true;
       out.cards = { collected, billed, expenses, students: students.length, debtors };
-      out.recent = completed.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 40)
-        .map(p => ({ receipt_no: p.receipt_no, student: studentName(p.student_id), category: p.category, amount: p.amount, currency: p.currency, date: p.decided_at || p.created_at }));
+      const OFFICE_LABEL = { accountant: 'Bursary / Accountant', registrar: 'Registrar', dean: 'Faculty Head (Dean)', student_affairs: 'Student Affairs', admin: 'Administration' };
+      const userName = (id) => { const x = id ? one('users', id) : null; return x ? x.full_name : '—'; };
+      // collections grouped by the office that collected them
+      const byOffice = {};
+      for (const p of completed) { const r = p.raised_role || 'accountant'; byOffice[r] = byOffice[r] || {}; byOffice[r][p.currency] = (byOffice[r][p.currency] || 0) + p.amount; }
+      out.byOffice = Object.entries(byOffice).map(([r, m]) => ({ role: r, office: OFFICE_LABEL[r] || r, amounts: m })).sort((a, b) => a.office.localeCompare(b.office));
+      // optional office filter (the accountant picks an office to drill into)
+      const off = period && period.office;
+      const filtered = off ? completed.filter(p => (p.raised_role || 'accountant') === off) : completed;
+      out.officeFilter = off || '';
+      out.recent = filtered.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 60)
+        .map(p => ({ receipt_no: p.receipt_no, student: studentName(p.student_id), category: p.category, amount: p.amount, currency: p.currency, office: OFFICE_LABEL[p.raised_role || 'accountant'] || '—', by: userName(p.decided_by || p.raised_by), date: p.decided_at || p.created_at }));
+      // expenses — ALL offices, with who recorded them
+      const expRows = all('expenses').filter(inP);
+      const expByOffice = {};
+      for (const e of expRows) { const r = (one('users', e.recorded_by) || {}).role || 'accountant'; expByOffice[r] = expByOffice[r] || {}; expByOffice[r][e.currency] = (expByOffice[r][e.currency] || 0) + e.amount; }
+      out.expensesByOffice = Object.entries(expByOffice).map(([r, m]) => ({ office: OFFICE_LABEL[r] || r, amounts: m }));
+      out.expensesList = expRows.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 60)
+        .map(e => ({ category: e.category, description: e.description, amount: e.amount, currency: e.currency, by: userName(e.recorded_by), date: e.created_at }));
     } else if (role === 'registrar' || role === 'student_affairs') {
       out.kind = 'registrar';
       out.collected = {};
@@ -577,12 +599,26 @@ th{background:#f8fafc;font-size:11px;text-transform:uppercase;letter-spacing:.4p
 .muted{color:var(--muted)}.badge{background:#eef2ff;color:#3730a3;border-radius:999px;padding:3px 9px;font-size:11px;font-weight:700}
 .empty{padding:24px;text-align:center;color:var(--muted)}
 .live{font-size:11px;color:#16a34a;margin-left:8px}
+.tscroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+select{padding:9px 10px;border:1px solid var(--line);border-radius:9px;font-size:13.5px;background:#fff;max-width:100%}
+.toolbarp{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .pbanner{background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe;border-radius:12px;padding:11px 16px;margin-bottom:14px;font-size:13.5px}
 .exbar{border-radius:12px;padding:13px 16px;margin-bottom:14px;font-weight:800;text-align:center;letter-spacing:.3px;font-size:15px}
 .exbar.ok{background:#dcfce7;color:#166534;border:1px solid #86efac}
 .exbar.warn{background:#fef9c3;color:#854d0e;border:1px solid #fde68a}
 .exbar.bad{background:#fee2e2;color:#991b1b;border:1px solid #fca5a5}
-@media(max-width:560px){.top .rl{display:none}}
+@media(max-width:760px){
+  .wrap{padding:12px}
+  .top{padding:11px 14px;gap:9px}
+  .kpis{grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px}
+  .kpi{padding:13px}.kpi .v{font-size:19px}
+  .panel h3{padding:12px 14px;font-size:14px}
+  th,td{padding:9px 11px;font-size:13px;white-space:nowrap}
+  .tscroll table{min-width:560px}
+  .prof{flex-direction:column;text-align:center;gap:10px}
+  .prof img,.prof .ph{width:96px;height:112px}
+}
+@media(max-width:560px){.top .rl{display:none}.lbox{padding:22px}}
 </style></head>
 <body>
 <div id="app"></div>
@@ -642,7 +678,7 @@ async function renderApp(){
   if(TIMER)clearInterval(TIMER);
   TIMER=setInterval(async()=>{try{const v=(await api('/api/version')).version;if(v!==VER){VER=v;renderApp();}}catch(_){}},5000);
 }
-function tbl(cols,rows,empty){if(!rows||!rows.length)return '<div class="empty">'+(empty||'Nothing to show.')+'</div>';return '<table><thead><tr>'+cols.map(c=>'<th class="'+(c.r?'r':'')+'">'+c.t+'</th>').join('')+'</tr></thead><tbody>'+rows.map(row=>'<tr>'+cols.map(c=>'<td class="'+(c.r?'r':'')+'">'+c.f(row)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';}
+function tbl(cols,rows,empty){if(!rows||!rows.length)return '<div class="empty">'+(empty||'Nothing to show.')+'</div>';return '<div class="tscroll"><table><thead><tr>'+cols.map(c=>'<th class="'+(c.r?'r':'')+'">'+c.t+'</th>').join('')+'</tr></thead><tbody>'+rows.map(row=>'<tr>'+cols.map(c=>'<td class="'+(c.r?'r':'')+'">'+c.f(row)+'</td>').join('')+'</tr>').join('')+'</tbody></table></div>';}
 function doc(path){window.open(path+(path.includes('?')?'&':'?')+'t='+encodeURIComponent(TOKEN),'_blank');}
 
 function studentView(w,d){
@@ -696,14 +732,19 @@ function officerControls(w,d){
   var basisOpts=[['all','All time'],['day','Daily'],['week','Weekly'],['month','Monthly'],['semester','Semester'],['session','Session']].map(function(x){return o(x[0],x[1],basis===x[0]);}).join('');
   var sessOpts='<option value="">All sessions</option>'+ps.sessions.map(function(s){return o(s.id,eh(s.name),s.id===per.session);}).join('');
   var semOpts='<option value="">All semesters</option>'+ps.semesters.map(function(sm){return o(sm.id,eh(sm.name),sm.id===per.semester);}).join('');
-  var bar=$('<div class="panel"><div style="padding:14px 16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">'
+  // finance officers (accountant/admin) can drill into a specific office's collections
+  var officeCtrl='';
+  if(d.canPickOffice){var oo=per.office||'';officeCtrl='<span class="muted">Office:</span> <select id="of-office">'+[['','All offices'],['accountant','Bursary / Accountant'],['registrar','Registrar'],['dean','Faculty Head (Dean)'],['student_affairs','Student Affairs']].map(function(x){return o(x[0],x[1],oo===x[0]);}).join('')+'</select>';}
+  var bar=$('<div class="panel"><div class="toolbarp" style="padding:14px 16px">'
     +'<b>📊 Report:</b> <select id="of-basis">'+basisOpts+'</select> <span id="of-valwrap"></span>'
+    +officeCtrl
     +'<button class="btn sm" id="of-dl" style="width:auto">📄 Download</button>'
     +'<span style="flex:1"></span>'
-    +'<input id="of-find" placeholder="🔎 Find a student…" style="min-width:220px;width:auto">'
+    +'<input id="of-find" placeholder="🔎 Find a student…" style="min-width:200px;width:auto">'
     +'</div><div id="of-find-res" style="padding:0 16px 14px"></div></div>');
   w.appendChild(bar);
   var basisSel=bar.querySelector('#of-basis'),valwrap=bar.querySelector('#of-valwrap');
+  var officeSel=bar.querySelector('#of-office');if(officeSel)officeSel.onchange=apply;
   function buildVal(){
     var b=basisSel.value;
     if(b==='day')valwrap.innerHTML='<input type="date" id="of-day" value="'+(per.day||today)+'">';
@@ -721,6 +762,7 @@ function officerControls(w,d){
     else if(b==='month'){e=valwrap.querySelector('#of-month');p.month=e?e.value:thisMonth;}
     else if(b==='session'){e=valwrap.querySelector('#of-sess');p.session=e?e.value:'';}
     else if(b==='semester'){var s=valwrap.querySelector('#of-sess'),m=valwrap.querySelector('#of-sem');p.session=s?s.value:'';p.semester=m?m.value:'';}
+    if(officeSel&&officeSel.value)p.office=officeSel.value;
     return p;
   }
   function qstr(p){return Object.keys(p).map(function(k){return k+'='+encodeURIComponent(p[k]||'');}).join('&');}
@@ -743,10 +785,22 @@ function officerReload(period){
   });
 }
 function officerView(w,d){
+  var pp=d.profile||{};
+  w.appendChild($('<div class="panel"><div class="prof">'+(pp.photo?'<img src="'+pp.photo+'">':'<div class="ph">👤</div>')+'<div><div class="nm">'+eh(pp.full_name||'Officer')+'</div><div class="meta" style="text-transform:capitalize">'+eh((d.role||'').replace("_"," "))+' • '+eh(pp.email||'')+'</div></div></div></div>'));
   officerControls(w,d);
   if(d.kind==='finance'){
     w.appendChild($('<div class="kpis">'+kpi('Collected',mapMoney(d.cards.collected))+kpi('Billed',mapMoney(d.cards.billed))+kpi('Expenses',mapMoney(d.cards.expenses))+kpi('Students',d.cards.students)+kpi('Debtors',d.cards.debtors)+'</div>'));
-    w.appendChild($('<div class="panel"><h3>Recent Payments</h3>'+tbl([{t:'Receipt',f:r=>r.receipt_no||'—'},{t:'Student',f:r=>r.student},{t:'For',f:r=>cap(r.category)},{t:'Date',f:r=>fmt(r.date)},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)}],d.recent,'No payments.')+'</div>'));
+    // collections grouped by office (who collected)
+    if(d.byOffice&&d.byOffice.length){
+      w.appendChild($('<div class="panel"><h3>💰 Collections by Office</h3>'+tbl([{t:'Office',f:r=>eh(r.office)},{t:'Collected',r:1,f:r=>mapMoney(r.amounts)}],d.byOffice,'No collections.')+'</div>'));
+    }
+    var rtitle = d.officeFilter ? 'Payments — '+eh((d.byOffice.find(function(o){return o.role===d.officeFilter;})||{}).office||'office') : 'Recent Payments (all offices)';
+    w.appendChild($('<div class="panel"><h3>'+rtitle+'</h3>'+tbl([{t:'Receipt',f:r=>r.receipt_no||'—'},{t:'Student',f:r=>eh(r.student)},{t:'For',f:r=>cap(r.category)},{t:'Office',f:r=>eh(r.office||'—')},{t:'By',f:r=>eh(r.by||'—')},{t:'Date',f:r=>fmt(r.date)},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)}],d.recent,'No payments.')+'</div>'));
+    // expenses — all offices
+    if(d.expensesByOffice&&d.expensesByOffice.length){
+      w.appendChild($('<div class="panel"><h3>📉 Expenses by Office</h3>'+tbl([{t:'Office',f:r=>eh(r.office)},{t:'Spent',r:1,f:r=>mapMoney(r.amounts)}],d.expensesByOffice,'No expenses.')+'</div>'));
+    }
+    w.appendChild($('<div class="panel"><h3>Expense Records (all offices)</h3>'+tbl([{t:'Category',f:r=>cap(r.category)},{t:'Description',f:r=>eh(r.description||'—')},{t:'Recorded By',f:r=>eh(r.by||'—')},{t:'Date',f:r=>fmt(r.date)},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)}],d.expensesList||[],'No expenses recorded yet.')+'</div>'));
   } else if(d.kind==='registrar'){
     w.appendChild($('<div class="kpis">'+kpi('My Collections',mapMoney(d.collected))+kpi('Students I Billed',d.students.length)+'</div>'));
     w.appendChild($('<div class="panel"><h3>Students I Billed — paid vs owing</h3>'+tbl([{t:'Name',f:r=>r.full_name},{t:'Matric',f:r=>r.matric_no||'—'},{t:'Department',f:r=>r.department||'—'},{t:'Paid',r:1,f:r=>mapMoney(r.paid)},{t:'Owing',r:1,f:r=>'<span class=neg>'+mapMoney(r.owing)+'</span>'}],d.students,'You have not billed anyone yet.')+'</div>'));
