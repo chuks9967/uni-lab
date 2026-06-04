@@ -207,7 +207,13 @@ const server = http.createServer(async (req, res) => {
     for (const ch of changes) {
       const entity = ch && ch.entity, row = ch && ch.row; if (!entity || !row || !row.id) continue;
       const key = `${entity}:${row.id}`; const updated_at = row.updated_at || new Date().toISOString();
-      const prev = store.records[key]; if (prev && prev.updated_at && updated_at <= prev.updated_at) continue;
+      const prev = store.records[key];
+      // sticky deletes: a delete always wins and is never resurrected
+      if (prev && prev.row && prev.row.deleted && !row.deleted) continue;
+      if (row.deleted) { if (!(prev && prev.row && prev.row.deleted)) { store.records[key] = { entity, id: row.id, row, updated_at }; applied++; } continue; }
+      // sticky payment decisions: never revert a decided payment back to pending
+      if (entity === 'payments' && prev && prev.row && ['completed', 'denied', 'voided'].includes(prev.row.status) && row.status === 'pending') continue;
+      if (prev && prev.updated_at && updated_at <= prev.updated_at) continue;
       store.records[key] = { entity, id: row.id, row, updated_at }; applied++;
     }
     if (applied) { storeVersion = Date.now(); save(); }
