@@ -11,6 +11,14 @@
  * Pure Node — no dependencies. Mounted by server.js via createPortal().
  */
 const crypto = require('crypto');
+// pure-Node QR encoder (no npm deps — keeps the hub zero-dependency). Used to print a
+// SCANNABLE verification QR on portal receipts & payslips.
+let qrcode = null; try { qrcode = require('./qrcode'); } catch (_) { qrcode = null; }
+function verifyQrSvg(targetUrl) {
+  if (!qrcode || !targetUrl) return '';
+  // force a fixed display size (viewBox keeps it crisp + scannable at any QR version)
+  try { return qrcode.toSVG(targetUrl, { ec: 'M', cellSize: 3, margin: 1 }).replace(/width="\d+" height="\d+"/, 'width="104" height="104"'); } catch (_) { return ''; }
+}
 
 const SYM = { NGN: '₦', XOF: 'CFA', USD: '$', EUR: '€', GBP: '£', GHS: '₵', KES: 'KSh', ZAR: 'R', GMD: 'D', SLL: 'Le' };
 function money(a, c) { const n = Number(a || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); return `${SYM[c] || (c ? c + ' ' : '')}${n}`; }
@@ -42,6 +50,16 @@ function amountWords(a, c) { const whole = Math.floor(Number(a) || 0); const k =
 
 module.exports = function createPortal(deps) {
   const { all, one, getVersion, secret, institution, update } = deps;
+  // the public base URL of THIS request (https://host) — used to print absolute,
+  // scannable verification URLs in the QR on receipts/payslips. Set per request.
+  let docBase = '';
+  function buildBase(req) {
+    try {
+      const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() || (req.socket && req.socket.encrypted ? 'https' : 'http');
+      const host = req.headers['x-forwarded-host'] || req.headers.host || '';
+      return host ? `${proto}://${host}` : '';
+    } catch (_) { return ''; }
+  }
   // The session-token signing key. If no shared secret is configured we use a
   // strong RANDOM per-process key (never the old public default), so portal
   // tokens can never be forged. Set a SYNC_TOKEN to keep sessions across restarts.
@@ -341,12 +359,14 @@ module.exports = function createPortal(deps) {
     const s = one('students', p.student_id) || {};
     const office = ROLE_OFFICE[p.raised_role] || 'Office of the Bursar';
     const receivedBy = (one('users', p.decided_by) || one('users', p.raised_by) || {}).full_name || office;
+    const catRow = all('fee_categories').find(c => c.key === p.category && !c.deleted);
+    const feeLabel = (catRow && catRow.name) || (p.category ? p.category[0].toUpperCase() + p.category.slice(1).replace(/_/g, ' ') + ' Fee' : '—');
     return {
       valid: true, kind: 'receipt',
       ref: String(p.id).replace(/-/g, '').slice(0, 8).toUpperCase(),
       receipt_no: p.receipt_no || '—',
       amountText: money(p.amount, p.currency),
-      category: p.category, narration: p.narration || p.description || '',
+      category: feeLabel, narration: p.narration || '',
       method: String(p.channel || p.method || 'cash').toUpperCase(),
       dateText: fmtDate(p.decided_at || p.created_at), office, receivedBy,
       student: {
@@ -354,6 +374,28 @@ module.exports = function createPortal(deps) {
         matric: s.matric_no || '—', photo: s.photo || '',
         faculty: nameOf('faculties', s.faculty_id) || '—', department: nameOf('departments', s.department_id) || '—',
       },
+    };
+  }
+
+  // Public payslip authenticity check (no login) — confirms a payslip presented to a
+  // bank/landlord is genuine: who it's for, the period, and the NET pay.
+  function verifyPayslip(idOrRef) {
+    const key = String(idOrRef || '').trim();
+    if (!key) return { valid: false };
+    let ps = one('payslips', key);
+    if (!ps) { const want = key.replace(/-/g, '').toLowerCase(); if (want.length >= 6 && want.length <= 16) ps = all('payslips').find(x => String(x.id).replace(/-/g, '').toLowerCase().startsWith(want)); }
+    if (!ps || ps.deleted) return { valid: false };
+    const st = one('staff', ps.staff_id) || {};
+    const run = one('payroll_runs', ps.run_id) || {};
+    const cur = ps.currency || st.currency;
+    const isLect = st.staff_type === 'lecturer';
+    return {
+      valid: true, kind: 'payslip',
+      ref: String(ps.id).replace(/-/g, '').slice(0, 8).toUpperCase(),
+      staffType: isLect ? 'Lecturer' : 'Staff',
+      net: money(ps.net, cur), gross: money(ps.gross, cur),
+      period: run.period || '—', dateText: fmtDate(run.updated_at || run.created_at),
+      staff: { name: st.full_name || 'Unknown', staffNo: st.staff_no || '—', photo: st.photo || '', department: st.department || st.faculty || '—' },
     };
   }
 
@@ -389,6 +431,12 @@ module.exports = function createPortal(deps) {
     const issuer = one('users', p.decided_by) || one('users', p.raised_by) || {};
     const office = officeOf(p.raised_role, issuer.department_id || s.department_id);
     const receivedBy = issuer.full_name || office;
+    // the line DESCRIPTION is the FEE paid for (category), NOT the narration
+    const catRow = all('fee_categories').find(c => c.key === p.category && !c.deleted);
+    const feeLabel = (catRow && catRow.name) || (p.category ? p.category[0].toUpperCase() + p.category.slice(1).replace(/_/g, ' ') + ' Fee' : 'Fee');
+    // scannable verification QR → opens this hub's /verify page (same as the desktop receipt)
+    const verifyUrl = (docBase ? docBase : '') + '/verify?r=' + p.id;
+    const qrSvg = verifyQrSvg(verifyUrl);
     // SCOPE to the issuing office (mirrors the desktop): admin/accountant = full account;
     // any other office's receipt reflects only that office's fees/collections.
     const officeRole = ['admin', 'accountant'].includes(p.raised_role) ? null : p.raised_role;
@@ -412,10 +460,10 @@ module.exports = function createPortal(deps) {
         ${f('Level', nameOf('levels', s.level_id), 'Received By', receivedBy)}
       </tbody></table>
       <div class="bar">Payment Details</div>
-      <table><tbody>${f('Narration', p.narration || p.description || '—', 'Currency', cur)}</tbody></table>
+      <table><tbody>${f('Narration', p.narration || '—', 'Currency', cur)}</tbody></table>
       <div class="bar">Payment Breakdown</div>
       <table><thead><tr><th>Description</th><th class="r">Amount (${esc(cur)})</th><th class="r">Paid Now</th><th class="r">Balance After</th></tr></thead>
-        <tbody><tr><td>${esc(p.narration || p.description || (p.category[0].toUpperCase() + p.category.slice(1) + ' Fee'))}</td><td class="r">${money(lineRate, cur)}</td><td class="r"><b>${money(p.amount, cur)}</b></td><td class="r">${money(lineRate - paidCat, cur)}</td></tr></tbody></table>
+        <tbody><tr><td>${esc(feeLabel)}</td><td class="r">${money(lineRate, cur)}</td><td class="r"><b>${money(p.amount, cur)}</b></td><td class="r">${money(lineRate - paidCat, cur)}</td></tr></tbody></table>
       <div class="tot">TOTAL PAID: ${money(p.amount, cur)}</div>
       <div class="bar">Payment Summary</div>
       <table><tbody>
@@ -423,8 +471,11 @@ module.exports = function createPortal(deps) {
         ${f('Previous Net Balance', money(prevBal, cur), 'New Net Balance', money(newBal, cur))}
       </tbody></table>
       <div class="bar">Authenticity</div>
-      <table><tbody><tr><td style="color:#64748b">Verification ref</td><td><b style="letter-spacing:1px">${esc(String(p.id).replace(/-/g, '').slice(0, 8).toUpperCase())}</b></td><td style="color:#64748b">Verify online</td><td><a href="/verify?r=${esc(p.id)}">/verify?r=…</a></td></tr></tbody></table>
-      <p style="margin-top:18px;color:#64748b;font-size:11px">Received by ${esc(receivedBy)} (${esc(office)}) • Student copy of a computer-generated receipt; it mirrors the official receipt issued in the office. Anyone can confirm it is genuine on the Verify page above.</p>`;
+      <div style="display:flex;align-items:center;gap:14px;border:1px dashed #cbd5e1;border-radius:10px;padding:12px 14px;margin-top:8px">
+        ${qrSvg ? `<div style="width:104px;height:104px;flex:none">${qrSvg}</div>` : ''}
+        <div style="font-size:11.5px;color:#475569;line-height:1.5">Scan to verify this receipt is genuine.<br>Verification ref <b style="letter-spacing:1px;color:#111827">${esc(String(p.id).replace(/-/g, '').slice(0, 8).toUpperCase())}</b><br>or visit <a href="${esc(verifyUrl)}">${esc((docBase || '') + '/verify')}</a></div>
+      </div>
+      <p style="margin-top:18px;color:#64748b;font-size:11px">Received by ${esc(receivedBy)} (${esc(office)}) • Student copy of a computer-generated receipt; it mirrors the official receipt issued in the office. Anyone can confirm it is genuine by scanning the QR above.</p>`;
     return docShell('Payment Receipt', body, 'STUDENT COPY');
   }
 
@@ -446,6 +497,8 @@ module.exports = function createPortal(deps) {
     const cur = slip.currency || s.currency;
     const isLect = s.staff_type === 'lecturer';
     const wmText = isLect ? 'LECTURER PAYROLL' : 'STAFF PAYROLL';
+    const psVerifyUrl = (docBase || '') + '/verify?p=' + slip.id;
+    const psQr = verifyQrSvg(psVerifyUrl);
     const f = (l, v) => `<tr><td style="color:#64748b">${l}</td><td class="r"><b>${v}</b></td></tr>`;
     const body = `${s.photo ? `<img class="photo" src="${s.photo}">` : ''}
       <div class="grid" style="margin-bottom:8px"><div class="f"><span>Name</span><b>${esc(s.full_name)}</b></div><div class="f"><span>Staff No</span><b>${esc(s.staff_no || '—')}</b></div>
@@ -460,7 +513,12 @@ module.exports = function createPortal(deps) {
         ${f('Loan / IOU Deduction', money(slip.loan_deduction, cur))}
       </tbody></table>
       <div class="tot">NET PAY: ${money(slip.net, cur)}</div>
-      <p style="margin-top:8px" class="words">${esc(amountWords(slip.net, cur))}</p>`;
+      <p style="margin-top:8px" class="words">${esc(amountWords(slip.net, cur))}</p>
+      <div class="bar">Authenticity</div>
+      <div style="display:flex;align-items:center;gap:14px;border:1px dashed #cbd5e1;border-radius:10px;padding:12px 14px;margin-top:8px">
+        ${psQr ? `<div style="width:104px;height:104px;flex:none">${psQr}</div>` : ''}
+        <div style="font-size:11.5px;color:#475569;line-height:1.5">Scan to verify this payslip is genuine.<br>Verification ref <b style="letter-spacing:1px;color:#111827">${esc(String(slip.id).replace(/-/g, '').slice(0, 8).toUpperCase())}</b><br>or visit <a href="${esc(psVerifyUrl)}">${esc((docBase || '') + '/verify')}</a></div>
+      </div>`;
     return docShell((s.staff_type === 'lecturer' ? 'Lecturer' : 'Staff') + ' Payslip', body, wmText);
   }
 
@@ -494,6 +552,7 @@ module.exports = function createPortal(deps) {
 
   async function handle(req, res, u, method, readBody) {
     const p = u.pathname.replace(/\/+$/, '') || '/';
+    docBase = buildBase(req); // so any document we render this request can build absolute verify URLs
 
     if (p === '/' && method === 'GET') { H(res, 200, PAGE); return true; }
     if (p === '/api/version' && method === 'GET') { J(res, 200, { version: getVersion() }); return true; }
@@ -517,6 +576,12 @@ module.exports = function createPortal(deps) {
     if (method === 'GET' && p === '/scan') return H(res, 200, SCAN_PAGE);
     if (method === 'GET' && p === '/verify') return H(res, 200, VERIFY_PAGE);
     if (method === 'GET' && p === '/api/verify') {
+      let pid = u.searchParams.get('p') || '';
+      if (pid) { // a payslip code/link
+        const mp = /[?&]p=([^&\\s]+)/.exec(pid); if (mp) pid = decodeURIComponent(mp[1]);
+        pid = pid.replace(/^UBU-PSL:/i, '').trim();
+        return J(res, 200, { ok: true, ...verifyPayslip(pid) });
+      }
       let rid = u.searchParams.get('r') || '';
       if (rid) { // a receipt code/link
         const mr = /[?&]r=([^&\\s]+)/.exec(rid); if (mr) rid = decodeURIComponent(mr[1]);
@@ -926,6 +991,13 @@ function renderResult(el,d){
      '<table>'+row('Receipt No',d.receipt_no)+row('Amount paid',d.amountText)+row('Paid for',d.category)+row('Narration',d.narration)+row('Method',d.method)+row('Date',d.dateText)+row('Issued by',d.office)+row('Received by',d.receivedBy)+row('Faculty',rs.faculty)+row('Department',rs.department)+row('Verification ref',d.ref)+'</table>'+
      '<button class="btn" onclick="resetView&&resetView()">Check another</button></div>';
     return;}
+  if(d.kind==='payslip'){var ps=d.staff;
+    el.innerHTML='<div class="rcard valid">'+
+     '<div class="big">✓ GENUINE PAYSLIP</div>'+
+     '<div class="who">'+(ps.photo?'<img src="'+ps.photo+'" alt="photo">':'<div class="ph">💼</div>')+'<div><div class="nm">'+esc(ps.name)+'</div><div class="mt">'+esc(ps.staffNo)+'</div></div></div>'+
+     '<table>'+row('Type',d.staffType)+row('Department',ps.department)+row('Pay period',d.period)+row('Net pay',d.net)+row('Gross',d.gross)+row('Pay date',d.dateText)+row('Verification ref',d.ref)+'</table>'+
+     '<button class="btn" onclick="resetView&&resetView()">Check another</button></div>';
+    return;}
   var s=d.student;var ok=d.completed;
   el.innerHTML='<div class="rcard '+(ok?'valid':'warn')+'">'+
    '<div class="big">'+(ok?'✓ CLEARED':'⚠ '+String(d.status||'NOT COMPLETE').toUpperCase())+'</div>'+
@@ -1022,9 +1094,10 @@ ${RESULT_CSS}
 ${RESULT_JS}
 function resetView(){location.href='/scan';}
 var el=document.getElementById('result');
-var q=new URLSearchParams(location.search);var rr=q.get('r');var c=q.get('c')||q.get('ref');
+var q=new URLSearchParams(location.search);var rr=q.get('r');var pp=q.get('p');var c=q.get('c')||q.get('ref');
 document.getElementById('lk').onclick=function(){doVerify(el,extractCode(document.getElementById('code').value));};
-if(rr){document.getElementById('code').value=rr;doVerify(el,{type:'r',id:rr});}
+if(pp){document.getElementById('code').value=pp;doVerify(el,{type:'p',id:pp});}
+else if(rr){document.getElementById('code').value=rr;doVerify(el,{type:'r',id:rr});}
 else if(c){document.getElementById('code').value=c;doVerify(el,extractCode(c));}
 </script></body></html>`;
 
