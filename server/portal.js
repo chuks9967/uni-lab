@@ -439,7 +439,17 @@ module.exports = function createPortal(deps) {
     if (method === 'GET' && p === '/manifest.webmanifest') return S(res, 200, MANIFEST_PORTAL, 'application/manifest+json');
     if (method === 'GET' && p === '/scan-manifest.webmanifest') return S(res, 200, MANIFEST_SCAN, 'application/manifest+json');
     if (method === 'GET' && p === '/sw.js') return S(res, 200, SW_JS, 'application/javascript');
-    if (method === 'GET' && p === '/icon.svg') return S(res, 200, ICON_SVG, 'image/svg+xml');
+    // Favicon / app icon = the university LOGO (falls back to a branded monogram).
+    const monogramSvg = () => { const i = inst(); const init = String(i.short || i.name || 'U').replace(/[^A-Za-z0-9]/g, '').slice(0, 3).toUpperCase() || 'U';
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1e3a8a"/><stop offset="1" stop-color="#4338ca"/></linearGradient></defs><rect width="64" height="64" rx="14" fill="url(#g)"/><text x="32" y="41" font-family="Segoe UI,Arial,sans-serif" font-size="${init.length > 2 ? 20 : 26}" font-weight="800" fill="#fff" text-anchor="middle">${esc(init)}</text></svg>`; };
+    if (method === 'GET' && (p === '/favicon' || p === '/favicon.ico' || p === '/favicon.png')) {
+      const i = inst();
+      const m = /^data:([^;]+);base64,(.+)$/.exec(i.logo || '');
+      if (m) { res.writeHead(200, { 'Content-Type': m[1], 'Cache-Control': 'no-cache' }); res.end(Buffer.from(m[2], 'base64')); return true; }
+      if (i.logo && /^https?:/i.test(i.logo)) { res.writeHead(302, { Location: i.logo }); res.end(); return true; }
+      res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-cache' }); res.end(monogramSvg()); return true;
+    }
+    if (method === 'GET' && p === '/icon.svg') { res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-cache' }); res.end(monogramSvg()); return true; }
     if (method === 'GET' && p === '/scan') return H(res, 200, SCAN_PAGE);
     if (method === 'GET' && p === '/verify') return H(res, 200, VERIFY_PAGE);
     if (method === 'GET' && p === '/api/verify') {
@@ -561,7 +571,7 @@ module.exports = function createPortal(deps) {
 // ----------------------- single-page portal client -----------------------
 const PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>UniBursar Portal</title>
-<link rel="manifest" href="/manifest.webmanifest"><meta name="theme-color" content="#1e3a8a"><link rel="icon" href="/icon.svg">
+<link rel="manifest" href="/manifest.webmanifest"><meta name="theme-color" content="#1e3a8a"><link rel="icon" href="/favicon">
 <style>
 :root{--navy:#0f1e3d;--brand:#2563eb;--ink:#0f172a;--muted:#64748b;--line:#e6eaf0;--bg:#eef2f8}
 *{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',system-ui,Arial,sans-serif;background:var(--bg);color:var(--ink)}
@@ -823,8 +833,8 @@ if(TOKEN){renderApp().catch(()=>renderLogin());}else{renderLogin();}
 
 // ----------------------- installable app assets -----------------------
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512" rx="104" fill="#1e3a8a"/><text x="50%" y="55%" font-family="Segoe UI,Arial,sans-serif" font-size="220" font-weight="800" fill="#ffffff" text-anchor="middle" dominant-baseline="middle">UB</text></svg>`;
-const MANIFEST_PORTAL = JSON.stringify({ name: 'UniBursar Portal', short_name: 'Portal', start_url: '/', scope: '/', display: 'standalone', orientation: 'portrait', background_color: '#0f1e3d', theme_color: '#1e3a8a', icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' }] });
-const MANIFEST_SCAN = JSON.stringify({ name: 'UniBursar Clearance Scanner', short_name: 'Scanner', start_url: '/scan', scope: '/', display: 'standalone', orientation: 'portrait', background_color: '#0f1e3d', theme_color: '#0f1e3d', icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' }] });
+const MANIFEST_PORTAL = JSON.stringify({ name: 'UniBursar Portal', short_name: 'Portal', start_url: '/', scope: '/', display: 'standalone', orientation: 'portrait', background_color: '#0f1e3d', theme_color: '#1e3a8a', icons: [{ src: '/favicon', sizes: '512x512', type: 'image/png', purpose: 'any' }, { src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'maskable' }] });
+const MANIFEST_SCAN = JSON.stringify({ name: 'UniBursar Clearance Scanner', short_name: 'Scanner', start_url: '/scan', scope: '/', display: 'standalone', orientation: 'portrait', background_color: '#0f1e3d', theme_color: '#0f1e3d', icons: [{ src: '/favicon', sizes: '512x512', type: 'image/png', purpose: 'any' }, { src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'maskable' }] });
 const SW_JS = `const C='ubu-portal-v2';
 self.addEventListener('install',e=>{e.waitUntil(caches.open(C).then(c=>c.addAll(['/','/scan','/verify','/icon.svg']).catch(()=>{})).then(()=>self.skipWaiting()));});
 self.addEventListener('activate',e=>{e.waitUntil(Promise.all([caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==C).map(k=>caches.delete(k)))),self.clients.claim()]));});
@@ -865,7 +875,7 @@ const RESULT_CSS = `
 .btn{display:block;width:100%;margin-top:14px;background:linear-gradient(135deg,#2563eb,#4338ca);color:#fff;border:0;border-radius:10px;padding:13px;font-weight:800;font-size:15px;cursor:pointer}`;
 
 const SCAN_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>Clearance Scanner</title><link rel="manifest" href="/scan-manifest.webmanifest"><meta name="theme-color" content="#0f1e3d"><link rel="icon" href="/icon.svg">
+<title>Clearance Scanner</title><link rel="manifest" href="/scan-manifest.webmanifest"><meta name="theme-color" content="#0f1e3d"><link rel="icon" href="/favicon">
 <style>*{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',system-ui,Arial,sans-serif;background:#0f1e3d;color:#fff;min-height:100vh}
 .bar{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;background:#0b1730;font-size:15px}
 .bar #st{font-size:12px;opacity:.85}
@@ -918,7 +928,7 @@ if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch
 </script></body></html>`;
 
 const VERIFY_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Clearance Verification</title><link rel="icon" href="/icon.svg"><meta name="theme-color" content="#0f1e3d">
+<title>Clearance Verification</title><link rel="icon" href="/favicon"><meta name="theme-color" content="#0f1e3d">
 <style>*{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',system-ui,Arial,sans-serif;background:#eef2f8;color:#0f172a;min-height:100vh}
 .bar{background:#0f1e3d;color:#fff;padding:14px 16px;font-weight:700}
 #result{max-width:560px;margin:0 auto}
