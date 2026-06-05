@@ -103,7 +103,9 @@ module.exports = function createPortal(deps) {
     for (const k of Object.keys(bal)) if (Math.abs(bal[k]) < 0.001) delete bal[k];
     return bal;
   }
-  const ROLE_OFFICE = { registrar: 'Office of the Registrar', accountant: 'Office of the Bursar', dean: 'Office of the Faculty Head', admin: 'Administration', student_affairs: 'Office of Student Affairs' };
+  const ROLE_OFFICE = { registrar: 'Office of the Registrar', accountant: 'Office of the Bursar', dean: 'Office of the Faculty Head', admin: 'Administration', student_affairs: 'Office of Student Affairs', hod: 'Office of the Head of Department' };
+  // an HOD-issued receipt names the department; falls back to the plain office label
+  const officeOf = (role, deptId) => role === 'hod' ? ('Office of the Head of Department' + (deptId && nameOf('departments', deptId) ? ' — ' + nameOf('departments', deptId) : '')) : (ROLE_OFFICE[role] || 'Office of the Bursar');
 
   function studentProfile(s) {
     return {
@@ -144,7 +146,7 @@ module.exports = function createPortal(deps) {
     // segment by office so the student sees exactly who they owe (and who collected)
     const roleOf = (uid) => { const u = uid ? one('users', uid) : null; return u ? u.role : null; };
     const offices = {};
-    const bucket = (role) => { const k = role || 'accountant'; offices[k] = offices[k] || { role: k, office: ROLE_OFFICE[k] || 'Office of the Bursar', charged: {}, paid: {}, owing: {} }; return offices[k]; };
+    const bucket = (role) => { const k = role || 'accountant'; offices[k] = offices[k] || { role: k, office: officeOf(k, s.department_id), charged: {}, paid: {}, owing: {} }; return offices[k]; };
     for (const c of charges) { const b = bucket(roleOf(c.created_by) || 'accountant'); b.charged[c.currency] = (b.charged[c.currency] || 0) + c.amount; }
     for (const pmt of pays) { const b = bucket(pmt.raised_role || 'accountant'); b.paid[pmt.currency] = (b.paid[pmt.currency] || 0) + pmt.amount; }
     for (const k of Object.keys(offices)) { const o = offices[k]; for (const cur of new Set([...Object.keys(o.charged), ...Object.keys(o.paid)])) { const owe = (o.charged[cur] || 0) - (o.paid[cur] || 0); if (owe > 0.001) o.owing[cur] = owe; } }
@@ -161,7 +163,7 @@ module.exports = function createPortal(deps) {
         .map(d => ({ id: d.id, title: d.title, category: d.category, office: d.office, by: userName(d.uploaded_by), mime: d.mime, date: d.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       misconduct: all('misconducts').filter(m => m.student_id === s.id && !m.deleted).map(m => ({ offense: m.offense, severity: m.severity, action: m.action, fine: m.penalty_amount || 0, currency: m.currency, status: m.status, date: m.occurred_at || m.created_at, note: m.resolution_note || m.description || '' })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       charges: charges.map(c => ({ id: c.id, category: c.category, description: c.description, currency: c.currency, amount: c.amount, date: c.created_at, by: userName(c.created_by), rollover: !!c.is_rolled_over, rolled_from: nameOf('academic_sessions', c.rolled_from_session) })),
-      payments: pays.map(p => ({ id: p.id, receipt_no: p.receipt_no, category: p.category, currency: p.currency, amount: p.amount, method: p.method, date: p.decided_at || p.created_at, office: ROLE_OFFICE[p.raised_role] || 'Office of the Bursar', collector: userName(p.decided_by || p.raised_by) })),
+      payments: pays.map(p => ({ id: p.id, receipt_no: p.receipt_no, category: p.category, currency: p.currency, amount: p.amount, method: p.method, date: p.decided_at || p.created_at, office: officeOf(p.raised_role, s.department_id), collector: userName(p.decided_by || p.raised_by) })),
       outstanding: owingRows,
     };
   }
@@ -264,6 +266,20 @@ module.exports = function createPortal(deps) {
         const owing = {}; for (const k of Object.keys(bal)) if (bal[k] > 0.001) owing[k] = bal[k];
         if (Object.keys(owing).length) out.debtors.push({ full_name: studentName(s.id), matric_no: s.matric_no, department: nameOf('departments', s.department_id), owing });
       }
+    } else if (role === 'hod') {
+      // a Head of Department's portal view mirrors the dean's, scoped to ONE department
+      out.kind = 'dean'; out.collected = {}; out.expenses = {}; out.scopeLabel = 'Department: ' + (nameOf('departments', u.department_id) || '—');
+      for (const p of completed) if (p.raised_by === u.id || p.decided_by === u.id) out.collected[p.currency] = (out.collected[p.currency] || 0) + p.amount;
+      for (const e of all('expenses').filter(e => e.recorded_by === u.id && inP(e))) out.expenses[e.currency] = (out.expenses[e.currency] || 0) + e.amount;
+      const inDept = all('students').filter(s => s.department_id === u.department_id && s.status !== 'alumni');
+      out.debtors = [];
+      for (const s of inDept) {
+        const bal = {};
+        for (const c of studentCharges(s.id)) if (['faculty_due', 'custom'].includes(c.category)) bal[c.currency] = (bal[c.currency] || 0) + c.amount;
+        for (const p of studentPaymentsCompleted(s.id)) if (['faculty_due', 'custom'].includes(p.category)) bal[p.currency] = (bal[p.currency] || 0) - p.amount;
+        const owing = {}; for (const k of Object.keys(bal)) if (bal[k] > 0.001) owing[k] = bal[k];
+        if (Object.keys(owing).length) out.debtors.push({ full_name: studentName(s.id), matric_no: s.matric_no, department: nameOf('departments', s.department_id), owing });
+      }
     } else { // student_affairs (no collections role) — clearance + discipline summary
       out.kind = 'affairs';
       const aps = all('clearance_approvals').filter(a => a.office === 'student_affairs');
@@ -309,13 +325,48 @@ module.exports = function createPortal(deps) {
     };
   }
 
+  // Public receipt authenticity check (no login). Resolves a payment by id, short
+  // id-ref, OR its printed receipt number, and returns the genuine details so anyone
+  // can confirm a receipt presented to them isn't forged or altered.
+  function verifyReceipt(idOrRef) {
+    const key = String(idOrRef || '').trim();
+    if (!key) return { valid: false };
+    let p = one('payments', key);
+    if (!p) {
+      const want = key.replace(/-/g, '').toLowerCase();
+      if (want.length >= 6 && want.length <= 16) p = all('payments').find(x => String(x.id).replace(/-/g, '').toLowerCase().startsWith(want));
+      if (!p) p = all('payments').find(x => String(x.receipt_no || '').toLowerCase() === key.toLowerCase());
+    }
+    if (!p || p.deleted || p.status !== 'completed') return { valid: false };
+    const s = one('students', p.student_id) || {};
+    const office = ROLE_OFFICE[p.raised_role] || 'Office of the Bursar';
+    const receivedBy = (one('users', p.decided_by) || one('users', p.raised_by) || {}).full_name || office;
+    return {
+      valid: true, kind: 'receipt',
+      ref: String(p.id).replace(/-/g, '').slice(0, 8).toUpperCase(),
+      receipt_no: p.receipt_no || '—',
+      amountText: money(p.amount, p.currency),
+      category: p.category, narration: p.narration || p.description || '',
+      method: String(p.channel || p.method || 'cash').toUpperCase(),
+      dateText: fmtDate(p.decided_at || p.created_at), office, receivedBy,
+      student: {
+        name: `${s.first_name || ''} ${s.last_name || ''}`.trim() || 'Unknown',
+        matric: s.matric_no || '—', photo: s.photo || '',
+        faculty: nameOf('faculties', s.faculty_id) || '—', department: nameOf('departments', s.department_id) || '—',
+      },
+    };
+  }
+
   // ---- documents (printable HTML) ----
   function inst() { return institution ? institution() : { name: 'UniBursar', short: 'UBU', logo: '', motto: '' }; }
-  function docShell(title, body) {
+  function docShell(title, body, watermark) {
     const i = inst();
+    const wm = watermark ? `<div class="wm"><span>${esc(watermark)}</span></div>` : '';
     return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title><meta name="viewport" content="width=device-width,initial-scale=1">
-    <style>*{box-sizing:border-box}body{font-family:'Segoe UI',Arial,sans-serif;color:#1f2937;margin:0;padding:24px;font-size:13px;background:#f1f5f9}
-    .sheet{max-width:820px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:26px;box-shadow:0 8px 30px rgba(15,23,42,.08)}
+    <style>*{box-sizing:border-box}body{font-family:'Segoe UI',Arial,sans-serif;color:#1f2937;margin:0;padding:24px;font-size:13px;background:#f1f5f9;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+    .sheet{position:relative;overflow:hidden;max-width:820px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:26px;box-shadow:0 8px 30px rgba(15,23,42,.08)}
+    .wm{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;z-index:6}
+    .wm span{font-size:62px;font-weight:900;color:rgba(30,58,138,.12);transform:rotate(-28deg);letter-spacing:9px;white-space:nowrap;border:7px solid rgba(30,58,138,.12);padding:12px 34px;border-radius:14px}
     .head{display:flex;align-items:center;gap:12px;border-bottom:3px solid #1e3a8a;padding-bottom:14px;margin-bottom:18px}
     .head .logo{width:50px;height:50px;object-fit:contain;border-radius:8px}
     .head .mono{width:50px;height:50px;border-radius:10px;background:linear-gradient(135deg,#1e3a8a,#4338ca);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800}
@@ -329,19 +380,26 @@ module.exports = function createPortal(deps) {
     @media print{.pbar{display:none}body{background:#fff;padding:0}.sheet{box-shadow:none;border:0}}
     .neg{color:#b91c1c}.pos{color:#065f46}.photo{width:84px;height:96px;object-fit:cover;border:1.5px solid #1e3a8a;border-radius:6px;float:right}</style></head>
     <body><div class="pbar"><button onclick="window.print()">🖨 Print / Save as PDF</button></div>
-    <div class="sheet"><div class="head">${i.logo ? `<img class="logo" src="${i.logo}">` : `<div class="mono">${esc((i.short || 'U').slice(0, 3))}</div>`}<h1>${esc(i.name)}</h1><div class="t">${esc(title)}</div></div>${body}</div></body></html>`;
+    <div class="sheet">${wm}<div class="head">${i.logo ? `<img class="logo" src="${i.logo}">` : `<div class="mono">${esc((i.short || 'U').slice(0, 3))}</div>`}<h1>${esc(i.name)}</h1><div class="t">${esc(title)}</div></div>${body}</div></body></html>`;
   }
 
   function receiptHTML(p) {
     const s = one('students', p.student_id) || {};
     const cur = p.currency;
-    const office = ROLE_OFFICE[p.raised_role] || 'Office of the Bursar';
-    // line + balances in this currency
-    const billedCat = studentCharges(p.student_id).filter(c => c.category === p.category && c.currency === cur).reduce((a, c) => a + c.amount, 0);
-    const paidCat = studentPaymentsCompleted(p.student_id).filter(x => x.category === p.category && x.currency === cur).reduce((a, x) => a + x.amount, 0);
+    const issuer = one('users', p.decided_by) || one('users', p.raised_by) || {};
+    const office = officeOf(p.raised_role, issuer.department_id || s.department_id);
+    const receivedBy = issuer.full_name || office;
+    // SCOPE to the issuing office (mirrors the desktop): admin/accountant = full account;
+    // any other office's receipt reflects only that office's fees/collections.
+    const officeRole = ['admin', 'accountant'].includes(p.raised_role) ? null : p.raised_role;
+    const officeUsers = officeRole ? new Set(all('users').filter(u => u.role === officeRole).map(u => u.id)) : null;
+    const myCharge = (c) => !officeUsers || officeUsers.has(c.created_by);
+    const myPay = (x) => !officeRole || x.raised_role === officeRole || (officeUsers && (officeUsers.has(x.raised_by) || officeUsers.has(x.decided_by)));
+    const billedCat = studentCharges(p.student_id).filter(c => c.category === p.category && c.currency === cur && myCharge(c)).reduce((a, c) => a + c.amount, 0);
+    const paidCat = studentPaymentsCompleted(p.student_id).filter(x => x.category === p.category && x.currency === cur && myPay(x)).reduce((a, x) => a + x.amount, 0);
     const lineRate = billedCat > 0 ? billedCat : p.amount;
-    const chargesCur = studentCharges(p.student_id).filter(c => c.currency === cur).reduce((a, c) => a + c.amount, 0);
-    const paidCur = studentPaymentsCompleted(p.student_id).filter(x => x.currency === cur).reduce((a, x) => a + x.amount, 0);
+    const chargesCur = studentCharges(p.student_id).filter(c => c.currency === cur && myCharge(c)).reduce((a, c) => a + c.amount, 0);
+    const paidCur = studentPaymentsCompleted(p.student_id).filter(x => x.currency === cur && myPay(x)).reduce((a, x) => a + x.amount, 0);
     const newBal = chargesCur - paidCur; const prevBal = newBal + p.amount;
     const f = (l1, v1, l2, v2) => `<tr><td style="color:#64748b">${l1}</td><td><b>${esc(v1 || '—')}</b></td><td style="color:#64748b">${l2}</td><td><b>${esc(v2 || '—')}</b></td></tr>`;
     const body = `${s.photo ? `<img class="photo" src="${s.photo}">` : ''}
@@ -351,19 +409,23 @@ module.exports = function createPortal(deps) {
       <table><tbody>
         ${f("Student", `${s.first_name || ''} ${s.last_name || ''}`, 'Matric No', s.matric_no)}
         ${f('Faculty', nameOf('faculties', s.faculty_id), 'Department', nameOf('departments', s.department_id))}
-        ${f('Level', nameOf('levels', s.level_id), 'Email', s.email)}
+        ${f('Level', nameOf('levels', s.level_id), 'Received By', receivedBy)}
       </tbody></table>
+      <div class="bar">Payment Details</div>
+      <table><tbody>${f('Narration', p.narration || p.description || '—', 'Currency', cur)}</tbody></table>
       <div class="bar">Payment Breakdown</div>
       <table><thead><tr><th>Description</th><th class="r">Amount (${esc(cur)})</th><th class="r">Paid Now</th><th class="r">Balance After</th></tr></thead>
-        <tbody><tr><td>${esc(p.description || (p.category[0].toUpperCase() + p.category.slice(1) + ' Fee'))}</td><td class="r">${money(lineRate, cur)}</td><td class="r"><b>${money(p.amount, cur)}</b></td><td class="r">${money(lineRate - paidCat, cur)}</td></tr></tbody></table>
+        <tbody><tr><td>${esc(p.narration || p.description || (p.category[0].toUpperCase() + p.category.slice(1) + ' Fee'))}</td><td class="r">${money(lineRate, cur)}</td><td class="r"><b>${money(p.amount, cur)}</b></td><td class="r">${money(lineRate - paidCat, cur)}</td></tr></tbody></table>
       <div class="tot">TOTAL PAID: ${money(p.amount, cur)}</div>
       <div class="bar">Payment Summary</div>
       <table><tbody>
         <tr><td style="color:#64748b">Amount In Words</td><td class="words" colspan="3">${esc(amountWords(p.amount, cur))}</td></tr>
-        ${f('Previous Balance', money(prevBal, cur), 'New Balance', money(newBal, cur))}
+        ${f('Previous Net Balance', money(prevBal, cur), 'New Net Balance', money(newBal, cur))}
       </tbody></table>
-      <p style="margin-top:26px;color:#64748b;font-size:11px">Received by ${esc(office)} • This is a computer-generated receipt and mirrors the official receipt issued in the bursary.</p>`;
-    return docShell('Payment Receipt', body);
+      <div class="bar">Authenticity</div>
+      <table><tbody><tr><td style="color:#64748b">Verification ref</td><td><b style="letter-spacing:1px">${esc(String(p.id).replace(/-/g, '').slice(0, 8).toUpperCase())}</b></td><td style="color:#64748b">Verify online</td><td><a href="/verify?r=${esc(p.id)}">/verify?r=…</a></td></tr></tbody></table>
+      <p style="margin-top:18px;color:#64748b;font-size:11px">Received by ${esc(receivedBy)} (${esc(office)}) • Student copy of a computer-generated receipt; it mirrors the official receipt issued in the office. Anyone can confirm it is genuine on the Verify page above.</p>`;
+    return docShell('Payment Receipt', body, 'STUDENT COPY');
   }
 
   function statementHTML(s) {
@@ -382,6 +444,8 @@ module.exports = function createPortal(deps) {
   function payslipHTML(slip) {
     const run = one('payroll_runs', slip.run_id) || {}; const s = one('staff', slip.staff_id) || {};
     const cur = slip.currency || s.currency;
+    const isLect = s.staff_type === 'lecturer';
+    const wmText = isLect ? 'LECTURER PAYROLL' : 'STAFF PAYROLL';
     const f = (l, v) => `<tr><td style="color:#64748b">${l}</td><td class="r"><b>${v}</b></td></tr>`;
     const body = `${s.photo ? `<img class="photo" src="${s.photo}">` : ''}
       <div class="grid" style="margin-bottom:8px"><div class="f"><span>Name</span><b>${esc(s.full_name)}</b></div><div class="f"><span>Staff No</span><b>${esc(s.staff_no || '—')}</b></div>
@@ -397,7 +461,7 @@ module.exports = function createPortal(deps) {
       </tbody></table>
       <div class="tot">NET PAY: ${money(slip.net, cur)}</div>
       <p style="margin-top:8px" class="words">${esc(amountWords(slip.net, cur))}</p>`;
-    return docShell((s.staff_type === 'lecturer' ? 'Lecturer' : 'Staff') + ' Payslip', body);
+    return docShell((s.staff_type === 'lecturer' ? 'Lecturer' : 'Staff') + ' Payslip', body, wmText);
   }
 
   function moneyMapHTML(m) { const e = Object.entries(m || {}); return e.length ? e.map(([c, v]) => money(v, c)).join(' · ') : money(0); }
@@ -453,6 +517,12 @@ module.exports = function createPortal(deps) {
     if (method === 'GET' && p === '/scan') return H(res, 200, SCAN_PAGE);
     if (method === 'GET' && p === '/verify') return H(res, 200, VERIFY_PAGE);
     if (method === 'GET' && p === '/api/verify') {
+      let rid = u.searchParams.get('r') || '';
+      if (rid) { // a receipt code/link
+        const mr = /[?&]r=([^&\\s]+)/.exec(rid); if (mr) rid = decodeURIComponent(mr[1]);
+        rid = rid.replace(/^UBU-RCT:/i, '').trim();
+        return J(res, 200, { ok: true, ...verifyReceipt(rid) });
+      }
       let id = u.searchParams.get('c') || u.searchParams.get('ref') || '';
       const m = /[?&]c=([^&\\s]+)/.exec(id); if (m) id = decodeURIComponent(m[1]);   // a full URL was scanned
       id = id.replace(/^UBU-CLR:/i, '').trim();
@@ -846,8 +916,16 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(m){return
 function office(o){return ({registrar:'Registrar',dean:'Dean / Faculty Head',student_affairs:'Student Affairs'})[o]||o;}
 function row(k,v){return '<tr><td>'+k+'</td><td>'+esc(v||'—')+'</td></tr>';}
 function extractId(raw){raw=String(raw||'').trim();var m=/[?&]c=([^&\\s]+)/.exec(raw);if(m)return decodeURIComponent(m[1]);return raw.replace(/^UBU-CLR:/i,'').trim();}
+function extractCode(raw){raw=String(raw||'').trim();var m=/[?&]r=([^&\\s]+)/.exec(raw);if(m)return{type:'r',id:decodeURIComponent(m[1])};if(/^UBU-RCT:/i.test(raw))return{type:'r',id:raw.replace(/^UBU-RCT:/i,'').trim()};m=/[?&]c=([^&\\s]+)/.exec(raw);if(m)return{type:'c',id:decodeURIComponent(m[1])};return{type:'c',id:raw.replace(/^UBU-CLR:/i,'').trim()};}
 function renderResult(el,d){
-  if(!d||!d.valid){el.innerHTML='<div class="rcard invalid"><div class="big">✗ INVALID</div><p>This code does not match any clearance on record. The certificate may be forged, altered, or not yet issued.</p><button class="btn" onclick="resetView&&resetView()">Scan another</button></div>';return;}
+  if(!d||!d.valid){el.innerHTML='<div class="rcard invalid"><div class="big">✗ INVALID</div><p>This code does not match any record on file. The document may be forged, altered, or not yet issued.</p><button class="btn" onclick="resetView&&resetView()">Check another</button></div>';return;}
+  if(d.kind==='receipt'){var rs=d.student;
+    el.innerHTML='<div class="rcard valid">'+
+     '<div class="big">✓ GENUINE RECEIPT</div>'+
+     '<div class="who">'+(rs.photo?'<img src="'+rs.photo+'" alt="photo">':'<div class="ph">🧾</div>')+'<div><div class="nm">'+esc(rs.name)+'</div><div class="mt">'+esc(rs.matric)+'</div></div></div>'+
+     '<table>'+row('Receipt No',d.receipt_no)+row('Amount paid',d.amountText)+row('Paid for',d.category)+row('Narration',d.narration)+row('Method',d.method)+row('Date',d.dateText)+row('Issued by',d.office)+row('Received by',d.receivedBy)+row('Faculty',rs.faculty)+row('Department',rs.department)+row('Verification ref',d.ref)+'</table>'+
+     '<button class="btn" onclick="resetView&&resetView()">Check another</button></div>';
+    return;}
   var s=d.student;var ok=d.completed;
   el.innerHTML='<div class="rcard '+(ok?'valid':'warn')+'">'+
    '<div class="big">'+(ok?'✓ CLEARED':'⚠ '+String(d.status||'NOT COMPLETE').toUpperCase())+'</div>'+
@@ -857,7 +935,7 @@ function renderResult(el,d){
    (ok?'':'<p class="note">Not all offices have approved. Do NOT admit this student to the examination.</p>')+
    '<button class="btn" onclick="resetView&&resetView()">Scan another</button></div>';
 }
-async function doVerify(el,id){el.innerHTML='<div class="rcard"><div class="big">Checking…</div></div>';try{var r=await fetch('/api/verify?c='+encodeURIComponent(id));var d=await r.json();renderResult(el,d);}catch(e){renderResult(el,{valid:false});}}`;
+async function doVerify(el,code){var q=(code&&code.type)?code.type:'c';var id=(code&&code.id!=null)?code.id:code;el.innerHTML='<div class="rcard"><div class="big">Checking…</div></div>';try{var r=await fetch('/api/verify?'+q+'='+encodeURIComponent(id));var d=await r.json();renderResult(el,d);}catch(e){renderResult(el,{valid:false});}}`;
 
 const RESULT_CSS = `
 .rcard{background:#fff;border-radius:16px;padding:18px;margin:14px;box-shadow:0 10px 30px rgba(0,0,0,.18)}
@@ -920,15 +998,15 @@ async function loop(){
     setStatus('Manual mode');
   }
 }
-function onCode(raw){stopCam();setStatus('Found code');doVerify($('result'),extractId(raw));}
+function onCode(raw){stopCam();setStatus('Found code');doVerify($('result'),extractCode(raw));}
 $('start').onclick=startCam;$('stop').onclick=stopCam;
-$('lk').onclick=function(){doVerify($('result'),extractId($('code').value));};
-$('code').addEventListener('keydown',function(e){if(e.key==='Enter')doVerify($('result'),extractId($('code').value));});
+$('lk').onclick=function(){doVerify($('result'),extractCode($('code').value));};
+$('code').addEventListener('keydown',function(e){if(e.key==='Enter')doVerify($('result'),extractCode($('code').value));});
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(function(){});
 </script></body></html>`;
 
 const VERIFY_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Clearance Verification</title><link rel="icon" href="/favicon"><meta name="theme-color" content="#0f1e3d">
+<title>Document Verification</title><link rel="icon" href="/favicon"><meta name="theme-color" content="#0f1e3d">
 <style>*{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',system-ui,Arial,sans-serif;background:#eef2f8;color:#0f172a;min-height:100vh}
 .bar{background:#0f1e3d;color:#fff;padding:14px 16px;font-weight:700}
 #result{max-width:560px;margin:0 auto}
@@ -937,15 +1015,16 @@ const VERIFY_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 .lookup .b{background:#1e3a8a;color:#fff;border:0;border-radius:10px;padding:0 16px;font-weight:700}
 ${RESULT_CSS}
 </style></head><body>
-<div class="bar">🛡 Clearance Verification</div>
-<div class="lookup"><input id="code" placeholder="Clearance code / link"><button class="b" id="lk">Verify</button></div>
+<div class="bar">🛡 Document Verification</div>
+<div class="lookup"><input id="code" placeholder="Clearance or receipt code / link"><button class="b" id="lk">Verify</button></div>
 <div id="result"></div>
 <script>
 ${RESULT_JS}
 function resetView(){location.href='/scan';}
 var el=document.getElementById('result');
-var q=new URLSearchParams(location.search);var c=q.get('c')||q.get('ref');
-document.getElementById('lk').onclick=function(){doVerify(el,extractId(document.getElementById('code').value));};
-if(c){document.getElementById('code').value=c;doVerify(el,extractId(c));}
+var q=new URLSearchParams(location.search);var rr=q.get('r');var c=q.get('c')||q.get('ref');
+document.getElementById('lk').onclick=function(){doVerify(el,extractCode(document.getElementById('code').value));};
+if(rr){document.getElementById('code').value=rr;doVerify(el,{type:'r',id:rr});}
+else if(c){document.getElementById('code').value=c;doVerify(el,extractCode(c));}
 </script></body></html>`;
 
