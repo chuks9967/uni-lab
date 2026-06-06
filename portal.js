@@ -148,14 +148,20 @@ module.exports = function createPortal(deps) {
       if (owed > 0.001) owingRows.push({ category, currency, billed: billed[k], paid: paid[k] || 0, outstanding: owed });
     }
     const userName = (uid) => { const u = uid ? one('users', uid) : null; return u ? u.full_name : null; };
-    // exam clearance status: full clearance, else active partial, else not cleared
+    // exam clearance status: full clearance, else active partial, else not cleared.
+    // A student may hold BOTH a mid-semester and an examination clearance — list each
+    // so the portal can offer a separate, correctly-labelled certificate per type.
     const clr = (() => {
-      const full = all('exam_clearances').find(c => c.student_id === s.id && c.status === 'completed');
-      if (full) return { cleared: true, type: 'full', clearanceId: full.id };
+      const completed = all('exam_clearances').filter(c => c.student_id === s.id && c.status === 'completed')
+        .map(c => ({ id: c.id, type: c.clearance_type === 'midterm' ? 'midterm' : 'exam', typeName: c.clearance_type === 'midterm' ? 'Mid-Semester' : 'Examination' }));
+      if (completed.length) {
+        const exam = completed.find(c => c.type === 'exam') || completed[0];
+        return { cleared: true, type: 'full', clearanceId: exam.id, certs: completed };
+      }
       const partial = all('partial_clearances').find(p => p.student_id === s.id && p.status === 'active');
-      if (partial) return { cleared: true, type: 'partial', reason: partial.reason };
+      if (partial) return { cleared: true, type: 'partial', reason: partial.reason, certs: [] };
       const owes = Object.values(balancesFor(s.id)).some(v => v > 0.001);
-      return { cleared: false, type: null, reason: owes ? 'Outstanding fees not cleared' : 'No examination clearance issued' };
+      return { cleared: false, type: null, reason: owes ? 'Outstanding fees not cleared' : 'No examination clearance issued', certs: [] };
     })();
     const validations = all('exam_validations').filter(v => v.student_id === s.id)
       .map(v => ({ status: v.status, reason: v.reason, exam_type: v.exam_type, date: v.created_at, session: nameOf('academic_sessions', v.session_id), semester: nameOf('semesters', v.semester_id) }))
@@ -330,8 +336,10 @@ module.exports = function createPortal(deps) {
     const s = one('students', c.student_id) || {};
     const approvals = all('clearance_approvals').filter(a => a.clearance_id === c.id)
       .map(a => ({ office: a.office, status: a.status, by: a.approver_id ? ((one('users', a.approver_id) || {}).full_name || null) : null, date: a.decided_at }));
+    const isMid = c.clearance_type === 'midterm';
     return {
       valid: true, completed: c.status === 'completed', status: c.status,
+      clearanceType: isMid ? 'midterm' : 'exam', typeName: isMid ? 'Mid-Semester' : 'Examination',
       ref: String(c.id).replace(/-/g, '').slice(0, 8).toUpperCase(),
       student: {
         name: `${s.first_name || ''} ${s.last_name || ''}`.trim() || 'Unknown', matric: s.matric_no || '—', gender: s.gender || '—',
@@ -528,17 +536,21 @@ module.exports = function createPortal(deps) {
    *  desktop one, with a scannable QR (name, photo, department, level on the verify page). */
   function clearanceCertHTML(clearanceId) {
     const v = verifyClearance(clearanceId);
-    if (!v.valid) return docShell('Examination Clearance', '<div class="empty" style="padding:30px;text-align:center">Clearance not found.</div>');
+    const typeName = (v && v.typeName) || 'Examination';
+    if (!v.valid) return docShell(typeName + ' Clearance', '<div class="empty" style="padding:30px;text-align:center">Clearance not found.</div>');
     const st = v.student;
+    const isMid = v.clearanceType === 'midterm';
     const verifyUrl = (docBase || '') + '/verify?c=' + clearanceId;
     const qr = verifyQrSvg(verifyUrl);
     const apps = (v.approvals || []).map(a => `<tr><td>${esc(({ registrar: 'Registrar', dean: 'Faculty Head (Dean)', student_affairs: 'Student Affairs' })[a.office] || a.office)}</td><td><b style="color:${a.status === 'approved' ? '#166534' : a.status === 'denied' ? '#991b1b' : '#92400e'}">${esc(String(a.status || 'pending').toUpperCase())}</b></td><td>${esc(a.by || '—')}</td></tr>`).join('');
     const ok = v.completed;
+    const okText = isMid ? '✓ CLEARED FOR MID-SEMESTER TESTS' : '✓ CLEARED FOR EXAMINATIONS';
     const body = `${st.photo ? `<img class="photo" src="${st.photo}">` : ''}
-      <div class="exbar ${ok ? '' : ''}" style="background:${ok ? '#dcfce7' : '#fef9c3'};color:${ok ? '#166534' : '#854d0e'};border-radius:10px;padding:12px;text-align:center;font-weight:800;font-size:16px;margin-bottom:12px">${ok ? '✓ CLEARED FOR EXAMINATIONS' : '⚠ ' + esc(String(v.status || 'pending').toUpperCase())}</div>
+      <div class="exbar ${ok ? '' : ''}" style="background:${ok ? '#dcfce7' : '#fef9c3'};color:${ok ? '#166534' : '#854d0e'};border-radius:10px;padding:12px;text-align:center;font-weight:800;font-size:16px;margin-bottom:12px">${ok ? okText : '⚠ ' + esc(String(v.status || 'pending').toUpperCase())}</div>
       <div class="grid" style="margin-bottom:8px"><div class="f"><span>Student</span><b>${esc(st.name)}</b></div><div class="f"><span>Matric No</span><b>${esc(st.matric)}</b></div>
         <div class="f"><span>Faculty</span><b>${esc(st.faculty)}</b></div><div class="f"><span>Department</span><b>${esc(st.department)}</b></div>
-        <div class="f"><span>Level</span><b>${esc(st.level)}</b></div><div class="f"><span>Session</span><b>${esc(v.session)} • ${esc(v.semester)}</b></div></div>
+        <div class="f"><span>Level</span><b>${esc(st.level)}</b></div><div class="f"><span>Clearance Type</span><b>${esc(typeName)} Clearance</b></div>
+        <div class="f"><span>Session</span><b>${esc(v.session)} • ${esc(v.semester)}</b></div></div>
       <div class="bar">Office Approvals</div>
       <table><thead><tr><th>Office</th><th>Status</th><th>Approved By</th></tr></thead><tbody>${apps || '<tr><td colspan="3">—</td></tr>'}</tbody></table>
       <div class="bar">Authenticity</div>
@@ -546,8 +558,8 @@ module.exports = function createPortal(deps) {
         ${qr ? `<div style="width:104px;height:104px;flex:none">${qr}</div>` : ''}
         <div style="font-size:11.5px;color:#475569;line-height:1.5">Scan to verify this clearance — shows the student's name, photo, department & level.<br>Verification ref <b style="letter-spacing:1px;color:#111827">${esc(v.ref)}</b></div>
       </div>
-      <p style="margin-top:18px;color:#64748b;font-size:11px">Student copy of a computer-generated examination clearance. Anyone can confirm it is genuine by scanning the QR above.</p>`;
-    return docShell('Examination Clearance', body, 'STUDENT COPY');
+      <p style="margin-top:18px;color:#64748b;font-size:11px">Student copy of a computer-generated ${esc(typeName.toLowerCase())} clearance. Anyone can confirm it is genuine by scanning the QR above.</p>`;
+    return docShell(typeName + ' Clearance', body, 'STUDENT COPY');
   }
 
   function moneyMapHTML(m) { const e = Object.entries(m || {}); return e.length ? e.map(([c, v]) => money(v, c)).join(' · ') : money(0); }
@@ -957,7 +969,7 @@ function studentView(w,d){
   html+=seg('clearance',
     '<h2 class="sectitle">✅ Examination Clearance</h2>'
     +'<div class="exbar '+clrCls+'">'+clrTxt+'</div>'
-    +((clr.cleared&&clr.clearanceId)?('<div class="qa"><button class="btn sm" onclick="doc(\\'/doc/clearance/'+clr.clearanceId+'\\')">📄 Download my clearance certificate</button></div>'):'')
+    +(((clr.certs&&clr.certs.length))?('<div class="qa">'+clr.certs.map(function(ct){return '<button class="btn sm" onclick="doc(\\'/doc/clearance/'+ct.id+'\\')">📄 Download my '+eh(ct.typeName)+' clearance certificate</button>';}).join('')+'</div>'):'')
     +'<div class="panel"><h3>Exam Validation History</h3>'+tbl([{t:'Date',f:function(r){return fmt(r.date);}},{t:'Type',f:function(r){return cap(r.exam_type||'exam');}},{t:'Session',f:function(r){return eh(r.session||'—')+(r.semester?(' · '+eh(r.semester)):'');}},{t:'Result',f:function(r){return '<span class="'+(r.status==='valid'?'pos':'neg')+'" style="font-weight:800">'+(r.status==='valid'?'CLEARED':'DENIED')+'</span>';}},{t:'Reason',f:function(r){return eh(r.reason||'—');}}],d.validations,'No exam validations yet.')+'</div>');
   // DOCUMENTS
   html+=seg('documents',
@@ -1128,13 +1140,13 @@ function renderResult(el,d){
      '<table>'+row('Type',d.staffType)+row('Department',ps.department)+row('Pay period',d.period)+row('Net pay',d.net)+row('Gross',d.gross)+row('Pay date',d.dateText)+row('Verification ref',d.ref)+'</table>'+
      '<button class="btn" onclick="resetView&&resetView()">Check another</button></div>';
     return;}
-  var s=d.student;var ok=d.completed;
+  var s=d.student;var ok=d.completed;var tn=d.typeName||'Examination';var mid=d.clearanceType==='midterm';
   el.innerHTML='<div class="rcard '+(ok?'valid':'warn')+'">'+
-   '<div class="big">'+(ok?'✓ CLEARED':'⚠ '+String(d.status||'NOT COMPLETE').toUpperCase())+'</div>'+
+   '<div class="big">'+(ok?'✓ CLEARED — '+tn.toUpperCase():'⚠ '+String(d.status||'NOT COMPLETE').toUpperCase())+'</div>'+
    '<div class="who">'+(s.photo?'<img src="'+s.photo+'" alt="photo">':'<div class="ph">🎓</div>')+'<div><div class="nm">'+esc(s.name)+'</div><div class="mt">'+esc(s.matric)+'</div></div></div>'+
-   '<table>'+row('Faculty',s.faculty)+row('Department',s.department)+row('Level',s.level)+row('Gender',s.gender)+row('Student status',s.status)+row('Session',d.session)+row('Semester',d.semester)+row('Verification ref',d.ref)+'</table>'+
+   '<table>'+row('Clearance type',tn+' Clearance')+row('Faculty',s.faculty)+row('Department',s.department)+row('Level',s.level)+row('Gender',s.gender)+row('Student status',s.status)+row('Session',d.session)+row('Semester',d.semester)+row('Verification ref',d.ref)+'</table>'+
    '<div class="apps">'+(d.approvals||[]).map(function(a){return '<span class="ap '+(a.status==='approved'?'a':(a.status==='denied'?'x':'p'))+'">'+office(a.office)+': '+a.status+(a.by?(' ('+esc(a.by)+')'):'')+'</span>';}).join('')+'</div>'+
-   (ok?'':'<p class="note">Not all offices have approved. Do NOT admit this student to the examination.</p>')+
+   (ok?'':'<p class="note">Not all offices have approved. Do NOT admit this student to the '+(mid?'mid-semester test':'examination')+'.</p>')+
    '<button class="btn" onclick="resetView&&resetView()">Scan another</button></div>';
 }
 async function doVerify(el,code){var q=(code&&code.type)?code.type:'c';var id=(code&&code.id!=null)?code.id:code;el.innerHTML='<div class="rcard"><div class="big">Checking…</div></div>';try{var r=await fetch('/api/verify?'+q+'='+encodeURIComponent(id));var d=await r.json();renderResult(el,d);}catch(e){renderResult(el,{valid:false});}}`;
