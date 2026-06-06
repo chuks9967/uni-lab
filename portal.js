@@ -134,8 +134,11 @@ module.exports = function createPortal(deps) {
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
     const gpaOf = (list) => { let qp = 0, u = 0; for (const s of list) { qp += s.grade_point * s.credit_unit; u += s.credit_unit; } return { gpa: u ? Math.round((qp / u) * 100) / 100 : 0, units: u }; };
     const groups = {};
-    for (const r of rows) { const k = `${r.session_id || ''}|${r.semester_id || ''}`; (groups[k] = groups[k] || { session: r.session, semester: r.semester, list: [] }).list.push(r); }
-    const semesters = Object.values(groups).map(g => ({ session: g.session, semester: g.semester, courses: g.list, ...gpaOf(g.list) }));
+    for (const r of rows) { const k = `${r.session_id || ''}|${r.semester_id || ''}`; (groups[k] = groups[k] || { session: r.session, semester: r.semester, session_id: r.session_id, semester_id: r.semester_id, list: [] }).list.push(r); }
+    // chronological (ascending) so we can carry a running CGPA per semester
+    const ordered = Object.values(groups).sort((a, b) => String((a.list[0] || {}).date).localeCompare(String((b.list[0] || {}).date)));
+    let cumQp = 0, cumU = 0;
+    const semesters = ordered.map(g => { const b = gpaOf(g.list); cumQp += g.list.reduce((x, c) => x + c.grade_point * c.credit_unit, 0); cumU += b.units; return { session: g.session, semester: g.semester, session_id: g.session_id, semester_id: g.semester_id, courses: g.list, ...b, cgpa: cumU ? Math.round((cumQp / cumU) * 100) / 100 : 0 }; });
     const overall = gpaOf(rows);
     return { courses: rows, semesters, cgpa: overall.gpa, totalUnits: overall.units };
   }
@@ -448,8 +451,10 @@ module.exports = function createPortal(deps) {
     .pbar{margin:16px 0;text-align:center}.pbar button{background:#1e3a8a;color:#fff;border:0;border-radius:8px;padding:10px 18px;font-weight:700;cursor:pointer}
     @media print{.pbar{display:none}body{background:#fff;padding:0}.sheet{box-shadow:none;border:0}}
     .neg{color:#b91c1c}.pos{color:#065f46}.photo{width:84px;height:96px;object-fit:cover;border:1.5px solid #1e3a8a;border-radius:6px;float:right}</style></head>
-    <body><div class="pbar"><button onclick="window.print()">🖨 Print / Save as PDF</button></div>
-    <div class="sheet">${wm}<div class="head">${i.logo ? `<img class="logo" src="${i.logo}">` : `<div class="mono">${esc((i.short || 'U').slice(0, 3))}</div>`}<h1>${esc(i.name)}</h1><div class="t">${esc(title)}</div></div>${body}</div></body></html>`;
+    <body><div class="pbar"><button onclick="window.print()">⬇️ Download PDF / Print</button></div>
+    <div class="sheet">${wm}<div class="head">${i.logo ? `<img class="logo" src="${i.logo}">` : `<div class="mono">${esc((i.short || 'U').slice(0, 3))}</div>`}<h1>${esc(i.name)}</h1><div class="t">${esc(title)}</div></div>${body}</div>
+    <script>(function(){var done=false;function go(){if(done)return;done=true;try{window.focus();window.print();}catch(e){}}window.addEventListener('load',function(){setTimeout(go,400);});})();</script>
+    </body></html>`;
   }
 
   function receiptHTML(p) {
@@ -519,6 +524,54 @@ module.exports = function createPortal(deps) {
       <div class="bar">Full Statement — All Fees & Payments</div>
       <table><thead><tr><th>Date</th><th>Description</th><th class="r">Debit (Fee)</th><th class="r">Credit (Paid)</th><th class="r">Balance</th></tr></thead><tbody>${rows || '<tr><td colspan="5">No ledger entries.</td></tr>'}</tbody></table>`;
     return docShell('Student Financial Statement', body);
+  }
+
+  // Student statement of result (PDF via the browser print dialog) — mirrors the desktop slip.
+  function resultSlipHTML(s, filter) {
+    const sc = scoresFor(s.id);
+    let sems = sc.semesters || [];
+    let focused = null;
+    if (filter && (filter.session || filter.semester)) {
+      focused = sems.find(g => (!filter.session || g.session_id === filter.session) && (!filter.semester || g.semester_id === filter.semester));
+      if (focused) sems = [focused];
+    }
+    const stand = (g) => { const x = Number(g) || 0; return x >= 4.5 ? 'First Class' : x >= 3.5 ? 'Second Class (Upper)' : x >= 2.4 ? 'Second Class (Lower)' : x >= 1.5 ? 'Third Class' : x >= 1 ? 'Pass' : '—'; };
+    const cgpa = focused ? focused.cgpa : sc.cgpa;
+    const photo = s.photo ? `<img class="photo" src="${s.photo}">` : '';
+    const infoRows = [
+      ['Matric Number', s.matric_no || '—'],
+      ['Full Name', `${s.first_name || ''} ${s.last_name || ''}`.trim()],
+      ['Faculty', nameOf('faculties', s.faculty_id) || '—'],
+      ['Department', nameOf('departments', s.department_id) || '—'],
+      ['Level', nameOf('levels', s.level_id) || '—'],
+      ['Gender', s.gender || '—'],
+    ];
+    if (focused) { infoRows.push(['Semester', focused.semester || '—'], ['Session', focused.session || '—'], ['Semester GPA', String(focused.gpa)]); }
+    infoRows.push(['Cumulative GPA (CGPA)', String(cgpa)], ['Class Standing', stand(cgpa)]);
+    const infoTable = `<table class="info"><tbody>${infoRows.map(([k, v]) => `<tr><td class="k">${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`).join('')}</tbody></table>`;
+    const semBlocks = sems.map(g => {
+      const rows = (g.courses || []).map((r, i) => `<tr><td class="c">${i + 1}</td><td class="mono">${esc(r.course_code || '—')}</td><td>${esc(r.course_title || '—')}</td><td class="c">${esc(r.credit_unit)}</td><td class="c">${r.score == null ? '–' : esc(r.score)}</td><td class="c"><b>${esc(r.grade || '–')}</b></td><td class="c">${r.co == null ? '–' : esc(r.co)}</td></tr>`).join('') || '<tr><td colspan="7" class="c" style="color:#94a3b8">No courses</td></tr>';
+      return `<div class="bar">${esc(g.semester || 'Semester')} · ${esc(g.session || '—')} &nbsp;—&nbsp; GPA ${esc(g.gpa)} · CGPA ${esc(g.cgpa)}</div>
+        <table class="ctbl"><thead><tr><th class="c">#</th><th>CODE</th><th>COURSE TITLE</th><th class="c">CH</th><th class="c">SCORE</th><th class="c">GRADE</th><th class="c">CO</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }).join('') || '<p style="color:#94a3b8">No published results yet.</p>';
+    const legend = `<div class="legend"><b>Grading System:</b> 70–100 = A (5) · 60–69 = B (4) · 50–59 = C (3) · 45–49 = D (2) · 40–44 = E (1) · 0–39 = F (0)
+      <div class="note">CH = Credit Unit · CO = Grade Point × CH · GPA = Σ CO ÷ Σ CH for the semester · CGPA = cumulative GPA across all semesters.</div></div>`;
+    const sig = `<div class="sig"><div><div class="ln">Registrar / Examinations Officer</div></div><div><div class="ln" style="border-top-style:dashed">Official Stamp</div></div></div>`;
+    const css = `<style>
+      .info{width:100%;border-collapse:collapse;margin:4px 0}
+      .info td{border:1px solid #d8dee9;padding:6px 10px;font-size:12.5px}
+      .info td.k{background:#f1f5f9;font-weight:700;color:#334155;width:220px;text-transform:uppercase;font-size:10.5px;letter-spacing:.3px}
+      table.ctbl{width:100%;border-collapse:collapse;margin:0 0 8px}
+      table.ctbl th{background:#eef2ff;border:1px solid #c7d2fe;padding:6px 8px;font-size:10px;text-transform:uppercase;letter-spacing:.3px;color:#1e3a8a;text-align:left}
+      table.ctbl td{border:1px solid #d8dee9;padding:6px 8px}
+      .mono{font-family:Consolas,monospace;font-weight:700}.c{text-align:center}
+      .legend{margin-top:16px;font-size:10.5px;color:#475569;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:8px 12px}
+      .legend .note{margin-top:4px;color:#64748b;font-size:9.5px}
+      .sig{margin-top:32px;display:flex;justify-content:space-between}.sig div{width:42%;text-align:center}
+      .sig .ln{border-top:1.5px solid #475569;padding-top:5px;color:#334155;font-size:11px;font-weight:600}
+    </style>`;
+    const body = `${photo}<div class="bar">Students Information</div>${infoTable}${semBlocks}${legend}${sig}${css}`;
+    return docShell('Statement of Result', body, null);
   }
 
   function payslipHTML(slip) {
@@ -715,6 +768,11 @@ module.exports = function createPortal(deps) {
       const parts = p.split('/'); const type = parts[2]; const id = parts[3];
       const studentish = (t.k === 'student' || t.k === 'parent'); // both view the student record
       if (type === 'statement' && studentish) { return H(res, 200, statementHTML(accountById('student', t.id))); }
+      if (type === 'result-slip' && studentish) {
+        const s = accountById('student', t.id) || one('students', t.id);
+        if (!s) return H(res, 404, '<p>Student not found.</p>');
+        return H(res, 200, resultSlipHTML(s, { session: u.searchParams.get('session') || '', semester: u.searchParams.get('semester') || '' }));
+      }
       if (type === 'receipt') {
         const pay = one('payments', id);
         if (!pay) return H(res, 404, '<p>Receipt not found.</p>');
@@ -751,14 +809,14 @@ module.exports = function createPortal(deps) {
         if (studentish && r.student_id !== t.id) return H(res, 403, '<p>Not authorised.</p>');
         if (t.k === 'staff') return H(res, 403, '<p>Not authorised.</p>');
         const buf = Buffer.from(r.file, 'base64');
-        res.writeHead(200, { 'Content-Type': r.mime || 'application/octet-stream', 'Content-Disposition': 'inline; filename="' + (r.filename || 'result') + '"' });
+        res.writeHead(200, { 'Content-Type': r.mime || 'application/octet-stream', 'Content-Disposition': 'attachment; filename="' + (r.filename || 'result') + '"' });
         res.end(buf); return true;
       }
       if (type === 'portal-document' || type === 'document') {
         const d = one('portal_documents', id);
         if (!d || !d.file) return H(res, 404, '<p>Document not found.</p>');
         const buf = Buffer.from(d.file, 'base64');
-        res.writeHead(200, { 'Content-Type': d.mime || 'application/octet-stream', 'Content-Disposition': 'inline; filename="' + (d.filename || 'document') + '"' });
+        res.writeHead(200, { 'Content-Type': d.mime || 'application/octet-stream', 'Content-Disposition': 'attachment; filename="' + (d.filename || 'document') + '"' });
         res.end(buf); return true;
       }
       return H(res, 404, '<p>Not found.</p>');
@@ -977,20 +1035,25 @@ function studentView(w,d){
   html+=seg('receipts',
     '<h2 class="sectitle">🧾 Payment History &amp; Receipts</h2>'
     +'<div class="panel">'+tbl([{t:'Receipt',f:function(r){return r.receipt_no||'—';}},{t:'Date',f:function(r){return fmt(r.date);}},{t:'For',f:function(r){return cap(r.category);}},{t:'Collected By',f:function(r){return (r.collector?eh(r.collector)+'<br>':'')+'<span class="muted" style="font-size:11px">'+eh(r.office||'')+'</span>';}},{t:'Amount',r:1,f:function(r){return money(r.amount,r.currency);}},{t:'',r:1,f:function(r){return r.receipt_no?'<button class="btn sm" onclick="doc(\\'/doc/receipt/'+r.id+'\\')">Download</button>':'';}}],d.payments,'No payments yet.')+'</div>');
-  // RESULTS — published per-course scores + GPA/CGPA, then any uploaded result documents
+  // RESULTS — list each level + semester with a downloadable PDF statement of result
   var sc=d.scores||{courses:[],semesters:[],cgpa:0,totalUnits:0};
-  var gradeLegend='<div class="panel" style="font-size:12px;color:#475569"><b>Grading System</b><br>70–100 = A (5 pts) · 60–69 = B (4) · 50–59 = C (3) · 45–49 = D (2) · 40–44 = E (1) · 0–39 = F (0)<br><span class="muted">CH = credit unit · CO = grade point × CH · GPA = semester grade-point average · CGPA = cumulative GPA across semesters.</span></div>';
-  var scoresHtml=sc.courses&&sc.courses.length?(
-    sc.semesters.map(function(g){return '<div class="panel"><h3>'+eh(g.session||'—')+(g.semester?(' · '+eh(g.semester)):'')+' &nbsp;—&nbsp; GPA '+eh(g.gpa)+'</h3>'
-      +tbl([{t:'Course',f:function(r){return '<b>'+eh(r.course_code||'—')+'</b>'+(r.course_title?'<br><span class="muted" style="font-size:11px">'+eh(r.course_title)+'</span>':'');}},{t:'CH',f:function(r){return eh(r.credit_unit);}},{t:'Test',f:function(r){return r.test_score==null?'—':eh(r.test_score);}},{t:'Exam',f:function(r){return r.exam_score==null?'—':eh(r.exam_score);}},{t:'Score',r:1,f:function(r){return '<b>'+eh(r.score)+'</b>';}},{t:'Grade',f:function(r){return '<span class="badge" style="'+(r.grade==='F'?'background:#fee2e2;color:#991b1b':'background:#dbeafe;color:#1e40af')+'">'+eh(r.grade||'—')+'</span>';}},{t:'CO',r:1,f:function(r){return eh(r.co);}}],g.courses,'No courses.')
-      +'</div>';}).join('')
-    +'<div class="exbar" style="background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe">🎓 GPA & Cumulative GPA (CGPA): <b>'+eh(sc.cgpa)+'</b> · '+eh(sc.totalUnits)+' credit units</div>'
-    +gradeLegend
-  ):'<div class="empty">No course results published yet.</div>';
+  var myLevel=(d.profile&&d.profile.level)||'—';
+  var resultsHtml=(sc.semesters&&sc.semesters.length)?(
+    '<div class="panel"><h3>My Results</h3>'
+    +'<div class="muted" style="font-size:12.5px;margin-bottom:8px">Your statement of result is generated as a PDF. Pick a semester and click <b>Download PDF</b> — the document opens ready to save/print.</div>'
+    +tbl([
+      {t:'Level',f:function(r){return eh(myLevel);}},
+      {t:'Semester',f:function(r){return eh(r.semester||'—');}},
+      {t:'Session',f:function(r){return eh(r.session||'—');}},
+      {t:'',r:1,f:function(r){return '<button class="btn sm" onclick="doc(\\'/doc/result-slip?session='+encodeURIComponent(r.session_id||'')+'&semester='+encodeURIComponent(r.semester_id||'')+'\\')">⬇️ Download PDF</button>';}}
+    ],sc.semesters,'No results published yet.')
+    +'<div style="margin-top:10px"><button class="btn sm ghost" onclick="doc(\\'/doc/result-slip\\')">⬇️ Download full statement (all semesters)</button></div>'
+    +'</div>'
+  ):'<div class="empty">No results published yet. They will appear here once your results are released.</div>';
   html+=seg('results',
     '<h2 class="sectitle">📑 My Results</h2>'
-    +scoresHtml
-    +'<div class="panel"><h3>Result Documents</h3>'+tbl([{t:'Level',f:function(r){return eh(r.level||'—');}},{t:'Semester',f:function(r){return eh(r.semester||'—');}},{t:'Session',f:function(r){return eh(r.session||'—');}},{t:'Title',f:function(r){return eh(r.title||'Result');}},{t:'GPA',f:function(r){return eh(r.gpa||'—');}},{t:'',r:1,f:function(r){return '<button class="btn sm" onclick="doc(\\'/doc/result/'+r.id+'\\')">View / Download</button>';}}],d.results,'No result documents uploaded.')+'</div>');
+    +resultsHtml
+    +'<div class="panel"><h3>Other Result Documents</h3>'+tbl([{t:'Level',f:function(r){return eh(r.level||'—');}},{t:'Semester',f:function(r){return eh(r.semester||'—');}},{t:'Session',f:function(r){return eh(r.session||'—');}},{t:'Title',f:function(r){return eh(r.title||'Result');}},{t:'',r:1,f:function(r){return '<button class="btn sm" onclick="doc(\\'/doc/result/'+r.id+'\\')">Download</button>';}}],d.results,'No other result documents.')+'</div>');
   // CLEARANCE
   html+=seg('clearance',
     '<h2 class="sectitle">✅ Examination Clearance</h2>'
