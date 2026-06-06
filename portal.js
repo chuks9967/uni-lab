@@ -800,18 +800,23 @@ select{padding:9px 10px;border:1px solid var(--line);border-radius:9px;font-size
 .exbar.warn{background:#fef9c3;color:#854d0e;border:1px solid #fde68a}
 .exbar.bad{background:#fee2e2;color:#991b1b;border:1px solid #fca5a5}
 /* ---- segmented student portal ---- */
-.shell{display:grid;grid-template-columns:236px 1fr;gap:20px;max-width:1180px;margin:0 auto;padding:20px}
-.side{position:sticky;top:18px;align-self:start;display:flex;flex-direction:column;gap:14px}
-.sidecard{background:#fff;border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow:0 6px 22px rgba(15,23,42,.05)}
-.sideprof{padding:18px 16px;text-align:center;background:linear-gradient(160deg,#1e3a8a,#4338ca);color:#fff}
-.sideprof img,.sideprof .ph{width:78px;height:78px;border-radius:50%;object-fit:cover;border:3px solid rgba(255,255,255,.5);margin:0 auto 8px;display:block}
-.sideprof .ph{background:rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;font-size:30px}
-.sideprof .nm{font-weight:800;font-size:15px;line-height:1.2}.sideprof .mt{font-size:11.5px;opacity:.85;margin-top:3px}
-.nav a{display:flex;gap:11px;align-items:center;padding:11px 16px;color:#334155;text-decoration:none;font-size:14px;font-weight:600;border-left:3px solid transparent;cursor:pointer}
-.nav a .ic{width:20px;text-align:center}
-.nav a.active{background:#eff4ff;color:var(--brand);border-left-color:var(--brand)}
-.nav a:hover{background:#f6f8fb}
-.nav a .pill{margin-left:auto;background:#ef4444;color:#fff;border-radius:999px;font-size:10.5px;font-weight:800;padding:1px 7px}
+/* single column: photo + info at the TOP, section tabs beneath, content below — the
+   WHOLE page scrolls as one (no separate scrolling side panel). */
+.shell{max-width:940px;margin:0 auto;padding:18px 16px}
+.phead{background:linear-gradient(160deg,#1e3a8a,#4338ca);color:#fff;border-radius:18px;padding:20px 22px;display:flex;gap:18px;align-items:center;margin-bottom:14px;box-shadow:0 8px 26px rgba(30,58,138,.22)}
+.phead img,.phead .ph{width:86px;height:86px;border-radius:50%;object-fit:cover;border:3px solid rgba(255,255,255,.55);flex:none}
+.phead .ph{background:rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;font-size:34px}
+.phead .nm{font-weight:800;font-size:21px;line-height:1.15}
+.phead .mt{opacity:.92;font-size:13px;margin-top:4px}
+.phead .bal{margin-left:8px;font-size:13px;opacity:.95}
+.phead .chip{vertical-align:middle}
+/* horizontal section tabs (sticky to the top of the page so they're always reachable) */
+.nav{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;background:#fff;border:1px solid var(--line);border-radius:14px;padding:6px;margin-bottom:16px;position:sticky;top:8px;z-index:6;box-shadow:0 4px 16px rgba(15,23,42,.05)}
+.nav a{display:inline-flex;gap:7px;align-items:center;padding:9px 14px;color:#334155;text-decoration:none;font-size:13.5px;font-weight:700;border-radius:10px;white-space:nowrap;cursor:pointer}
+.nav a .ic{font-size:15px}
+.nav a.active{background:var(--brand);color:#fff}
+.nav a:hover{background:#f1f5f9}.nav a.active:hover{background:var(--brand)}
+.nav a .pill{background:#ef4444;color:#fff;border-radius:999px;font-size:10px;font-weight:800;padding:1px 6px}
 .content{min-width:0}
 .hero{background:#fff;border:1px solid var(--line);border-radius:16px;padding:18px 20px;margin-bottom:16px;display:flex;align-items:center;gap:16px;box-shadow:0 6px 22px rgba(15,23,42,.05)}
 .hero .big{font-size:21px;font-weight:800}.hero .meta{color:var(--muted);font-size:13px;margin-top:3px}
@@ -820,25 +825,16 @@ select{padding:9px 10px;border:1px solid var(--line);border-radius:9px;font-size
 .seg{display:none}.seg.on{display:block}
 .sectitle{font-size:18px;font-weight:800;margin:0 0 12px;color:var(--navy)}
 .qa{display:flex;flex-wrap:wrap;gap:9px;margin-bottom:16px}
-/* tablet — keep the nav on the LEFT (compact) */
-@media(max-width:860px){
-  .shell{grid-template-columns:132px 1fr;gap:10px;padding:10px}
-  .side{position:sticky;top:10px;align-self:start;flex-direction:column;gap:10px}
-  .sideprof{padding:13px 8px}
-  .sideprof img,.sideprof .ph{width:50px;height:50px;font-size:20px}
-  .sideprof .nm{font-size:12px}.sideprof .mt{display:none}
-  .nav a{padding:10px 11px;font-size:12.5px;gap:8px}
-  .hero{flex-direction:column;text-align:center}
+/* phone — shrink the profile header; tabs become an icon strip that scrolls sideways */
+@media(max-width:600px){
+  .shell{padding:11px 9px}
+  .phead{padding:14px;gap:12px;border-radius:14px}
+  .phead img,.phead .ph{width:60px;height:60px;font-size:24px}
+  .phead .nm{font-size:16px}.phead .mt{font-size:12px}
+  .nav a{padding:9px 11px}
+  .nav a .ic{font-size:18px}
+  .nav a .lbl{display:none}   /* icons only on small phones; full labels on tablet+ */
   .tscroll table{min-width:520px}
-}
-/* phone — a narrow LEFT icon rail (icon over a tiny label) */
-@media(max-width:480px){
-  .shell{grid-template-columns:56px 1fr;gap:8px;padding:7px}
-  .side .sidecard:first-child{display:none}
-  .nav a{flex-direction:column;gap:2px;padding:9px 2px;font-size:9px;text-align:center;line-height:1.05;border-left:0;position:relative}
-  .nav a.active{border-left:0;background:#eff4ff}
-  .nav a .ic{font-size:19px}
-  .nav a .pill{position:absolute;top:4px;right:6px;margin:0;font-size:9px;padding:0 4px}
 }
 @media(max-width:760px){
   .wrap{padding:12px}
@@ -920,20 +916,21 @@ function studentView(w,d){
   var chip=clr.cleared?(clr.type==='partial'?'<span class="chip warn">⚠ Partially cleared</span>':'<span class="chip ok">✓ Cleared for exams</span>'):'<span class="chip bad">✗ Not cleared</span>';
   var owingCount=(d.outstanding||[]).length;
   var photo=p.photo?'<img src="'+p.photo+'">':'<div class="ph">🎓</div>';
-  // --- sidebar (profile + section nav) ---
+  // --- section tabs ---
   var segs=[['overview','🏠','Overview',0],['fees','💳','Fees & Payments',owingCount],['receipts','🧾','Receipts',0],['results','📑','Results',0],['clearance','✅','Clearance',0],['documents','📂','Documents',0]];
   if(d.misconduct&&d.misconduct.length)segs.push(['discipline','⚖️','Discipline',d.misconduct.length]);
   segs.push(['profile','👤','Profile',0]);
-  var navHtml=segs.map(function(s){return '<a data-seg="'+s[0]+'"><span class="ic">'+s[1]+'</span><span>'+s[2]+'</span>'+(s[3]?'<span class="pill">'+s[3]+'</span>':'')+'</a>';}).join('');
-  var side=$('<div class="side">'
-    +'<div class="sidecard"><div class="sideprof">'+photo+'<div class="nm">'+eh(p.full_name)+'</div><div class="mt">'+eh(p.matric_no||'Matric pending')+'</div></div></div>'
-    +'<div class="sidecard"><div class="nav">'+navHtml+'</div></div></div>');
-  // --- content (hero + segments) ---
+  var navHtml=segs.map(function(s){return '<a data-seg="'+s[0]+'"><span class="ic">'+s[1]+'</span><span class="lbl">'+s[2]+'</span>'+(s[3]?'<span class="pill">'+s[3]+'</span>':'')+'</a>';}).join('');
+  // --- profile + photo pinned at the TOP (full width) ---
+  var head=$('<div class="phead">'+photo
+    +'<div style="flex:1;min-width:0"><div class="nm">'+eh(p.full_name)+'</div>'
+    +'<div class="mt">'+eh(p.matric_no||'Matric pending')+' · '+eh(p.department||'—')+' · '+eh(p.level||'—')+(p.faculty?(' · '+eh(p.faculty)):'')+'</div>'
+    +'<div style="margin-top:9px">'+chip+'<span class="bal">Balance: <b>'+mapMoney(d.balances)+'</b></span></div></div></div>');
+  // --- horizontal section tabs ---
+  var navEl=$('<div class="nav">'+navHtml+'</div>');
+  // --- content (segments) ---
   var content=$('<div class="content"></div>');
   if(d.parentView)content.appendChild($('<div class="pbanner">👨‍👩‍👧 Parent/Guardian view — records of <b>'+eh(p.full_name||'your ward')+'</b>.</div>'));
-  content.appendChild($('<div class="hero">'+(p.photo?'<img src="'+p.photo+'" style="width:62px;height:62px;border-radius:50%;object-fit:cover;flex:none">':'')
-    +'<div style="flex:1;min-width:0"><div class="big">'+eh(p.full_name)+'</div><div class="meta">'+eh(p.department||'—')+' · '+eh(p.level||'—')+(p.faculty?(' · '+eh(p.faculty)):'')+'</div></div>'
-    +'<div style="text-align:right">'+chip+'<div class="meta" style="margin-top:7px">Balance: <b class="neg">'+mapMoney(d.balances)+'</b></div></div></div>'));
 
   function seg(id,html){return '<div class="seg" data-seg="'+id+'">'+html+'</div>';}
   function sevBadge(s){var c=s==='severe'?'background:#fee2e2;color:#991b1b':s==='major'?'background:#fef3c7;color:#92400e':'background:#e5e7eb;color:#374151';return '<span class="badge" style="'+c+'">'+cap(s||'minor')+'</span>';}
@@ -994,13 +991,14 @@ function studentView(w,d){
 
   var box=document.createElement('div');box.innerHTML=html;
   while(box.firstChild)content.appendChild(box.firstChild);
-  var shell=$('<div class="shell"></div>');shell.appendChild(side);shell.appendChild(content);w.appendChild(shell);
+  var shell=$('<div class="shell"></div>');shell.appendChild(head);shell.appendChild(navEl);shell.appendChild(content);w.appendChild(shell);
   function show(s){
     Array.prototype.forEach.call(content.querySelectorAll('.seg'),function(el){el.classList.toggle('on',el.getAttribute('data-seg')===s);});
-    Array.prototype.forEach.call(side.querySelectorAll('.nav a'),function(a){a.classList.toggle('active',a.getAttribute('data-seg')===s);});
+    Array.prototype.forEach.call(navEl.querySelectorAll('a'),function(a){a.classList.toggle('active',a.getAttribute('data-seg')===s);});
     window.__seg=s;
+    try{window.scrollTo(0,0);}catch(_){}   // show the top of the chosen section
   }
-  Array.prototype.forEach.call(side.querySelectorAll('.nav a'),function(a){a.onclick=function(){show(a.getAttribute('data-seg'));};});
+  Array.prototype.forEach.call(navEl.querySelectorAll('a'),function(a){a.onclick=function(){show(a.getAttribute('data-seg'));};});
   var want=window.__seg||'overview';
   if(!content.querySelector('.seg[data-seg="'+want+'"]'))want='overview';
   show(want);
