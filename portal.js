@@ -773,16 +773,25 @@ select{padding:9px 10px;border:1px solid var(--line);border-radius:9px;font-size
 .seg{display:none}.seg.on{display:block}
 .sectitle{font-size:18px;font-weight:800;margin:0 0 12px;color:var(--navy)}
 .qa{display:flex;flex-wrap:wrap;gap:9px;margin-bottom:16px}
+/* tablet — keep the nav on the LEFT (compact) */
 @media(max-width:860px){
-  .shell{grid-template-columns:1fr;gap:14px;padding:12px}
-  .side{position:static;flex-direction:row;overflow-x:auto;gap:0}
-  .side .sidecard:first-child{display:none}
-  .side .sidecard{width:100%}
-  .nav{display:flex;min-width:max-content}
-  .nav a{border-left:0;border-bottom:3px solid transparent;white-space:nowrap;padding:11px 14px}
-  .nav a.active{border-left:0;border-bottom-color:var(--brand)}
-  .nav a .pill{margin-left:6px}
+  .shell{grid-template-columns:132px 1fr;gap:10px;padding:10px}
+  .side{position:sticky;top:10px;align-self:start;flex-direction:column;gap:10px}
+  .sideprof{padding:13px 8px}
+  .sideprof img,.sideprof .ph{width:50px;height:50px;font-size:20px}
+  .sideprof .nm{font-size:12px}.sideprof .mt{display:none}
+  .nav a{padding:10px 11px;font-size:12.5px;gap:8px}
   .hero{flex-direction:column;text-align:center}
+  .tscroll table{min-width:520px}
+}
+/* phone — a narrow LEFT icon rail (icon over a tiny label) */
+@media(max-width:480px){
+  .shell{grid-template-columns:56px 1fr;gap:8px;padding:7px}
+  .side .sidecard:first-child{display:none}
+  .nav a{flex-direction:column;gap:2px;padding:9px 2px;font-size:9px;text-align:center;line-height:1.05;border-left:0;position:relative}
+  .nav a.active{border-left:0;background:#eff4ff}
+  .nav a .ic{font-size:19px}
+  .nav a .pill{position:absolute;top:4px;right:6px;margin:0;font-size:9px;padding:0 4px}
 }
 @media(max-width:760px){
   .wrap{padding:12px}
