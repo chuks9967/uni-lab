@@ -752,6 +752,38 @@ select{padding:9px 10px;border:1px solid var(--line);border-radius:9px;font-size
 .exbar.ok{background:#dcfce7;color:#166534;border:1px solid #86efac}
 .exbar.warn{background:#fef9c3;color:#854d0e;border:1px solid #fde68a}
 .exbar.bad{background:#fee2e2;color:#991b1b;border:1px solid #fca5a5}
+/* ---- segmented student portal ---- */
+.shell{display:grid;grid-template-columns:236px 1fr;gap:20px;max-width:1180px;margin:0 auto;padding:20px}
+.side{position:sticky;top:18px;align-self:start;display:flex;flex-direction:column;gap:14px}
+.sidecard{background:#fff;border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow:0 6px 22px rgba(15,23,42,.05)}
+.sideprof{padding:18px 16px;text-align:center;background:linear-gradient(160deg,#1e3a8a,#4338ca);color:#fff}
+.sideprof img,.sideprof .ph{width:78px;height:78px;border-radius:50%;object-fit:cover;border:3px solid rgba(255,255,255,.5);margin:0 auto 8px;display:block}
+.sideprof .ph{background:rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;font-size:30px}
+.sideprof .nm{font-weight:800;font-size:15px;line-height:1.2}.sideprof .mt{font-size:11.5px;opacity:.85;margin-top:3px}
+.nav a{display:flex;gap:11px;align-items:center;padding:11px 16px;color:#334155;text-decoration:none;font-size:14px;font-weight:600;border-left:3px solid transparent;cursor:pointer}
+.nav a .ic{width:20px;text-align:center}
+.nav a.active{background:#eff4ff;color:var(--brand);border-left-color:var(--brand)}
+.nav a:hover{background:#f6f8fb}
+.nav a .pill{margin-left:auto;background:#ef4444;color:#fff;border-radius:999px;font-size:10.5px;font-weight:800;padding:1px 7px}
+.content{min-width:0}
+.hero{background:#fff;border:1px solid var(--line);border-radius:16px;padding:18px 20px;margin-bottom:16px;display:flex;align-items:center;gap:16px;box-shadow:0 6px 22px rgba(15,23,42,.05)}
+.hero .big{font-size:21px;font-weight:800}.hero .meta{color:var(--muted);font-size:13px;margin-top:3px}
+.chip{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 12px;font-size:12.5px;font-weight:800}
+.chip.ok{background:#dcfce7;color:#166534}.chip.warn{background:#fef9c3;color:#854d0e}.chip.bad{background:#fee2e2;color:#991b1b}
+.seg{display:none}.seg.on{display:block}
+.sectitle{font-size:18px;font-weight:800;margin:0 0 12px;color:var(--navy)}
+.qa{display:flex;flex-wrap:wrap;gap:9px;margin-bottom:16px}
+@media(max-width:860px){
+  .shell{grid-template-columns:1fr;gap:14px;padding:12px}
+  .side{position:static;flex-direction:row;overflow-x:auto;gap:0}
+  .side .sidecard:first-child{display:none}
+  .side .sidecard{width:100%}
+  .nav{display:flex;min-width:max-content}
+  .nav a{border-left:0;border-bottom:3px solid transparent;white-space:nowrap;padding:11px 14px}
+  .nav a.active{border-left:0;border-bottom-color:var(--brand)}
+  .nav a .pill{margin-left:6px}
+  .hero{flex-direction:column;text-align:center}
+}
 @media(max-width:760px){
   .wrap{padding:12px}
   .top{padding:11px 14px;gap:9px}
@@ -827,41 +859,94 @@ function tbl(cols,rows,empty){if(!rows||!rows.length)return '<div class="empty">
 function doc(path){window.open(path+(path.includes('?')?'&':'?')+'t='+encodeURIComponent(TOKEN),'_blank');}
 
 function studentView(w,d){
-  const p=d.profile;
-  if(d.parentView){w.appendChild($('<div class="pbanner">👨‍👩‍👧 Parent/Guardian view — you are viewing the records of <b>'+(p.full_name||'your ward')+'</b>.</div>'));}
-  w.appendChild($('<div class="panel"><div class="prof">'+(p.photo?'<img src="'+p.photo+'">':'<div class="ph">🎓</div>')+'<div><div class="nm">'+p.full_name+'</div><div class="meta">'+(p.matric_no||'Matric pending')+' · '+(p.department||'—')+' · '+(p.level||'—')+'</div><div class="meta">'+(p.faculty||'')+' · '+(p.email||'')+'</div></div></div></div>'));
-  // exam clearance status banner
+  var p=d.profile;
   var clr=d.examClearance||{};
-  var cls=clr.cleared?(clr.type==='partial'?'warn':'ok'):'bad';
-  var ctxt=clr.cleared?(clr.type==='partial'?'⚠ PARTIALLY CLEARED for exams — you still owe fees':'✓ CLEARED for examinations'):('✗ NOT CLEARED for exams — '+(clr.reason||'no clearance'));
-  w.appendChild($('<div class="exbar '+cls+'">'+ctxt+'</div>'));
-  w.appendChild($('<div class="kpis">'
+  var chip=clr.cleared?(clr.type==='partial'?'<span class="chip warn">⚠ Partially cleared</span>':'<span class="chip ok">✓ Cleared for exams</span>'):'<span class="chip bad">✗ Not cleared</span>';
+  var owingCount=(d.outstanding||[]).length;
+  var photo=p.photo?'<img src="'+p.photo+'">':'<div class="ph">🎓</div>';
+  // --- sidebar (profile + section nav) ---
+  var segs=[['overview','🏠','Overview',0],['fees','💳','Fees & Payments',owingCount],['receipts','🧾','Receipts',0],['results','📑','Results',0],['clearance','✅','Clearance',0],['documents','📂','Documents',0]];
+  if(d.misconduct&&d.misconduct.length)segs.push(['discipline','⚖️','Discipline',d.misconduct.length]);
+  segs.push(['profile','👤','Profile',0]);
+  var navHtml=segs.map(function(s){return '<a data-seg="'+s[0]+'"><span class="ic">'+s[1]+'</span><span>'+s[2]+'</span>'+(s[3]?'<span class="pill">'+s[3]+'</span>':'')+'</a>';}).join('');
+  var side=$('<div class="side">'
+    +'<div class="sidecard"><div class="sideprof">'+photo+'<div class="nm">'+eh(p.full_name)+'</div><div class="mt">'+eh(p.matric_no||'Matric pending')+'</div></div></div>'
+    +'<div class="sidecard"><div class="nav">'+navHtml+'</div></div></div>');
+  // --- content (hero + segments) ---
+  var content=$('<div class="content"></div>');
+  if(d.parentView)content.appendChild($('<div class="pbanner">👨‍👩‍👧 Parent/Guardian view — records of <b>'+eh(p.full_name||'your ward')+'</b>.</div>'));
+  content.appendChild($('<div class="hero">'+(p.photo?'<img src="'+p.photo+'" style="width:62px;height:62px;border-radius:50%;object-fit:cover;flex:none">':'')
+    +'<div style="flex:1;min-width:0"><div class="big">'+eh(p.full_name)+'</div><div class="meta">'+eh(p.department||'—')+' · '+eh(p.level||'—')+(p.faculty?(' · '+eh(p.faculty)):'')+'</div></div>'
+    +'<div style="text-align:right">'+chip+'<div class="meta" style="margin-top:7px">Balance: <b class="neg">'+mapMoney(d.balances)+'</b></div></div></div>'));
+
+  function seg(id,html){return '<div class="seg" data-seg="'+id+'">'+html+'</div>';}
+  function sevBadge(s){var c=s==='severe'?'background:#fee2e2;color:#991b1b':s==='major'?'background:#fef3c7;color:#92400e':'background:#e5e7eb;color:#374151';return '<span class="badge" style="'+c+'">'+cap(s||'minor')+'</span>';}
+  function stBadge(s){var c=s==='resolved'?'background:#dcfce7;color:#166534':'background:#fee2e2;color:#991b1b';return '<span class="badge" style="'+c+'">'+cap(s||'open')+'</span>';}
+  var clrCls=clr.cleared?(clr.type==='partial'?'warn':'ok'):'bad';
+  var clrTxt=clr.cleared?(clr.type==='partial'?'⚠ PARTIALLY CLEARED for exams — you still owe fees':'✓ CLEARED for examinations'):('✗ NOT CLEARED for exams — '+eh(clr.reason||'no clearance'));
+
+  var html='';
+  // OVERVIEW
+  html+=seg('overview',
+    '<div class="kpis">'
     +'<div class="kpi"><div class="l">Outstanding Balance</div><div class="v neg">'+mapMoney(d.balances)+'</div></div>'
     +'<div class="kpi"><div class="l">Session</div><div class="v" style="font-size:16px">'+eh(d.currentSession||'—')+'</div></div>'
     +'<div class="kpi"><div class="l">Semester</div><div class="v" style="font-size:16px">'+eh(d.currentSemester||'—')+'</div></div>'
-    +'<div class="kpi"><div class="l">Exam Status</div><div class="v" style="font-size:15px">'+(clr.cleared?(clr.type==='partial'?'Partial':'Cleared'):'Not cleared')+'</div></div>'
-    +'</div>'));
-  w.appendChild($('<div style="margin-bottom:14px"><button class="btn sm" onclick="doc(\\'/doc/statement\\')">📄 Download full statement (all fees & payments)</button></div>'));
-  // who you owe — segmented by office
-  if(d.byOffice&&d.byOffice.length){
-    w.appendChild($('<div class="panel"><h3>Who You Owe — by Office</h3>'+tbl([{t:'Office',f:r=>r.office},{t:'Charged',r:1,f:r=>mapMoney(r.charged)},{t:'Paid',r:1,f:r=>mapMoney(r.paid)},{t:'Outstanding',r:1,f:r=>Object.keys(r.owing).length?'<span class=neg>'+mapMoney(r.owing)+'</span>':'<span class=pos>Cleared</span>'}],d.byOffice,'No charges.')+'</div>'));
-  }
-  w.appendChild($('<div class="panel"><h3>Outstanding Fees (all offices)</h3>'+tbl([{t:'Fee Category',f:r=>cap(r.category)},{t:'Currency',f:r=>r.currency},{t:'Billed',r:1,f:r=>money(r.billed,r.currency)},{t:'Paid',r:1,f:r=>money(r.paid,r.currency)},{t:'Outstanding',r:1,f:r=>'<span class=neg>'+money(r.outstanding,r.currency)+'</span>'}],d.outstanding,'You owe nothing. 🎉')+'</div>'));
-  w.appendChild($('<div class="panel"><h3>All Fees &amp; Charges</h3>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Description',f:r=>(r.description||cap(r.category))+' '+(r.rollover?'<span class="badge" style="background:#fef3c7;color:#92400e">Rollover'+(r.rolled_from?' · '+eh(r.rolled_from):'')+'</span>':'<span class="badge" style="background:#dbeafe;color:#1e40af">Current</span>')},{t:'Category',f:r=>cap(r.category)},{t:'Set By',f:r=>r.by||'—'},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)}],d.charges,'No charges yet.')+'</div>'));
-  w.appendChild($('<div class="panel"><h3>Payment History &amp; Receipts</h3>'+tbl([{t:'Receipt',f:r=>r.receipt_no||'—'},{t:'Date',f:r=>fmt(r.date)},{t:'For',f:r=>cap(r.category)},{t:'Collected By',f:r=>(r.collector?eh(r.collector)+'<br>':'')+'<span class="muted" style="font-size:11px">'+eh(r.office||'')+'</span>'},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)},{t:'',r:1,f:r=>r.receipt_no?'<button class="btn sm" onclick="doc(\\'/doc/receipt/'+r.id+'\\')">Receipt</button>':''}],d.payments,'No payments yet.')+'</div>'));
-  // results — uploaded by the registrar/admin per level + semester
-  w.appendChild($('<div class="panel"><h3>📑 My Results</h3>'+tbl([{t:'Level',f:r=>eh(r.level||'—')},{t:'Semester',f:r=>eh(r.semester||'—')},{t:'Session',f:r=>eh(r.session||'—')},{t:'Title',f:r=>eh(r.title||'Result')},{t:'GPA',f:r=>eh(r.gpa||'—')},{t:'',r:1,f:r=>'<button class="btn sm" onclick="doc(\\'/doc/result/'+r.id+'\\')">View / Download</button>'}],d.results,'No results uploaded yet.')+'</div>'));
-  // university documents (calendar, timetable, handbook…) — students download these; each shows the office that issued it
-  w.appendChild($('<div class="panel"><h3>📂 University Documents</h3>'+tbl([{t:'Title',f:r=>eh(r.title||'Document')},{t:'Type',f:r=>'<span class="badge">'+eh(r.category||'Document')+'</span>'},{t:'From Office',f:r=>eh(r.office||'—')+(r.by?'<br><span class="muted" style="font-size:11px">'+eh(r.by)+'</span>':'')},{t:'Date',f:r=>fmt(r.date)},{t:'',r:1,f:r=>'<button class="btn sm" onclick="doc(\\'/doc/portal-document/'+r.id+'\\')">Download</button>'}],d.documents,'No documents published yet.')+'</div>'));
-  // disciplinary / misconduct records — so students see when they've been flagged
+    +'<div class="kpi"><div class="l">Exam Status</div><div class="v" style="font-size:15px">'+(clr.cleared?(clr.type==='partial'?'Partial':'Cleared'):'Not cleared')+'</div></div></div>'
+    +'<div class="exbar '+clrCls+'">'+clrTxt+'</div>'
+    +'<div class="qa"><button class="btn sm" onclick="doc(\\'/doc/statement\\')">📄 Download full statement</button><button class="btn sm ghost" onclick="changePassword()">🔑 Change password</button></div>'
+    +'<div class="panel"><h3>Who You Owe — by Office</h3>'+tbl([{t:'Office',f:function(r){return eh(r.office);}},{t:'Charged',r:1,f:function(r){return mapMoney(r.charged);}},{t:'Paid',r:1,f:function(r){return mapMoney(r.paid);}},{t:'Outstanding',r:1,f:function(r){return Object.keys(r.owing).length?'<span class=neg>'+mapMoney(r.owing)+'</span>':'<span class=pos>Cleared</span>';}}],d.byOffice,'No charges on your account.')+'</div>');
+  // FEES
+  html+=seg('fees',
+    '<h2 class="sectitle">💳 Fees &amp; Payments</h2>'
+    +'<div class="panel"><h3>Outstanding Fees</h3>'+tbl([{t:'Fee Category',f:function(r){return cap(r.category);}},{t:'Currency',f:function(r){return r.currency;}},{t:'Billed',r:1,f:function(r){return money(r.billed,r.currency);}},{t:'Paid',r:1,f:function(r){return money(r.paid,r.currency);}},{t:'Outstanding',r:1,f:function(r){return '<span class=neg>'+money(r.outstanding,r.currency)+'</span>';}}],d.outstanding,'You owe nothing. 🎉')+'</div>'
+    +'<div class="panel"><h3>All Fees &amp; Charges</h3>'+tbl([{t:'Date',f:function(r){return fmt(r.date);}},{t:'Description',f:function(r){return (eh(r.description)||cap(r.category))+' '+(r.rollover?'<span class="badge" style="background:#fef3c7;color:#92400e">Rollover'+(r.rolled_from?' · '+eh(r.rolled_from):'')+'</span>':'<span class="badge" style="background:#dbeafe;color:#1e40af">Current</span>');}},{t:'Category',f:function(r){return cap(r.category);}},{t:'Set By',f:function(r){return eh(r.by||'—');}},{t:'Amount',r:1,f:function(r){return money(r.amount,r.currency);}}],d.charges,'No charges yet.')+'</div>');
+  // RECEIPTS
+  html+=seg('receipts',
+    '<h2 class="sectitle">🧾 Payment History &amp; Receipts</h2>'
+    +'<div class="panel">'+tbl([{t:'Receipt',f:function(r){return r.receipt_no||'—';}},{t:'Date',f:function(r){return fmt(r.date);}},{t:'For',f:function(r){return cap(r.category);}},{t:'Collected By',f:function(r){return (r.collector?eh(r.collector)+'<br>':'')+'<span class="muted" style="font-size:11px">'+eh(r.office||'')+'</span>';}},{t:'Amount',r:1,f:function(r){return money(r.amount,r.currency);}},{t:'',r:1,f:function(r){return r.receipt_no?'<button class="btn sm" onclick="doc(\\'/doc/receipt/'+r.id+'\\')">Download</button>':'';}}],d.payments,'No payments yet.')+'</div>');
+  // RESULTS
+  html+=seg('results',
+    '<h2 class="sectitle">📑 My Results</h2>'
+    +'<div class="panel">'+tbl([{t:'Level',f:function(r){return eh(r.level||'—');}},{t:'Semester',f:function(r){return eh(r.semester||'—');}},{t:'Session',f:function(r){return eh(r.session||'—');}},{t:'Title',f:function(r){return eh(r.title||'Result');}},{t:'GPA',f:function(r){return eh(r.gpa||'—');}},{t:'',r:1,f:function(r){return '<button class="btn sm" onclick="doc(\\'/doc/result/'+r.id+'\\')">View / Download</button>';}}],d.results,'No results uploaded yet.')+'</div>');
+  // CLEARANCE
+  html+=seg('clearance',
+    '<h2 class="sectitle">✅ Examination Clearance</h2>'
+    +'<div class="exbar '+clrCls+'">'+clrTxt+'</div>'
+    +'<div class="panel"><h3>Exam Validation History</h3>'+tbl([{t:'Date',f:function(r){return fmt(r.date);}},{t:'Type',f:function(r){return cap(r.exam_type||'exam');}},{t:'Session',f:function(r){return eh(r.session||'—')+(r.semester?(' · '+eh(r.semester)):'');}},{t:'Result',f:function(r){return '<span class="'+(r.status==='valid'?'pos':'neg')+'" style="font-weight:800">'+(r.status==='valid'?'CLEARED':'DENIED')+'</span>';}},{t:'Reason',f:function(r){return eh(r.reason||'—');}}],d.validations,'No exam validations yet.')+'</div>');
+  // DOCUMENTS
+  html+=seg('documents',
+    '<h2 class="sectitle">📂 University Documents</h2>'
+    +'<div class="panel">'+tbl([{t:'Title',f:function(r){return eh(r.title||'Document');}},{t:'Type',f:function(r){return '<span class="badge">'+eh(r.category||'Document')+'</span>';}},{t:'From Office',f:function(r){return eh(r.office||'—')+(r.by?'<br><span class="muted" style="font-size:11px">'+eh(r.by)+'</span>':'');}},{t:'Date',f:function(r){return fmt(r.date);}},{t:'',r:1,f:function(r){return '<button class="btn sm" onclick="doc(\\'/doc/portal-document/'+r.id+'\\')">Download</button>';}}],d.documents,'No documents published yet.')+'</div>');
+  // DISCIPLINE
   if(d.misconduct&&d.misconduct.length){
-    var sevBadge=function(s){var c=s==='severe'?'background:#fee2e2;color:#991b1b':s==='major'?'background:#fef3c7;color:#92400e':'background:#e5e7eb;color:#374151';return '<span class="badge" style="'+c+'">'+cap(s||'minor')+'</span>';};
-    var stBadge=function(s){var c=s==='resolved'?'background:#dcfce7;color:#166534':'background:#fee2e2;color:#991b1b';return '<span class="badge" style="'+c+'">'+cap(s||'open')+'</span>';};
-    w.appendChild($('<div class="panel"><h3>⚖️ Disciplinary Records</h3>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Offense',f:r=>eh(r.offense||'—')},{t:'Severity',f:r=>sevBadge(r.severity)},{t:'Action',f:r=>cap(r.action||'—')},{t:'Fine',r:1,f:r=>r.fine>0?money(r.fine,r.currency):'—'},{t:'Status',f:r=>stBadge(r.status)},{t:'Note',f:r=>eh(r.note||'—')}],d.misconduct,'No misconduct on record.')+'</div>'));
+    html+=seg('discipline',
+      '<h2 class="sectitle">⚖️ Disciplinary Records</h2>'
+      +'<div class="panel">'+tbl([{t:'Date',f:function(r){return fmt(r.date);}},{t:'Offense',f:function(r){return eh(r.offense||'—');}},{t:'Severity',f:function(r){return sevBadge(r.severity);}},{t:'Action',f:function(r){return cap(r.action||'—');}},{t:'Fine',r:1,f:function(r){return r.fine>0?money(r.fine,r.currency):'—';}},{t:'Status',f:function(r){return stBadge(r.status);}},{t:'Note',f:function(r){return eh(r.note||'—');}}],d.misconduct,'No misconduct on record.')+'</div>');
   }
-  if(d.validations&&d.validations.length){
-    w.appendChild($('<div class="panel"><h3>Exam Validation History</h3>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Type',f:r=>cap(r.exam_type||'exam')},{t:'Session',f:r=>(r.session||'—')+(r.semester?(' · '+r.semester):'')},{t:'Result',f:r=>'<span class="'+(r.status==='valid'?'pos':'neg')+'" style="font-weight:800">'+(r.status==='valid'?'CLEARED':'DENIED')+'</span>'},{t:'Reason',f:r=>r.reason||'—'}],d.validations,'No validations yet.')+'</div>'));
+  // PROFILE
+  html+=seg('profile',
+    '<h2 class="sectitle">👤 My Profile</h2>'
+    +'<div class="panel"><div class="prof">'+photo+'<div><div class="nm">'+eh(p.full_name)+'</div><div class="meta">'+eh(p.matric_no||'Matric pending')+'</div></div></div>'
+    +'<table><tbody>'
+    +'<tr><th>Faculty</th><td>'+eh(p.faculty||'—')+'</td><th>Department</th><td>'+eh(p.department||'—')+'</td></tr>'
+    +'<tr><th>Level</th><td>'+eh(p.level||'—')+'</td><th>Email</th><td>'+eh(p.email||'—')+'</td></tr>'
+    +'<tr><th>Session</th><td>'+eh(d.currentSession||'—')+'</td><th>Semester</th><td>'+eh(d.currentSemester||'—')+'</td></tr>'
+    +'</tbody></table></div>'
+    +'<div class="qa"><button class="btn sm" onclick="changePassword()">🔑 Change password</button></div>');
+
+  var box=document.createElement('div');box.innerHTML=html;
+  while(box.firstChild)content.appendChild(box.firstChild);
+  var shell=$('<div class="shell"></div>');shell.appendChild(side);shell.appendChild(content);w.appendChild(shell);
+  function show(s){
+    Array.prototype.forEach.call(content.querySelectorAll('.seg'),function(el){el.classList.toggle('on',el.getAttribute('data-seg')===s);});
+    Array.prototype.forEach.call(side.querySelectorAll('.nav a'),function(a){a.classList.toggle('active',a.getAttribute('data-seg')===s);});
+    window.__seg=s;
   }
+  Array.prototype.forEach.call(side.querySelectorAll('.nav a'),function(a){a.onclick=function(){show(a.getAttribute('data-seg'));};});
+  var want=window.__seg||'overview';
+  if(!content.querySelector('.seg[data-seg="'+want+'"]'))want='overview';
+  show(want);
 }
 function staffView(w,d){
   const p=d.profile;
