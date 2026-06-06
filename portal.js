@@ -121,6 +121,24 @@ module.exports = function createPortal(deps) {
     for (const k of Object.keys(bal)) if (Math.abs(bal[k]) < 0.001) delete bal[k];
     return bal;
   }
+  // published per-course scores grouped by session+semester, with semester GPA + overall CGPA
+  function scoresFor(sid) {
+    const codeK = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const raw = all('student_scores').filter(r => r.student_id === sid && !r.deleted)
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+    // collapse duplicate course rows (same course in the same session+semester) — most recent wins
+    const ddMap = {};
+    for (const r of raw) ddMap[`${r.session_id || ''}|${r.semester_id || ''}|${codeK(r.course_code)}`] = r;
+    const rows = Object.values(ddMap)
+      .map(r => { const gp = Number(r.grade_point) || 0, cu = Number(r.credit_unit) || 0; return { course_code: r.course_code, course_title: r.course_title, credit_unit: cu, test_score: r.test_score, exam_score: r.exam_score, score: r.score, grade: r.grade, grade_point: gp, co: gp * cu, session_id: r.session_id, semester_id: r.semester_id, session: nameOf('academic_sessions', r.session_id), semester: nameOf('semesters', r.semester_id), date: r.created_at }; })
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    const gpaOf = (list) => { let qp = 0, u = 0; for (const s of list) { qp += s.grade_point * s.credit_unit; u += s.credit_unit; } return { gpa: u ? Math.round((qp / u) * 100) / 100 : 0, units: u }; };
+    const groups = {};
+    for (const r of rows) { const k = `${r.session_id || ''}|${r.semester_id || ''}`; (groups[k] = groups[k] || { session: r.session, semester: r.semester, list: [] }).list.push(r); }
+    const semesters = Object.values(groups).map(g => ({ session: g.session, semester: g.semester, courses: g.list, ...gpaOf(g.list) }));
+    const overall = gpaOf(rows);
+    return { courses: rows, semesters, cgpa: overall.gpa, totalUnits: overall.units };
+  }
   const ROLE_OFFICE = { registrar: 'Office of the Registrar', accountant: 'Office of the Bursar', dean: 'Office of the Faculty Head', admin: 'Administration', student_affairs: 'Office of Student Affairs', hod: 'Office of the Head of Department' };
   // an HOD-issued receipt names the department; falls back to the plain office label
   const officeOf = (role, deptId) => role === 'hod' ? ('Office of the Head of Department' + (deptId && nameOf('departments', deptId) ? ' — ' + nameOf('departments', deptId) : '')) : (ROLE_OFFICE[role] || 'Office of the Bursar');
@@ -183,6 +201,7 @@ module.exports = function createPortal(deps) {
       examClearance: clr,
       validations,
       results: all('results').filter(r => r.student_id === s.id).map(r => ({ id: r.id, title: r.title, level: nameOf('levels', r.level_id), semester: nameOf('semesters', r.semester_id), session: nameOf('academic_sessions', r.session_id), gpa: r.gpa, remark: r.remark, mime: r.mime, date: r.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
+      scores: scoresFor(s.id),
       documents: all('portal_documents').filter(d => (!d.faculty_id || d.faculty_id === s.faculty_id) && (!d.department_id || d.department_id === s.department_id) && (!d.level_id || d.level_id === s.level_id))
         .map(d => ({ id: d.id, title: d.title, category: d.category, office: d.office, by: userName(d.uploaded_by), mime: d.mime, date: d.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       misconduct: all('misconducts').filter(m => m.student_id === s.id && !m.deleted).map(m => ({ offense: m.offense, severity: m.severity, action: m.action, fine: m.penalty_amount || 0, currency: m.currency, status: m.status, date: m.occurred_at || m.created_at, note: m.resolution_note || m.description || '' })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
@@ -958,10 +977,20 @@ function studentView(w,d){
   html+=seg('receipts',
     '<h2 class="sectitle">🧾 Payment History &amp; Receipts</h2>'
     +'<div class="panel">'+tbl([{t:'Receipt',f:function(r){return r.receipt_no||'—';}},{t:'Date',f:function(r){return fmt(r.date);}},{t:'For',f:function(r){return cap(r.category);}},{t:'Collected By',f:function(r){return (r.collector?eh(r.collector)+'<br>':'')+'<span class="muted" style="font-size:11px">'+eh(r.office||'')+'</span>';}},{t:'Amount',r:1,f:function(r){return money(r.amount,r.currency);}},{t:'',r:1,f:function(r){return r.receipt_no?'<button class="btn sm" onclick="doc(\\'/doc/receipt/'+r.id+'\\')">Download</button>':'';}}],d.payments,'No payments yet.')+'</div>');
-  // RESULTS
+  // RESULTS — published per-course scores + GPA/CGPA, then any uploaded result documents
+  var sc=d.scores||{courses:[],semesters:[],cgpa:0,totalUnits:0};
+  var gradeLegend='<div class="panel" style="font-size:12px;color:#475569"><b>Grading System</b><br>70–100 = A (5 pts) · 60–69 = B (4) · 50–59 = C (3) · 45–49 = D (2) · 40–44 = E (1) · 0–39 = F (0)<br><span class="muted">CH = credit unit · CO = grade point × CH · GPA = semester grade-point average · CGPA = cumulative GPA across semesters.</span></div>';
+  var scoresHtml=sc.courses&&sc.courses.length?(
+    sc.semesters.map(function(g){return '<div class="panel"><h3>'+eh(g.session||'—')+(g.semester?(' · '+eh(g.semester)):'')+' &nbsp;—&nbsp; GPA '+eh(g.gpa)+'</h3>'
+      +tbl([{t:'Course',f:function(r){return '<b>'+eh(r.course_code||'—')+'</b>'+(r.course_title?'<br><span class="muted" style="font-size:11px">'+eh(r.course_title)+'</span>':'');}},{t:'CH',f:function(r){return eh(r.credit_unit);}},{t:'Test',f:function(r){return r.test_score==null?'—':eh(r.test_score);}},{t:'Exam',f:function(r){return r.exam_score==null?'—':eh(r.exam_score);}},{t:'Score',r:1,f:function(r){return '<b>'+eh(r.score)+'</b>';}},{t:'Grade',f:function(r){return '<span class="badge" style="'+(r.grade==='F'?'background:#fee2e2;color:#991b1b':'background:#dbeafe;color:#1e40af')+'">'+eh(r.grade||'—')+'</span>';}},{t:'CO',r:1,f:function(r){return eh(r.co);}}],g.courses,'No courses.')
+      +'</div>';}).join('')
+    +'<div class="exbar" style="background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe">🎓 GPA & Cumulative GPA (CGPA): <b>'+eh(sc.cgpa)+'</b> · '+eh(sc.totalUnits)+' credit units</div>'
+    +gradeLegend
+  ):'<div class="empty">No course results published yet.</div>';
   html+=seg('results',
     '<h2 class="sectitle">📑 My Results</h2>'
-    +'<div class="panel">'+tbl([{t:'Level',f:function(r){return eh(r.level||'—');}},{t:'Semester',f:function(r){return eh(r.semester||'—');}},{t:'Session',f:function(r){return eh(r.session||'—');}},{t:'Title',f:function(r){return eh(r.title||'Result');}},{t:'GPA',f:function(r){return eh(r.gpa||'—');}},{t:'',r:1,f:function(r){return '<button class="btn sm" onclick="doc(\\'/doc/result/'+r.id+'\\')">View / Download</button>';}}],d.results,'No results uploaded yet.')+'</div>');
+    +scoresHtml
+    +'<div class="panel"><h3>Result Documents</h3>'+tbl([{t:'Level',f:function(r){return eh(r.level||'—');}},{t:'Semester',f:function(r){return eh(r.semester||'—');}},{t:'Session',f:function(r){return eh(r.session||'—');}},{t:'Title',f:function(r){return eh(r.title||'Result');}},{t:'GPA',f:function(r){return eh(r.gpa||'—');}},{t:'',r:1,f:function(r){return '<button class="btn sm" onclick="doc(\\'/doc/result/'+r.id+'\\')">View / Download</button>';}}],d.results,'No result documents uploaded.')+'</div>');
   // CLEARANCE
   html+=seg('clearance',
     '<h2 class="sectitle">✅ Examination Clearance</h2>'
