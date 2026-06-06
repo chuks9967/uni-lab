@@ -151,7 +151,7 @@ module.exports = function createPortal(deps) {
     // exam clearance status: full clearance, else active partial, else not cleared
     const clr = (() => {
       const full = all('exam_clearances').find(c => c.student_id === s.id && c.status === 'completed');
-      if (full) return { cleared: true, type: 'full' };
+      if (full) return { cleared: true, type: 'full', clearanceId: full.id };
       const partial = all('partial_clearances').find(p => p.student_id === s.id && p.status === 'active');
       if (partial) return { cleared: true, type: 'partial', reason: partial.reason };
       const owes = Object.values(balancesFor(s.id)).some(v => v > 0.001);
@@ -429,7 +429,9 @@ module.exports = function createPortal(deps) {
     const s = one('students', p.student_id) || {};
     const cur = p.currency;
     const issuer = one('users', p.decided_by) || one('users', p.raised_by) || {};
-    const office = officeOf(p.raised_role, issuer.department_id || s.department_id);
+    // issuing office = who COMPLETED it (decided_by) — a registrar-raised, accountant-verified
+    // payment is issued by the Bursar, not the registrar.
+    const office = officeOf(issuer.role || p.raised_role, issuer.department_id || s.department_id);
     const receivedBy = issuer.full_name || office;
     // the line DESCRIPTION is the FEE paid for (category), NOT the narration
     const catRow = all('fee_categories').find(c => c.key === p.category && !c.deleted);
@@ -520,6 +522,32 @@ module.exports = function createPortal(deps) {
         <div style="font-size:11.5px;color:#475569;line-height:1.5">Scan to verify this payslip is genuine.<br>Verification ref <b style="letter-spacing:1px;color:#111827">${esc(String(slip.id).replace(/-/g, '').slice(0, 8).toUpperCase())}</b><br>or visit <a href="${esc(psVerifyUrl)}">${esc((docBase || '') + '/verify')}</a></div>
       </div>`;
     return docShell((s.staff_type === 'lecturer' ? 'Lecturer' : 'Staff') + ' Payslip', body, wmText);
+  }
+
+  /** Printable examination-clearance certificate for the student (portal) — mirrors the
+   *  desktop one, with a scannable QR (name, photo, department, level on the verify page). */
+  function clearanceCertHTML(clearanceId) {
+    const v = verifyClearance(clearanceId);
+    if (!v.valid) return docShell('Examination Clearance', '<div class="empty" style="padding:30px;text-align:center">Clearance not found.</div>');
+    const st = v.student;
+    const verifyUrl = (docBase || '') + '/verify?c=' + clearanceId;
+    const qr = verifyQrSvg(verifyUrl);
+    const apps = (v.approvals || []).map(a => `<tr><td>${esc(({ registrar: 'Registrar', dean: 'Faculty Head (Dean)', student_affairs: 'Student Affairs' })[a.office] || a.office)}</td><td><b style="color:${a.status === 'approved' ? '#166534' : a.status === 'denied' ? '#991b1b' : '#92400e'}">${esc(String(a.status || 'pending').toUpperCase())}</b></td><td>${esc(a.by || '—')}</td></tr>`).join('');
+    const ok = v.completed;
+    const body = `${st.photo ? `<img class="photo" src="${st.photo}">` : ''}
+      <div class="exbar ${ok ? '' : ''}" style="background:${ok ? '#dcfce7' : '#fef9c3'};color:${ok ? '#166534' : '#854d0e'};border-radius:10px;padding:12px;text-align:center;font-weight:800;font-size:16px;margin-bottom:12px">${ok ? '✓ CLEARED FOR EXAMINATIONS' : '⚠ ' + esc(String(v.status || 'pending').toUpperCase())}</div>
+      <div class="grid" style="margin-bottom:8px"><div class="f"><span>Student</span><b>${esc(st.name)}</b></div><div class="f"><span>Matric No</span><b>${esc(st.matric)}</b></div>
+        <div class="f"><span>Faculty</span><b>${esc(st.faculty)}</b></div><div class="f"><span>Department</span><b>${esc(st.department)}</b></div>
+        <div class="f"><span>Level</span><b>${esc(st.level)}</b></div><div class="f"><span>Session</span><b>${esc(v.session)} • ${esc(v.semester)}</b></div></div>
+      <div class="bar">Office Approvals</div>
+      <table><thead><tr><th>Office</th><th>Status</th><th>Approved By</th></tr></thead><tbody>${apps || '<tr><td colspan="3">—</td></tr>'}</tbody></table>
+      <div class="bar">Authenticity</div>
+      <div style="display:flex;align-items:center;gap:14px;border:1px dashed #cbd5e1;border-radius:10px;padding:12px 14px;margin-top:8px">
+        ${qr ? `<div style="width:104px;height:104px;flex:none">${qr}</div>` : ''}
+        <div style="font-size:11.5px;color:#475569;line-height:1.5">Scan to verify this clearance — shows the student's name, photo, department & level.<br>Verification ref <b style="letter-spacing:1px;color:#111827">${esc(v.ref)}</b></div>
+      </div>
+      <p style="margin-top:18px;color:#64748b;font-size:11px">Student copy of a computer-generated examination clearance. Anyone can confirm it is genuine by scanning the QR above.</p>`;
+    return docShell('Examination Clearance', body, 'STUDENT COPY');
   }
 
   function moneyMapHTML(m) { const e = Object.entries(m || {}); return e.length ? e.map(([c, v]) => money(v, c)).join(' · ') : money(0); }
@@ -669,6 +697,13 @@ module.exports = function createPortal(deps) {
         if (t.k === 'staff' && slip.staff_id !== t.id) return H(res, 403, '<p>Not authorised.</p>');
         if (studentish) return H(res, 403, '<p>Not authorised.</p>');
         return H(res, 200, payslipHTML(slip));
+      }
+      if (type === 'clearance') {
+        const c = one('exam_clearances', id);
+        if (!c) return H(res, 404, '<p>Clearance not found.</p>');
+        if (studentish && c.student_id !== t.id) return H(res, 403, '<p>Not authorised.</p>');
+        if (t.k === 'staff') return H(res, 403, '<p>Not authorised.</p>');
+        return H(res, 200, clearanceCertHTML(id));
       }
       if (type === 'officer-report' && t.k === 'user') {
         const row = accountById('user', t.id); if (!row) return H(res, 404, '<p>Not found.</p>');
@@ -922,6 +957,7 @@ function studentView(w,d){
   html+=seg('clearance',
     '<h2 class="sectitle">✅ Examination Clearance</h2>'
     +'<div class="exbar '+clrCls+'">'+clrTxt+'</div>'
+    +((clr.cleared&&clr.clearanceId)?('<div class="qa"><button class="btn sm" onclick="doc(\\'/doc/clearance/'+clr.clearanceId+'\\')">📄 Download my clearance certificate</button></div>'):'')
     +'<div class="panel"><h3>Exam Validation History</h3>'+tbl([{t:'Date',f:function(r){return fmt(r.date);}},{t:'Type',f:function(r){return cap(r.exam_type||'exam');}},{t:'Session',f:function(r){return eh(r.session||'—')+(r.semester?(' · '+eh(r.semester)):'');}},{t:'Result',f:function(r){return '<span class="'+(r.status==='valid'?'pos':'neg')+'" style="font-weight:800">'+(r.status==='valid'?'CLEARED':'DENIED')+'</span>';}},{t:'Reason',f:function(r){return eh(r.reason||'—');}}],d.validations,'No exam validations yet.')+'</div>');
   // DOCUMENTS
   html+=seg('documents',
