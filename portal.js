@@ -473,7 +473,7 @@ module.exports = function createPortal(deps) {
     .neg{color:#b91c1c}.pos{color:#065f46}.photo{width:84px;height:96px;object-fit:cover;border:1.5px solid #1e3a8a;border-radius:6px;float:right}</style></head>
     <body><div class="pbar"><button onclick="window.print()">⬇️ Download PDF / Print</button></div>
     <div class="sheet">${wm}<div class="head">${i.logo ? `<img class="logo" src="${i.logo}">` : `<div class="mono">${esc((i.short || 'U').slice(0, 3))}</div>`}<h1>${esc(i.name)}</h1><div class="t">${esc(title)}</div></div>${body}</div>
-    <script>(function(){var FIT=${fit};function fit(){if(!FIT)return;var sh=document.querySelector('.sheet');if(!sh)return;sh.style.zoom='';var maxH=1040;var hgt=sh.scrollHeight;if(hgt>maxH){sh.style.zoom=Math.max(0.5,maxH/hgt);}}var done=false;function go(){if(done)return;done=true;fit();try{window.focus();window.print();}catch(e){}}window.addEventListener('load',function(){setTimeout(go,450);});window.addEventListener('beforeprint',fit);})();</script>
+    <script>(function(){var FIT=${fit};function fit(){if(!FIT)return;var sh=document.querySelector('.sheet');if(!sh)return;sh.style.zoom='';var maxH=1040;var hgt=sh.scrollHeight;if(hgt>maxH){sh.style.zoom=Math.max(0.35,(maxH/hgt));}}var done=false;function go(){if(done)return;done=true;fit();try{window.focus();window.print();}catch(e){}}window.addEventListener('load',function(){setTimeout(go,450);});window.addEventListener('beforeprint',fit);window.addEventListener('resize',fit);})();</script>
     </body></html>`;
   }
 
@@ -566,8 +566,8 @@ module.exports = function createPortal(deps) {
       ['Level', nameOf('levels', s.level_id) || '—'],
       ['Gender', s.gender || '—'],
     ];
-    if (focused) { infoRows.push(['Session / Semester', `${focused.session || '—'} · ${focused.semester || '—'}`], ['Semester GPA', String(focused.gpa)]); }
-    infoRows.push(['Cumulative GPA (CGPA)', String(cgpa)], ['Class Standing', stand(cgpa)]);
+    if (focused) { infoRows.push(['Session / Semester', `${focused.session || '—'} · ${focused.semester || '—'}`]); }
+    // GPA / CGPA / Class Standing are shown at the BOTTOM of the sheet, not here.
     const infoTable = `<table class="info"><tbody>${infoRows.map(([k, v]) => `<tr><td class="k">${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`).join('')}</tbody></table>`;
     const semBlocks = sems.map(g => {
       return `<div class="bar">${esc(g.semester || 'Semester')} · ${esc(g.session || '—')} &nbsp;—&nbsp; GPA ${esc(g.gpa)} · CGPA ${esc(g.cgpa)} · ${esc(g.units)} units</div>
@@ -581,8 +581,9 @@ module.exports = function createPortal(deps) {
       <tr><td>70–100</td><td class="c"><b>A</b></td><td class="c">5</td></tr><tr><td>60–69</td><td class="c"><b>B</b></td><td class="c">4</td></tr><tr><td>50–59</td><td class="c"><b>C</b></td><td class="c">3</td></tr>
       <tr><td>45–49</td><td class="c"><b>D</b></td><td class="c">2</td></tr><tr><td>40–44</td><td class="c"><b>E</b></td><td class="c">1</td></tr><tr><td>0–39</td><td class="c"><b>F</b></td><td class="c">0</td></tr></tbody></table>
       <div class="note">CH = Credit Unit · CO = Grade Point × CH · GPA = Σ CO ÷ Σ CH (semester) · CGPA = cumulative GPA.</div>`;
-    const authBox = `<div class="auth">${qr ? `<div class="qr">${qr}</div>` : ''}<div class="amt">Scan to verify this result on the portal.<br>Ref <b>${esc(ref)}</b><br><span class="vurl">${esc(vurl)}</span></div></div>`;
-    const summary = `<div class="summary"><div class="lab">Cumulative GPA</div><div class="big">${esc(cgpa)}</div><div class="lab">${esc(sc.totalUnits)} total units</div><div class="st">${esc(stand(cgpa))}</div></div>`;
+    // Only the QR is visible — the verify URL is kept in an invisible HTML comment (for tooling).
+    const authBox = `<div class="auth">${qr ? `<div class="qr">${qr}</div>` : ''}<div class="amt">Scan to<br>verify result</div></div><!--verify ${esc(vurl)} ref ${esc(ref)}-->`;
+    const summary = `<div class="summary">${focused ? `<div class="lab">Semester GPA</div><div class="mid">${esc(focused.gpa)}</div>` : ''}<div class="lab">Cumulative GPA (CGPA)</div><div class="big">${esc(cgpa)}</div><div class="lab">${esc(sc.totalUnits)} total credit units</div><div class="st">${esc(stand(cgpa))}</div></div>`;
     const sig = `<div class="sig"><div><div class="ln">Registrar / Examinations Officer</div></div><div><div class="ln" style="border-top-style:dashed">Official Stamp</div></div></div>`;
     const css = `<style>
       .sheet{font-size:11px}
@@ -603,8 +604,9 @@ module.exports = function createPortal(deps) {
       .auth .qr{width:84px;height:84px;flex:none}
       .auth .amt{font-size:9.5px;color:#475569;line-height:1.4}
       .auth .vurl{font-size:7.5px;color:#94a3b8;word-break:break-all}
-      .summary{text-align:right;min-width:130px}
-      .summary .lab{font-size:9px;color:#6b7280;text-transform:uppercase;letter-spacing:.4px}
+      .summary{text-align:right;min-width:140px}
+      .summary .lab{font-size:9px;color:#6b7280;text-transform:uppercase;letter-spacing:.4px;margin-top:4px}
+      .summary .mid{font-size:17px;font-weight:800;color:#334155;line-height:1.05}
       .summary .big{font-size:26px;font-weight:800;color:#1e3a8a;line-height:1}
       .summary .st{display:inline-block;margin-top:4px;padding:3px 11px;border-radius:999px;background:#dcfce7;color:#166534;font-weight:700;font-size:10px}
       .sig{margin-top:22px;display:flex;justify-content:space-between}.sig div{width:42%;text-align:center}
