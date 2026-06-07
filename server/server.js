@@ -25,7 +25,7 @@ let createPortal = null;
 try { createPortal = require('./portal'); }
 catch (e) { console.error('[UniBursar] portal.js not loaded (' + e.message + ') — upload server/portal.js to enable the web portal. Sync/email still work.'); }
 
-const BUILD = 'portal-15'; // bump when server changes — visible at /health to confirm the live code
+const BUILD = 'portal-16'; // bump when server changes — visible at /health to confirm the live code
 const PORT = process.env.PORT || 4000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const SYNC_TOKEN = process.env.SYNC_TOKEN || ''; // optional shared secret

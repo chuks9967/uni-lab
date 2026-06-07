@@ -187,6 +187,22 @@ module.exports = function createPortal(deps) {
     const validations = all('exam_validations').filter(v => v.student_id === s.id)
       .map(v => ({ status: v.status, reason: v.reason, exam_type: v.exam_type, date: v.created_at, session: nameOf('academic_sessions', v.session_id), semester: nameOf('semesters', v.semester_id) }))
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    // published timetables for this student's cohort (lecture for dept+level; exams dept- or
+    // faculty-wide, with faculty-wide sittings filtered down to the student's own cohort).
+    const myTimetables = all('timetables').filter(t => !t.deleted && t.status === 'published')
+      .filter(t => t.scope === 'faculty' ? t.faculty_id === s.faculty_id : (t.department_id === s.department_id && (!t.level_id || t.level_id === s.level_id)))
+      .map(t => {
+        let slots = all('timetable_slots').filter(sl => sl.timetable_id === t.id && !sl.deleted);
+        if (t.scope === 'faculty') slots = slots.filter(sl => sl.kind === 'holiday' || (sl.department_id === s.department_id && (!sl.level_id || sl.level_id === s.level_id)));
+        slots = slots.map(sl => ({ course_code: sl.course_code, course_title: sl.course_title, lecturer: sl.lecturer_name, day: sl.day_or_date, start: sl.start_time, end: sl.end_time, venue: sl.venue, kind: sl.kind }))
+          .sort((a, b) => String(a.day).localeCompare(String(b.day)) || String(a.start || '').localeCompare(String(b.start || '')));
+        return { id: t.id, title: t.title, type: t.type, level: nameOf('levels', t.level_id), department: nameOf('departments', t.department_id), faculty: nameOf('faculties', t.faculty_id), session: nameOf('academic_sessions', t.session_id), semester: nameOf('semesters', t.semester_id), date: t.published_at, slots };
+      }).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    // published course allocations (which lecturer teaches each course) for dept+level
+    const myAllocations = all('allocation_sets').filter(a => !a.deleted && a.status === 'published' && a.department_id === s.department_id && a.level_id === s.level_id)
+      .map(a => ({ id: a.id, title: a.title, department: nameOf('departments', a.department_id), level: nameOf('levels', a.level_id), session: nameOf('academic_sessions', a.session_id), semester: nameOf('semesters', a.semester_id), date: a.published_at,
+        courses: all('course_allocations').filter(r => r.set_id === a.id && !r.deleted).map(r => ({ code: r.course_code, title: r.course_title, ch: r.credit_unit, lecturer: r.lecturer_name })) }))
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)));
     const i = inst();
     // segment by office so the student sees exactly who they owe (and who collected)
     const roleOf = (uid) => { const u = uid ? one('users', uid) : null; return u ? u.role : null; };
@@ -205,6 +221,8 @@ module.exports = function createPortal(deps) {
       validations,
       results: all('results').filter(r => r.student_id === s.id).map(r => ({ id: r.id, title: r.title, level: nameOf('levels', r.level_id), semester: nameOf('semesters', r.semester_id), session: nameOf('academic_sessions', r.session_id), gpa: r.gpa, remark: r.remark, mime: r.mime, date: r.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       scores: scoresFor(s.id),
+      timetables: myTimetables,
+      allocations: myAllocations,
       documents: all('portal_documents').filter(d => (!d.faculty_id || d.faculty_id === s.faculty_id) && (!d.department_id || d.department_id === s.department_id) && (!d.level_id || d.level_id === s.level_id))
         .map(d => ({ id: d.id, title: d.title, category: d.category, office: d.office, by: userName(d.uploaded_by), mime: d.mime, date: d.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       misconduct: all('misconducts').filter(m => m.student_id === s.id && !m.deleted).map(m => ({ offense: m.offense, severity: m.severity, action: m.action, fine: m.penalty_amount || 0, currency: m.currency, status: m.status, date: m.occurred_at || m.created_at, note: m.resolution_note || m.description || '' })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
@@ -1043,7 +1061,8 @@ function studentView(w,d){
   var owingCount=(d.outstanding||[]).length;
   var photo=p.photo?'<img src="'+p.photo+'">':'<div class="ph">🎓</div>';
   // --- section tabs ---
-  var segs=[['overview','🏠','Overview',0],['fees','💳','Fees & Payments',owingCount],['receipts','🧾','Receipts',0],['results','📑','Results',0],['clearance','✅','Clearance',0],['documents','📂','Documents',0]];
+  var ttCount=(d.timetables||[]).length+(d.allocations||[]).length;
+  var segs=[['overview','🏠','Overview',0],['fees','💳','Fees & Payments',owingCount],['receipts','🧾','Receipts',0],['timetable','🗓','Timetable',ttCount],['results','📑','Results',0],['clearance','✅','Clearance',0],['documents','📂','Documents',0]];
   if(d.misconduct&&d.misconduct.length)segs.push(['discipline','⚖️','Discipline',d.misconduct.length]);
   segs.push(['profile','👤','Profile',0]);
   var navHtml=segs.map(function(s){return '<a data-seg="'+s[0]+'"><span class="ic">'+s[1]+'</span><span class="lbl">'+s[2]+'</span>'+(s[3]?'<span class="pill">'+s[3]+'</span>':'')+'</a>';}).join('');
@@ -1084,6 +1103,39 @@ function studentView(w,d){
   html+=seg('receipts',
     '<h2 class="sectitle">🧾 Payment History &amp; Receipts</h2>'
     +'<div class="panel">'+tbl([{t:'Receipt',f:function(r){return r.receipt_no||'—';}},{t:'Date',f:function(r){return fmt(r.date);}},{t:'For',f:function(r){return cap(r.category);}},{t:'Collected By',f:function(r){return (r.collector?eh(r.collector)+'<br>':'')+'<span class="muted" style="font-size:11px">'+eh(r.office||'')+'</span>';}},{t:'Amount',r:1,f:function(r){return money(r.amount,r.currency);}},{t:'',r:1,f:function(r){return r.receipt_no?'<button class="btn sm" onclick="doc(\\'/doc/receipt/'+r.id+'\\')">Download</button>':'';}}],d.payments,'No payments yet.')+'</div>');
+  // TIMETABLE — published lecture/exam/mid-semester timetables + course allocation
+  var ttTypeName=function(t){return t==='lecture'?'Lecture':t==='midsemester'?'Mid-Semester Test':'Examination';};
+  var ttHtml='';
+  (d.timetables||[]).forEach(function(t){
+    var rows=(t.slots||[]).filter(function(s){return s.kind!=='holiday';});
+    var hol=(t.slots||[]).filter(function(s){return s.kind==='holiday';});
+    var isLec=t.type==='lecture';
+    ttHtml+='<div class="panel"><h3>'+(isLec?'📘':t.type==='exam'?'📝':'🧪')+' '+eh(t.title||ttTypeName(t.type))+'</h3>'
+      +'<div class="muted" style="font-size:12px;margin-bottom:8px">'+eh([t.semester,t.session].filter(Boolean).join(' · ')||'')+'</div>'
+      +tbl([
+        {t:isLec?'Day':'Date',f:function(r){return eh(r.day||'—');}},
+        {t:'Time',f:function(r){return eh((r.start||'')+(r.end?('–'+r.end):''));}},
+        {t:'Course',f:function(r){return '<b>'+eh(r.course_code||'')+'</b> '+eh(r.course_title||'');}},
+        {t:'Lecturer',f:function(r){return eh(r.lecturer||'—');}},
+        {t:'Venue',f:function(r){return eh(r.venue||'—');}}
+      ],rows,'No entries.')
+      +(hol.length?('<div class="muted" style="font-size:12px;margin-top:6px">🏖 Breaks/holidays: '+hol.map(function(s){return eh(fmt(s.day));}).join(', ')+'</div>'):'')
+      +'</div>';
+  });
+  (d.allocations||[]).forEach(function(a){
+    ttHtml+='<div class="panel"><h3>👩‍🏫 '+eh(a.title||'Course Allocation')+'</h3>'
+      +'<div class="muted" style="font-size:12px;margin-bottom:8px">'+eh([a.semester,a.session].filter(Boolean).join(' · ')||'')+'</div>'
+      +tbl([
+        {t:'Code',f:function(r){return '<b>'+eh(r.code||'')+'</b>';}},
+        {t:'Course',f:function(r){return eh(r.title||'');}},
+        {t:'CH',r:1,f:function(r){return String(r.ch||0);}},
+        {t:'Lecturer',f:function(r){return eh(r.lecturer||'—');}}
+      ],a.courses,'No courses.')
+      +'</div>';
+  });
+  html+=seg('timetable',
+    '<h2 class="sectitle">🗓 My Timetable &amp; Course Allocation</h2>'
+    +(ttHtml||'<div class="empty">No timetables or course allocations published yet. They will appear here (and arrive by email) once your department releases them.</div>'));
   // RESULTS — list each level + semester with a downloadable PDF statement of result
   var sc=d.scores||{courses:[],semesters:[],cgpa:0,totalUnits:0};
   var myLevel=(d.profile&&d.profile.level)||'—';
