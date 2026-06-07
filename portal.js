@@ -429,10 +429,30 @@ module.exports = function createPortal(deps) {
     };
   }
 
+  // Public result authenticity check (no login) — confirms a statement of result is genuine:
+  // the student, level and the GPA/CGPA. Key is the student id, optionally "id|session|semester".
+  function verifyResult(idOrRef) {
+    let key = String(idOrRef || '').trim(); let ses = '', sem = '';
+    if (key.indexOf('|') >= 0) { const a = key.split('|'); key = a[0]; ses = a[1] || ''; sem = a[2] || ''; }
+    const s = one('students', key);
+    if (!s || s.deleted) return { valid: false };
+    const sc = scoresFor(s.id);
+    if (!sc.courses || !sc.courses.length) return { valid: false };
+    let gpa = sc.cgpa, cgpa = sc.cgpa, units = sc.totalUnits, courses = sc.courses.length, sesName = '', semName = '';
+    if (ses || sem) { const g = (sc.semesters || []).find(x => (!ses || x.session_id === ses) && (!sem || x.semester_id === sem)); if (g) { gpa = g.gpa; cgpa = g.cgpa; units = g.units; courses = g.courses.length; sesName = g.session || ''; semName = g.semester || ''; } }
+    const stand = (x) => { x = Number(x) || 0; return x >= 4.5 ? 'First Class' : x >= 3.5 ? 'Second Class (Upper)' : x >= 2.4 ? 'Second Class (Lower)' : x >= 1.5 ? 'Third Class' : x >= 1 ? 'Pass' : '—'; };
+    return {
+      valid: true, kind: 'result', ref: String(s.id).replace(/-/g, '').slice(0, 8).toUpperCase(),
+      session: sesName, semester: semName, gpa: gpa, cgpa: cgpa, totalUnits: units, courses: courses, standing: stand(cgpa),
+      student: { name: `${s.first_name || ''} ${s.last_name || ''}`.trim() || 'Unknown', matric: s.matric_no || '—', photo: s.photo || '', faculty: nameOf('faculties', s.faculty_id) || '—', department: nameOf('departments', s.department_id) || '—', level: nameOf('levels', s.level_id) || '—', gender: s.gender || '—', status: s.status || 'active' },
+    };
+  }
+
   // ---- documents (printable HTML) ----
   function inst() { return institution ? institution() : { name: 'UniBursar', short: 'UBU', logo: '', motto: '' }; }
-  function docShell(title, body, watermark) {
+  function docShell(title, body, watermark, opts) {
     const i = inst();
+    const fit = opts && opts.fit ? 'true' : 'false';
     const wm = watermark ? `<div class="wm"><span>${esc(watermark)}</span></div>` : '';
     return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title><meta name="viewport" content="width=device-width,initial-scale=1">
     <style>*{box-sizing:border-box}body{font-family:'Segoe UI',Arial,sans-serif;color:#1f2937;margin:0;padding:24px;font-size:13px;background:#f1f5f9;-webkit-print-color-adjust:exact;print-color-adjust:exact}
@@ -453,7 +473,7 @@ module.exports = function createPortal(deps) {
     .neg{color:#b91c1c}.pos{color:#065f46}.photo{width:84px;height:96px;object-fit:cover;border:1.5px solid #1e3a8a;border-radius:6px;float:right}</style></head>
     <body><div class="pbar"><button onclick="window.print()">⬇️ Download PDF / Print</button></div>
     <div class="sheet">${wm}<div class="head">${i.logo ? `<img class="logo" src="${i.logo}">` : `<div class="mono">${esc((i.short || 'U').slice(0, 3))}</div>`}<h1>${esc(i.name)}</h1><div class="t">${esc(title)}</div></div>${body}</div>
-    <script>(function(){var done=false;function go(){if(done)return;done=true;try{window.focus();window.print();}catch(e){}}window.addEventListener('load',function(){setTimeout(go,400);});})();</script>
+    <script>(function(){var FIT=${fit};function fit(){if(!FIT)return;var sh=document.querySelector('.sheet');if(!sh)return;sh.style.zoom='';var maxH=1040;var hgt=sh.scrollHeight;if(hgt>maxH){sh.style.zoom=Math.max(0.5,maxH/hgt);}}var done=false;function go(){if(done)return;done=true;fit();try{window.focus();window.print();}catch(e){}}window.addEventListener('load',function(){setTimeout(go,450);});window.addEventListener('beforeprint',fit);})();</script>
     </body></html>`;
   }
 
@@ -546,32 +566,53 @@ module.exports = function createPortal(deps) {
       ['Level', nameOf('levels', s.level_id) || '—'],
       ['Gender', s.gender || '—'],
     ];
-    if (focused) { infoRows.push(['Semester', focused.semester || '—'], ['Session', focused.session || '—'], ['Semester GPA', String(focused.gpa)]); }
+    if (focused) { infoRows.push(['Session / Semester', `${focused.session || '—'} · ${focused.semester || '—'}`], ['Semester GPA', String(focused.gpa)]); }
     infoRows.push(['Cumulative GPA (CGPA)', String(cgpa)], ['Class Standing', stand(cgpa)]);
     const infoTable = `<table class="info"><tbody>${infoRows.map(([k, v]) => `<tr><td class="k">${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`).join('')}</tbody></table>`;
     const semBlocks = sems.map(g => {
-      const rows = (g.courses || []).map((r, i) => `<tr><td class="c">${i + 1}</td><td class="mono">${esc(r.course_code || '—')}</td><td>${esc(r.course_title || '—')}</td><td class="c">${esc(r.credit_unit)}</td><td class="c">${r.score == null ? '–' : esc(r.score)}</td><td class="c"><b>${esc(r.grade || '–')}</b></td><td class="c">${r.co == null ? '–' : esc(r.co)}</td></tr>`).join('') || '<tr><td colspan="7" class="c" style="color:#94a3b8">No courses</td></tr>';
-      return `<div class="bar">${esc(g.semester || 'Semester')} · ${esc(g.session || '—')} &nbsp;—&nbsp; GPA ${esc(g.gpa)} · CGPA ${esc(g.cgpa)}</div>
-        <table class="ctbl"><thead><tr><th class="c">#</th><th>CODE</th><th>COURSE TITLE</th><th class="c">CH</th><th class="c">SCORE</th><th class="c">GRADE</th><th class="c">CO</th></tr></thead><tbody>${rows}</tbody></table>`;
+      return `<div class="bar">${esc(g.semester || 'Semester')} · ${esc(g.session || '—')} &nbsp;—&nbsp; GPA ${esc(g.gpa)} · CGPA ${esc(g.cgpa)} · ${esc(g.units)} units</div>
+        <table class="ctbl"><thead><tr><th class="c">#</th><th>CODE</th><th>COURSE TITLE</th><th class="c">CH</th><th class="c">TEST</th><th class="c">EXAM</th><th class="c">SCORE</th><th class="c">GRD</th><th class="c">CO</th></tr></thead><tbody>${(g.courses || []).map((r, i) => `<tr><td class="c">${i + 1}</td><td class="mono">${esc(r.course_code || '—')}</td><td>${esc(r.course_title || '—')}</td><td class="c">${esc(r.credit_unit)}</td><td class="c">${r.test_score == null ? '–' : esc(r.test_score)}</td><td class="c">${r.exam_score == null ? '–' : esc(r.exam_score)}</td><td class="c"><b>${r.score == null ? '–' : esc(r.score)}</b></td><td class="c"><b>${esc(r.grade || '–')}</b></td><td class="c">${r.co == null ? '–' : esc(r.co)}</td></tr>`).join('') || '<tr><td colspan="9" class="c" style="color:#94a3b8">No courses</td></tr>'}</tbody></table>`;
     }).join('') || '<p style="color:#94a3b8">No published results yet.</p>';
-    const legend = `<div class="legend"><b>Grading System:</b> 70–100 = A (5) · 60–69 = B (4) · 50–59 = C (3) · 45–49 = D (2) · 40–44 = E (1) · 0–39 = F (0)
-      <div class="note">CH = Credit Unit · CO = Grade Point × CH · GPA = Σ CO ÷ Σ CH for the semester · CGPA = cumulative GPA across all semesters.</div></div>`;
+    // verification QR → public /verify page (no login) showing the student + GPA/CGPA
+    const vurl = (docBase || '') + '/verify?res=' + s.id + (focused ? ('&ses=' + (focused.session_id || '') + '&sem=' + (focused.semester_id || '')) : '');
+    const qr = verifyQrSvg(vurl);
+    const ref = String(s.id).replace(/-/g, '').slice(0, 8).toUpperCase();
+    const legend = `<table class="gtbl"><thead><tr><th colspan="3">GRADING SYSTEM</th></tr></thead><tbody>
+      <tr><td>70–100</td><td class="c"><b>A</b></td><td class="c">5</td></tr><tr><td>60–69</td><td class="c"><b>B</b></td><td class="c">4</td></tr><tr><td>50–59</td><td class="c"><b>C</b></td><td class="c">3</td></tr>
+      <tr><td>45–49</td><td class="c"><b>D</b></td><td class="c">2</td></tr><tr><td>40–44</td><td class="c"><b>E</b></td><td class="c">1</td></tr><tr><td>0–39</td><td class="c"><b>F</b></td><td class="c">0</td></tr></tbody></table>
+      <div class="note">CH = Credit Unit · CO = Grade Point × CH · GPA = Σ CO ÷ Σ CH (semester) · CGPA = cumulative GPA.</div>`;
+    const authBox = `<div class="auth">${qr ? `<div class="qr">${qr}</div>` : ''}<div class="amt">Scan to verify this result on the portal.<br>Ref <b>${esc(ref)}</b><br><span class="vurl">${esc(vurl)}</span></div></div>`;
+    const summary = `<div class="summary"><div class="lab">Cumulative GPA</div><div class="big">${esc(cgpa)}</div><div class="lab">${esc(sc.totalUnits)} total units</div><div class="st">${esc(stand(cgpa))}</div></div>`;
     const sig = `<div class="sig"><div><div class="ln">Registrar / Examinations Officer</div></div><div><div class="ln" style="border-top-style:dashed">Official Stamp</div></div></div>`;
     const css = `<style>
-      .info{width:100%;border-collapse:collapse;margin:4px 0}
-      .info td{border:1px solid #d8dee9;padding:6px 10px;font-size:12.5px}
-      .info td.k{background:#f1f5f9;font-weight:700;color:#334155;width:220px;text-transform:uppercase;font-size:10.5px;letter-spacing:.3px}
-      table.ctbl{width:100%;border-collapse:collapse;margin:0 0 8px}
-      table.ctbl th{background:#eef2ff;border:1px solid #c7d2fe;padding:6px 8px;font-size:10px;text-transform:uppercase;letter-spacing:.3px;color:#1e3a8a;text-align:left}
-      table.ctbl td{border:1px solid #d8dee9;padding:6px 8px}
+      .sheet{font-size:11px}
+      .info{width:100%;border-collapse:collapse;margin:3px 0}
+      .info td{border:1px solid #d8dee9;padding:4px 9px;font-size:11.5px}
+      .info td.k{background:#f1f5f9;font-weight:700;color:#334155;width:190px;text-transform:uppercase;font-size:9.5px;letter-spacing:.3px}
+      .bar{margin:12px 0 4px;font-size:10.5px;padding:5px 10px}
+      table.ctbl{width:100%;border-collapse:collapse;margin:0 0 4px}
+      table.ctbl th{background:#eef2ff;border:1px solid #c7d2fe;padding:4px 6px;font-size:9px;text-transform:uppercase;letter-spacing:.2px;color:#1e3a8a;text-align:left}
+      table.ctbl td{border:1px solid #d8dee9;padding:4px 6px;font-size:10.5px}
       .mono{font-family:Consolas,monospace;font-weight:700}.c{text-align:center}
-      .legend{margin-top:16px;font-size:10.5px;color:#475569;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:8px 12px}
-      .legend .note{margin-top:4px;color:#64748b;font-size:9.5px}
-      .sig{margin-top:32px;display:flex;justify-content:space-between}.sig div{width:42%;text-align:center}
-      .sig .ln{border-top:1.5px solid #475569;padding-top:5px;color:#334155;font-size:11px;font-weight:600}
+      .foot{margin-top:14px;display:flex;gap:14px;align-items:flex-start;justify-content:space-between}
+      table.gtbl{border-collapse:collapse;width:170px}
+      table.gtbl th{background:#1e3a8a;color:#fff;padding:3px;font-size:9px;letter-spacing:1px}
+      table.gtbl td{border:1px solid #d1d5db;padding:1px 8px;font-size:9px}
+      .note{margin-top:5px;color:#64748b;font-size:8.5px;max-width:190px}
+      .auth{display:flex;gap:8px;align-items:center}
+      .auth .qr{width:84px;height:84px;flex:none}
+      .auth .amt{font-size:9.5px;color:#475569;line-height:1.4}
+      .auth .vurl{font-size:7.5px;color:#94a3b8;word-break:break-all}
+      .summary{text-align:right;min-width:130px}
+      .summary .lab{font-size:9px;color:#6b7280;text-transform:uppercase;letter-spacing:.4px}
+      .summary .big{font-size:26px;font-weight:800;color:#1e3a8a;line-height:1}
+      .summary .st{display:inline-block;margin-top:4px;padding:3px 11px;border-radius:999px;background:#dcfce7;color:#166534;font-weight:700;font-size:10px}
+      .sig{margin-top:22px;display:flex;justify-content:space-between}.sig div{width:42%;text-align:center}
+      .sig .ln{border-top:1.5px solid #475569;padding-top:4px;color:#334155;font-size:10px;font-weight:600}
+      @media print{@page{size:A4;margin:10mm}}
     </style>`;
-    const body = `${photo}<div class="bar">Students Information</div>${infoTable}${semBlocks}${legend}${sig}${css}`;
-    return docShell('Statement of Result', body, null);
+    const body = `${photo}<div class="bar">Students Information</div>${infoTable}${semBlocks}<div class="foot">${legend}${authBox}${summary}</div>${sig}${css}`;
+    return docShell('Statement of Result', body, null, { fit: true });
   }
 
   function payslipHTML(slip) {
@@ -693,6 +734,12 @@ module.exports = function createPortal(deps) {
         const mp = /[?&]p=([^&\\s]+)/.exec(pid); if (mp) pid = decodeURIComponent(mp[1]);
         pid = pid.replace(/^UBU-PSL:/i, '').trim();
         return J(res, 200, { ok: true, ...verifyPayslip(pid) });
+      }
+      let sres = u.searchParams.get('res') || '';
+      if (sres) { // a result statement link
+        const ms = /[?&]res=([^&\\s]+)/.exec(sres); if (ms) sres = decodeURIComponent(ms[1]);
+        const ses = u.searchParams.get('ses') || ''; const sem = u.searchParams.get('sem') || '';
+        return J(res, 200, { ok: true, ...verifyResult(sres + ((ses || sem) ? ('|' + ses + '|' + sem) : '')) });
       }
       let rid = u.searchParams.get('r') || '';
       if (rid) { // a receipt code/link
@@ -1228,6 +1275,13 @@ function renderResult(el,d){
      '<div class="big">✓ GENUINE PAYSLIP</div>'+
      '<div class="who">'+(ps.photo?'<img src="'+ps.photo+'" alt="photo">':'<div class="ph">💼</div>')+'<div><div class="nm">'+esc(ps.name)+'</div><div class="mt">'+esc(ps.staffNo)+'</div></div></div>'+
      '<table>'+row('Type',d.staffType)+row('Department',ps.department)+row('Pay period',d.period)+row('Net pay',d.net)+row('Gross',d.gross)+row('Pay date',d.dateText)+row('Verification ref',d.ref)+'</table>'+
+     '<button class="btn" onclick="resetView&&resetView()">Check another</button></div>';
+    return;}
+  if(d.kind==='result'){var rs=d.student;
+    el.innerHTML='<div class="rcard valid">'+
+     '<div class="big">✓ GENUINE RESULT</div>'+
+     '<div class="who">'+(rs.photo?'<img src="'+rs.photo+'" alt="photo">':'<div class="ph">🎓</div>')+'<div><div class="nm">'+esc(rs.name)+'</div><div class="mt">'+esc(rs.matric)+'</div></div></div>'+
+     '<table>'+row('Faculty',rs.faculty)+row('Department',rs.department)+row('Level',rs.level)+(d.session?row('Session',d.session):'')+(d.semester?row('Semester',d.semester):'')+row('Courses',String(d.courses))+row('GPA',String(d.gpa))+row('CGPA',String(d.cgpa))+row('Class standing',d.standing)+row('Verification ref',d.ref)+'</table>'+
      '<button class="btn" onclick="resetView&&resetView()">Check another</button></div>';
     return;}
   var s=d.student;var ok=d.completed;var tn=d.typeName||'Examination';var mid=d.clearanceType==='midterm';
