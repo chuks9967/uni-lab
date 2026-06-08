@@ -25,7 +25,7 @@ let createPortal = null;
 try { createPortal = require('./portal'); }
 catch (e) { console.error('[UniBursar] portal.js not loaded (' + e.message + ') — upload server/portal.js to enable the web portal. Sync/email still work.'); }
 
-const BUILD = 'portal-17'; // bump when server changes — visible at /health to confirm the live code
+const BUILD = 'portal-18'; // bump when server changes — visible at /health to confirm the live code
 const PORT = process.env.PORT || 4000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const SYNC_TOKEN = process.env.SYNC_TOKEN || ''; // optional shared secret
@@ -134,10 +134,19 @@ async function cloudPullDelta() {
       storeVersion = Date.now();
       return;
     }
-    let path = '/rest/v1/sync_records?select=entity,entity_id,row,updated_at&order=updated_at.asc&limit=1000';
-    if (lastCloudPull) path += '&updated_at=gt.' + encodeURIComponent(lastCloudPull);
-    const r = await supaRest('GET', path);
-    if (r.status >= 200 && r.status < 300 && Array.isArray(r.json)) mergeCloudRows(r.json);
+    // Incremental pull, paginated and using >= (not >). Many migrated rows share the SAME updated_at
+    // timestamp; with a strict ">" the portal would skip every row equal to the watermark and stay
+    // short (the "portal shows 83 of 371" bug). ">=" re-fetches the boundary rows, but mergeCloudRows
+    // de-duplicates them, so nothing is missed and the portal converges to the full count.
+    const PAGE = 1000;
+    for (let offset = 0; offset < 200000; offset += PAGE) {
+      let path = '/rest/v1/sync_records?select=entity,entity_id,row,updated_at&order=updated_at.asc&limit=' + PAGE + '&offset=' + offset;
+      if (lastCloudPull) path += '&updated_at=gte.' + encodeURIComponent(lastCloudPull);
+      const r = await supaRest('GET', path);
+      if (!(r.status >= 200 && r.status < 300 && Array.isArray(r.json))) break;
+      mergeCloudRows(r.json);
+      if (r.json.length < PAGE) break; // last page
+    }
     // refresh branding (logo + university name) every ~30s so the portal reflects changes the
     // desktop pushed AFTER this server booted, without needing a restart.
     if ((brandingTick++ % 6) === 0) {
@@ -343,7 +352,7 @@ const server = http.createServer(async (req, res) => {
 
   if (p === '/sync/pull' && req.method === 'GET') {
     const since = u.searchParams.get('since') || null; const out = [];
-    for (const k of Object.keys(store.records)) { const rec = store.records[k]; if (!since || rec.updated_at > since) out.push({ entity: rec.entity, row: rec.row, updated_at: rec.updated_at }); }
+    for (const k of Object.keys(store.records)) { const rec = store.records[k]; if (!since || rec.updated_at >= since) out.push({ entity: rec.entity, row: rec.row, updated_at: rec.updated_at }); }
     return send(res, 200, { ok: true, changes: out, now: new Date().toISOString(), epoch: store.epoch });
   }
 
