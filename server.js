@@ -73,8 +73,10 @@ function supaRest(method, path, body, extraHeaders) {
 }
 async function cloudUpsert(records) {
   if (!supaEnabled() || !records.length) return;
-  const rows = records.map(r => ({ key: r.entity + ':' + r.id, entity: r.entity, entity_id: String(r.id), row: r.row, updated_at: r.updated_at || new Date().toISOString() }));
-  try { await supaRest('POST', '/rest/v1/sync_records', rows, { 'Prefer': 'resolution=merge-duplicates,return=minimal' }); } catch (e) { console.error('[supabase] upsert failed:', e.message); }
+  // de-duplicate by key (keep newest) — a single upsert can't affect the same row twice
+  const byKey = new Map();
+  for (const r of records) byKey.set(r.entity + ':' + r.id, { key: r.entity + ':' + r.id, entity: r.entity, entity_id: String(r.id), row: r.row, updated_at: r.updated_at || new Date().toISOString() });
+  try { await supaRest('POST', '/rest/v1/sync_records', [...byKey.values()], { 'Prefer': 'resolution=merge-duplicates,return=minimal' }); } catch (e) { console.error('[supabase] upsert failed:', e.message); }
 }
 async function cloudGetMeta(key) {
   try { const r = await supaRest('GET', '/rest/v1/sync_meta?select=value&key=eq.' + encodeURIComponent(key)); if (Array.isArray(r.json) && r.json[0]) return r.json[0].value; } catch (_) {}
@@ -116,6 +118,7 @@ async function cloudLoadAll() {
     console.log('[supabase] portal loaded ' + total + ' records from the cloud.');
   } catch (e) { console.error('[supabase] initial load failed:', e.message); }
 }
+let brandingTick = 0;
 async function cloudPullDelta() {
   if (!supaEnabled()) return;
   try {
@@ -123,6 +126,12 @@ async function cloudPullDelta() {
     if (lastCloudPull) path += '&updated_at=gt.' + encodeURIComponent(lastCloudPull);
     const r = await supaRest('GET', path);
     if (r.status >= 200 && r.status < 300 && Array.isArray(r.json)) mergeCloudRows(r.json);
+    // refresh branding (logo + university name) and epoch every ~30s so the portal reflects
+    // changes the desktop pushed AFTER this server booted, without needing a restart.
+    if ((brandingTick++ % 6) === 0) {
+      const br = await cloudGetMeta('branding'); if (br) { try { const b = JSON.parse(br); if (b && (b.name || b.logo)) { store.branding = b; storeVersion = Date.now(); } } catch (_) {} }
+      const ep = await cloudGetMeta('epoch'); if (ep && ep !== store.epoch) store.epoch = ep;
+    }
   } catch (_) { /* transient — try again next tick */ }
 }
 

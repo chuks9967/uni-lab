@@ -223,7 +223,7 @@ module.exports = function createPortal(deps) {
       scores: scoresFor(s.id),
       timetables: myTimetables,
       allocations: myAllocations,
-      documents: all('portal_documents').filter(d => (!d.faculty_id || d.faculty_id === s.faculty_id) && (!d.department_id || d.department_id === s.department_id) && (!d.level_id || d.level_id === s.level_id))
+      documents: all('portal_documents').filter(d => (!d.student_id || d.student_id === s.id) && (!d.faculty_id || d.faculty_id === s.faculty_id) && (!d.department_id || d.department_id === s.department_id) && (!d.level_id || d.level_id === s.level_id))
         .map(d => ({ id: d.id, title: d.title, category: d.category, office: d.office, by: userName(d.uploaded_by), mime: d.mime, date: d.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       misconduct: all('misconducts').filter(m => m.student_id === s.id && !m.deleted).map(m => ({ offense: m.offense, severity: m.severity, action: m.action, fine: m.penalty_amount || 0, currency: m.currency, status: m.status, date: m.occurred_at || m.created_at, note: m.resolution_note || m.description || '' })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       charges: charges.map(c => ({ id: c.id, category: c.category, description: c.description, currency: c.currency, amount: c.amount, date: c.created_at, by: userName(c.created_by), rollover: !!c.is_rolled_over, rolled_from: nameOf('academic_sessions', c.rolled_from_session) })),
@@ -882,6 +882,8 @@ module.exports = function createPortal(deps) {
       if (type === 'portal-document' || type === 'document') {
         const d = one('portal_documents', id);
         if (!d || !d.file) return H(res, 404, '<p>Document not found.</p>');
+        // personalised docs (admission letter, certificate, transcript) are private to one student
+        if (d.student_id && studentish && d.student_id !== t.id) return H(res, 403, '<p>Not authorised.</p>');
         const buf = Buffer.from(d.file, 'base64');
         res.writeHead(200, { 'Content-Type': d.mime || 'application/octet-stream', 'Content-Disposition': 'attachment; filename="' + (d.filename || 'document') + '"' });
         res.end(buf); return true;
