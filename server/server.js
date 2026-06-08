@@ -46,6 +46,86 @@ if (!('branding' in store)) store.branding = null; // {name, short, logo, motto}
 let saveTimer = null;
 function save() { if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = null; try { fs.writeFileSync(STORE, JSON.stringify(store)); } catch (_) {} }, 600); }
 
+// ---- Supabase backing (optional) ------------------------------------------
+// When SUPABASE_URL + SUPABASE_KEY are set, this hub mirrors the SAME generic JSONB
+// store the desktop app writes to (table `sync_records`), so the online portal shows the
+// exact same data even when no desktop is online. The desktop may write to Supabase
+// directly (cloud mode) OR through this hub (hub mode) — either way the portal stays aligned.
+const https = require('https');
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_KEY = process.env.SUPABASE_KEY || '';
+const supaEnabled = () => !!(SUPABASE_URL && SUPABASE_KEY);
+let lastCloudPull = '';
+
+function supaRest(method, path, body, extraHeaders) {
+  return new Promise((resolve, reject) => {
+    let u; try { u = new URL(SUPABASE_URL + path); } catch (e) { return reject(e); }
+    const lib = u.protocol === 'https:' ? https : http;
+    const data = body != null ? Buffer.from(JSON.stringify(body)) : null;
+    const headers = Object.assign({ 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' }, extraHeaders || {});
+    if (data) headers['Content-Length'] = data.length;
+    const req = lib.request({ method, hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search, headers, timeout: 30000 }, (res) => {
+      let buf = ''; res.on('data', d => buf += d); res.on('end', () => { let j = null; try { j = buf ? JSON.parse(buf) : null; } catch (_) {} resolve({ status: res.statusCode, json: j, raw: buf }); });
+    });
+    req.on('error', reject); req.on('timeout', () => req.destroy(new Error('timeout')));
+    if (data) req.write(data); req.end();
+  });
+}
+async function cloudUpsert(records) {
+  if (!supaEnabled() || !records.length) return;
+  const rows = records.map(r => ({ key: r.entity + ':' + r.id, entity: r.entity, entity_id: String(r.id), row: r.row, updated_at: r.updated_at || new Date().toISOString() }));
+  try { await supaRest('POST', '/rest/v1/sync_records', rows, { 'Prefer': 'resolution=merge-duplicates,return=minimal' }); } catch (e) { console.error('[supabase] upsert failed:', e.message); }
+}
+async function cloudGetMeta(key) {
+  try { const r = await supaRest('GET', '/rest/v1/sync_meta?select=value&key=eq.' + encodeURIComponent(key)); if (Array.isArray(r.json) && r.json[0]) return r.json[0].value; } catch (_) {}
+  return null;
+}
+async function cloudSetMeta(key, value) {
+  if (!supaEnabled()) return;
+  try { await supaRest('POST', '/rest/v1/sync_meta', [{ key, value: value == null ? null : String(value) }], { 'Prefer': 'resolution=merge-duplicates,return=minimal' }); } catch (e) { console.error('[supabase] setMeta failed:', e.message); }
+}
+/** Merge a page of cloud rows into the in-memory store; advances the pull watermark. */
+function mergeCloudRows(page) {
+  let n = 0;
+  for (const rec of page || []) {
+    if (!rec || !rec.row) continue;
+    const key = rec.entity + ':' + rec.entity_id;
+    const prev = store.records[key];
+    const ua = rec.updated_at || (rec.row && rec.row.updated_at);
+    if (prev && prev.updated_at && ua && ua <= prev.updated_at) { if (ua > lastCloudPull) lastCloudPull = ua; continue; }
+    store.records[key] = { entity: rec.entity, id: rec.entity_id, row: rec.row, updated_at: ua };
+    if (ua && ua > lastCloudPull) lastCloudPull = ua;
+    n++;
+  }
+  if (n) { storeVersion = Date.now(); save(); }
+  return n;
+}
+async function cloudLoadAll() {
+  if (!supaEnabled()) return;
+  try {
+    const ep = await cloudGetMeta('epoch'); if (ep) store.epoch = ep;
+    const br = await cloudGetMeta('branding'); if (br) { try { store.branding = JSON.parse(br); } catch (_) {} }
+    let offset = 0; const PAGE = 1000; let total = 0;
+    for (;;) {
+      const r = await supaRest('GET', '/rest/v1/sync_records?select=entity,entity_id,row,updated_at&order=updated_at.asc&limit=' + PAGE + '&offset=' + offset);
+      if (r.status < 200 || r.status >= 300) { console.error('[supabase] load failed (' + r.status + '): ' + (r.raw || '').slice(0, 200)); break; }
+      const page = Array.isArray(r.json) ? r.json : [];
+      total += mergeCloudRows(page);
+      if (page.length < PAGE) break; offset += PAGE;
+    }
+    console.log('[supabase] portal loaded ' + total + ' records from the cloud.');
+  } catch (e) { console.error('[supabase] initial load failed:', e.message); }
+}
+async function cloudPullDelta() {
+  if (!supaEnabled()) return;
+  try {
+    let path = '/rest/v1/sync_records?select=entity,entity_id,row,updated_at&order=updated_at.asc&limit=1000';
+    if (lastCloudPull) path += '&updated_at=gt.' + encodeURIComponent(lastCloudPull);
+    const r = await supaRest('GET', path);
+    if (r.status >= 200 && r.status < 300 && Array.isArray(r.json)) mergeCloudRows(r.json);
+  } catch (_) { /* transient — try again next tick */ }
+}
+
 // in-memory version bumped on every applied change → portal clients poll this for live updates
 let storeVersion = Date.now();
 function allEntity(entity) { const out = []; for (const k in store.records) { const r = store.records[k]; if (r.entity === entity && r.row && !r.row.deleted) out.push(r.row); } return out; }
@@ -203,20 +283,20 @@ const server = http.createServer(async (req, res) => {
   if ((p === '/sync/push' || p === '/sync/pull' || p === '/email/send') && !tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized — missing or wrong sync token.' });
 
   if (p === '/sync/push' && req.method === 'POST') {
-    const body = await readBody(req); const changes = (body && body.changes) || []; let applied = 0;
+    const body = await readBody(req); const changes = (body && body.changes) || []; let applied = 0; const changedRecs = [];
     for (const ch of changes) {
       const entity = ch && ch.entity, row = ch && ch.row; if (!entity || !row || !row.id) continue;
       const key = `${entity}:${row.id}`; const updated_at = row.updated_at || new Date().toISOString();
       const prev = store.records[key];
       // sticky deletes: a delete always wins and is never resurrected
       if (prev && prev.row && prev.row.deleted && !row.deleted) continue;
-      if (row.deleted) { if (!(prev && prev.row && prev.row.deleted)) { store.records[key] = { entity, id: row.id, row, updated_at }; applied++; } continue; }
+      if (row.deleted) { if (!(prev && prev.row && prev.row.deleted)) { store.records[key] = { entity, id: row.id, row, updated_at }; changedRecs.push(store.records[key]); applied++; } continue; }
       // sticky payment decisions: never revert a decided payment back to pending
       if (entity === 'payments' && prev && prev.row && ['completed', 'denied', 'voided'].includes(prev.row.status) && row.status === 'pending') continue;
       if (prev && prev.updated_at && updated_at <= prev.updated_at) continue;
-      store.records[key] = { entity, id: row.id, row, updated_at }; applied++;
+      store.records[key] = { entity, id: row.id, row, updated_at }; changedRecs.push(store.records[key]); applied++;
     }
-    if (applied) { storeVersion = Date.now(); save(); }
+    if (applied) { storeVersion = Date.now(); save(); cloudUpsert(changedRecs); } // mirror hub-mode writes to the cloud
     return send(res, 200, { ok: true, applied, epoch: store.epoch });
   }
 
@@ -227,6 +307,7 @@ const server = http.createServer(async (req, res) => {
     if (!body || body.confirm !== 'RESET') return send(res, 400, { ok: false, error: 'confirm required' });
     store = { epoch: crypto.randomUUID(), records: {}, branding: store.branding };
     storeVersion = Date.now(); save();
+    if (supaEnabled()) { lastCloudPull = ''; supaRest('DELETE', '/rest/v1/sync_records?key=not.is.null', null, { 'Prefer': 'return=minimal' }).catch(() => {}); cloudSetMeta('epoch', store.epoch); }
     return send(res, 200, { ok: true });
   }
 
@@ -236,6 +317,7 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     store.branding = { name: body.name || '', short: body.short || '', logo: body.logo || '', motto: body.motto || '', session: body.session || '', semester: body.semester || '' };
     storeVersion = Date.now(); save();
+    cloudSetMeta('branding', JSON.stringify(store.branding));
     return send(res, 200, { ok: true });
   }
 
@@ -264,7 +346,14 @@ server.on('error', (e) => {
   }
   console.error('Server error:', e.message); process.exit(1);
 });
-server.listen(PORT, () => console.log(`UniBursar hub [build ${BUILD}] listening on http://0.0.0.0:${PORT}  portal=${!!portal}  (data: ${STORE})`));
+server.listen(PORT, () => console.log(`UniBursar hub [build ${BUILD}] listening on http://0.0.0.0:${PORT}  portal=${!!portal}  cloud=${supaEnabled()}  (data: ${STORE})`));
+
+// When backed by Supabase, load the full dataset on boot and then poll for deltas every ~5s
+// so the portal reflects changes the desktop wrote DIRECTLY to the cloud (cloud-sync mode).
+if (supaEnabled()) {
+  cloudLoadAll().then(() => { storeVersion = Date.now(); });
+  setInterval(cloudPullDelta, 5000);
+}
 
 // Keep a free-tier cloud instance awake so students always reach the portal even
 // when no desktop is online. Render exposes RENDER_EXTERNAL_URL; you can also set
