@@ -25,7 +25,7 @@ let createPortal = null;
 try { createPortal = require('./portal'); }
 catch (e) { console.error('[UniBursar] portal.js not loaded (' + e.message + ') — upload server/portal.js to enable the web portal. Sync/email still work.'); }
 
-const BUILD = 'portal-16'; // bump when server changes — visible at /health to confirm the live code
+const BUILD = 'portal-17'; // bump when server changes — visible at /health to confirm the live code
 const PORT = process.env.PORT || 4000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const SYNC_TOKEN = process.env.SYNC_TOKEN || ''; // optional shared secret
@@ -73,8 +73,10 @@ function supaRest(method, path, body, extraHeaders) {
 }
 async function cloudUpsert(records) {
   if (!supaEnabled() || !records.length) return;
-  const rows = records.map(r => ({ key: r.entity + ':' + r.id, entity: r.entity, entity_id: String(r.id), row: r.row, updated_at: r.updated_at || new Date().toISOString() }));
-  try { await supaRest('POST', '/rest/v1/sync_records', rows, { 'Prefer': 'resolution=merge-duplicates,return=minimal' }); } catch (e) { console.error('[supabase] upsert failed:', e.message); }
+  // de-duplicate by key (keep newest) — a single upsert can't affect the same row twice
+  const byKey = new Map();
+  for (const r of records) byKey.set(r.entity + ':' + r.id, { key: r.entity + ':' + r.id, entity: r.entity, entity_id: String(r.id), row: r.row, updated_at: r.updated_at || new Date().toISOString() });
+  try { await supaRest('POST', '/rest/v1/sync_records', [...byKey.values()], { 'Prefer': 'resolution=merge-duplicates,return=minimal' }); } catch (e) { console.error('[supabase] upsert failed:', e.message); }
 }
 async function cloudGetMeta(key) {
   try { const r = await supaRest('GET', '/rest/v1/sync_meta?select=value&key=eq.' + encodeURIComponent(key)); if (Array.isArray(r.json) && r.json[0]) return r.json[0].value; } catch (_) {}
@@ -116,13 +118,31 @@ async function cloudLoadAll() {
     console.log('[supabase] portal loaded ' + total + ' records from the cloud.');
   } catch (e) { console.error('[supabase] initial load failed:', e.message); }
 }
+let brandingTick = 0;
 async function cloudPullDelta() {
   if (!supaEnabled()) return;
   try {
+    // FIRST detect a cloud RESET: the desktop rotates the "epoch" whenever it wipes the cloud
+    // (e.g. before a fresh student-database migration). When the epoch changes we must DROP our
+    // stale in-memory store and reload the fresh cloud — otherwise the portal keeps showing the
+    // old/duplicate records that were just deleted from the cloud.
+    const ep = await cloudGetMeta('epoch');
+    if (ep && ep !== store.epoch) {
+      console.log('[supabase] cloud epoch changed (' + String(store.epoch).slice(0, 8) + ' → ' + String(ep).slice(0, 8) + ') — clearing portal store and reloading the fresh cloud.');
+      store.epoch = ep; store.records = {}; lastCloudPull = ''; storeVersion = Date.now(); save();
+      await cloudLoadAll();
+      storeVersion = Date.now();
+      return;
+    }
     let path = '/rest/v1/sync_records?select=entity,entity_id,row,updated_at&order=updated_at.asc&limit=1000';
     if (lastCloudPull) path += '&updated_at=gt.' + encodeURIComponent(lastCloudPull);
     const r = await supaRest('GET', path);
     if (r.status >= 200 && r.status < 300 && Array.isArray(r.json)) mergeCloudRows(r.json);
+    // refresh branding (logo + university name) every ~30s so the portal reflects changes the
+    // desktop pushed AFTER this server booted, without needing a restart.
+    if ((brandingTick++ % 6) === 0) {
+      const br = await cloudGetMeta('branding'); if (br) { try { const b = JSON.parse(br); if (b && (b.name || b.logo)) { store.branding = b; storeVersion = Date.now(); } } catch (_) {} }
+    }
   } catch (_) { /* transient — try again next tick */ }
 }
 
