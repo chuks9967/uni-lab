@@ -251,6 +251,10 @@ module.exports = function createPortal(deps) {
       add('timetable', '🗓', 'Timetable published', t.title || 'A new timetable is available', t.published_at, 'timetable', '/doc/timetable/' + t.id);
     for (const a of all('allocation_sets').filter(a => !a.deleted && a.status === 'published' && a.department_id === s.department_id && a.level_id === s.level_id))
       add('allocation', '👩‍🏫', 'Course allocation published', a.title || 'Lecturers have been assigned to your courses', a.published_at, 'liveclasses', null);
+    // a class that went live in the last 3 hours — surfaces in Updates with a tap-through to Live Classes
+    const liveCut = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    for (const v of all('live_sessions').filter(v => !v.deleted && v.active && v.department_id === s.department_id && v.level_id === s.level_id && String(v.started_at || '') >= liveCut))
+      add('liveclass', '🔴', 'Live class started', (v.subject || v.course_code || 'A class') + ' is live now — open Live Classes to join', v.started_at, 'liveclasses', null);
     for (const v of all('exam_validations').filter(v => v.student_id === s.id))
       add('clearance', '✅', 'Examination clearance update', (v.status === 'valid' ? 'You have been cleared for exams' : 'Your clearance status changed') + (v.reason ? ' — ' + v.reason : ''), v.created_at, 'clearance', null);
     for (const m of all('misconducts').filter(m => m.student_id === s.id && !m.deleted))

@@ -22,6 +22,9 @@ function serviceAccount() {
   try {
     let raw = process.env.FCM_SERVICE_ACCOUNT_JSON;
     if (!raw && process.env.FCM_SERVICE_ACCOUNT) raw = fs.readFileSync(process.env.FCM_SERVICE_ACCOUNT, 'utf8');
+    // Fallback: a service-account JSON shipped next to the server, so a plain `server/` upload to
+    // Cloud Run / cPanel can send pushes with NO env-var setup. Env vars still take precedence.
+    if (!raw) { try { const p = require('path').join(__dirname, 'fcm-service-account.json'); if (fs.existsSync(p)) raw = fs.readFileSync(p, 'utf8'); } catch (_) {} }
     const sa = raw ? JSON.parse(raw) : null;
     _sa = (sa && sa.client_email && sa.private_key && sa.project_id) ? sa : false;
   } catch (_) { _sa = false; }

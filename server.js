@@ -113,6 +113,9 @@ async function cloudLoadAll() {
   try {
     const ep = await cloudGetMeta('epoch'); if (ep) store.epoch = ep;
     const br = await cloudGetMeta('branding'); if (br) { try { store.branding = JSON.parse(br); } catch (_) {} }
+    // restore registered push tokens (Cloud Run's local FS is ephemeral — without this, a cold start
+    // would forget every device and pushes would stop until each app re-registers on next open).
+    const dt = await cloudGetMeta('deviceTokens'); if (dt) { try { const o = JSON.parse(dt); if (o && typeof o === 'object') store.deviceTokens = Object.assign(o, store.deviceTokens); } catch (_) {} }
     let offset = 0; const PAGE = 1000; let total = 0;
     for (;;) {
       const r = await supaRest('GET', '/rest/v1/sync_records?select=entity,entity_id,row,updated_at&order=updated_at.asc&limit=' + PAGE + '&offset=' + offset);
@@ -184,7 +187,8 @@ function tokensForStudents(ids) {
   for (const tk of Object.keys(store.deviceTokens || {})) { const d = store.deviceTokens[tk]; if (d && d.kind === 'student' && set.has(d.id)) out.push(tk); }
   return out;
 }
-function pruneStaleTokens(r) { if (r && r.stale && r.stale.length) { for (const t of r.stale) delete store.deviceTokens[t]; save(); } }
+function persistDeviceTokens() { if (supaEnabled()) { try { cloudSetMeta('deviceTokens', JSON.stringify(store.deviceTokens)); } catch (_) {} } }
+function pruneStaleTokens(r) { if (r && r.stale && r.stale.length) { for (const t of r.stale) delete store.deviceTokens[t]; save(); persistDeviceTokens(); } }
 async function pushNewRecords(recs) {
   if (!pushReady || !fcm || !fcm.configured() || !recs || !recs.length) return;
   for (const rec of recs) {
@@ -196,15 +200,21 @@ async function pushNewRecords(recs) {
       } else if (rec.entity === 'results' && row.student_id) {
         const tokens = tokensForStudents([row.student_id]);
         if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: 'Result published', body: row.title || 'A new statement of result is available' }, { seg: 'results', id: String(row.id || '') }));
+      } else if (rec.entity === 'live_sessions' && row.active && !row.deleted) {
+        // A class just went live — push every enrolled student in the cohort so they can tap in to join.
+        const ids = allEntity('students').filter(s => s.department_id === row.department_id && s.level_id === row.level_id).map(s => s.id);
+        const tokens = tokensForStudents(ids);
+        if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: '🔴 Live class started', body: (row.subject || row.course_code || 'Your class') + ' is live now — tap to join' }, { seg: 'liveclasses', id: String(row.id || ''), room: String(row.room || '') }));
       }
     } catch (_) { /* best-effort */ }
   }
 }
 /** Records whose arrival should trigger a push (new, not-deleted documents/results). */
 function collectPushable(entity, prev, row) {
-  if (entity !== 'portal_documents' && entity !== 'results') return false;
+  if (entity !== 'portal_documents' && entity !== 'results' && entity !== 'live_sessions') return false;
   if (!row || row.deleted) return false;
-  return !prev || !prev.row || prev.row.deleted; // genuinely new (or un-deleted)
+  if (entity === 'live_sessions' && !row.active) return false; // only a started (active) session pushes
+  return !prev || !prev.row || prev.row.deleted; // genuinely new (or un-deleted) — re-opening the same room won't re-push
 }
 let portal = null;
 if (createPortal) {
@@ -244,7 +254,8 @@ if (createPortal) {
       registerDevice: (token, account) => {
         if (!token) return false;
         store.deviceTokens[token] = { kind: account && account.kind, id: account && account.id, platform: (account && account.platform) || 'android', ts: Date.now() };
-        save(); return true;
+        save(); persistDeviceTokens(); // survive Cloud Run cold starts
+        return true;
       },
       institution: () => (store.branding && store.branding.name)
         ? store.branding
