@@ -24,6 +24,9 @@ const tls = require('tls');
 let createPortal = null;
 try { createPortal = require('./portal'); }
 catch (e) { console.error('[UniBursar] portal.js not loaded (' + e.message + ') — upload server/portal.js to enable the web portal. Sync/email still work.'); }
+// Firebase Cloud Messaging (native-app push). Optional — no-op unless FCM_SERVICE_ACCOUNT[_JSON] is set.
+let fcm = null;
+try { fcm = require('./fcm'); } catch (_) { fcm = null; }
 
 const BUILD = 'portal-20'; // bump when server changes — visible at /health to confirm the live code
 const PORT = process.env.PORT || 4000;
@@ -42,6 +45,7 @@ try {
 } catch (_) { store = { epoch: crypto.randomUUID(), records: {} }; }
 if (!store.epoch) store.epoch = crypto.randomUUID();
 if (!('branding' in store)) store.branding = null; // {name, short, logo, motto} pushed by the app
+if (!store.deviceTokens) store.deviceTokens = {}; // fcmToken -> { kind, id, platform, ts } (native app push targets)
 
 let saveTimer = null;
 function save() { if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = null; try { fs.writeFileSync(STORE, JSON.stringify(store)); } catch (_) {} }, 600); }
@@ -88,18 +92,20 @@ async function cloudSetMeta(key, value) {
 }
 /** Merge a page of cloud rows into the in-memory store; advances the pull watermark. */
 function mergeCloudRows(page) {
-  let n = 0;
+  let n = 0; const pushable = [];
   for (const rec of page || []) {
     if (!rec || !rec.row) continue;
     const key = rec.entity + ':' + rec.entity_id;
     const prev = store.records[key];
     const ua = rec.updated_at || (rec.row && rec.row.updated_at);
     if (prev && prev.updated_at && ua && ua <= prev.updated_at) { if (ua > lastCloudPull) lastCloudPull = ua; continue; }
+    if (collectPushable(rec.entity, prev, rec.row)) pushable.push({ entity: rec.entity, row: rec.row });
     store.records[key] = { entity: rec.entity, id: rec.entity_id, row: rec.row, updated_at: ua };
     if (ua && ua > lastCloudPull) lastCloudPull = ua;
     n++;
   }
   if (n) { storeVersion = Date.now(); save(); }
+  if (pushable.length) pushNewRecords(pushable); // fire-and-forget native push (no-op without FCM creds)
   return n;
 }
 async function cloudLoadAll() {
@@ -159,6 +165,47 @@ async function cloudPullDelta() {
 let storeVersion = Date.now();
 function allEntity(entity) { const out = []; for (const k in store.records) { const r = store.records[k]; if (r.entity === entity && r.row && !r.row.deleted) out.push(r.row); } return out; }
 function oneEntity(entity, id) { const r = store.records[entity + ':' + id]; return r && r.row && !r.row.deleted ? r.row : null; }
+
+// ---- native-app push (FCM) when a document/result is posted ---------------------------------
+// Fires only for records that arrive AFTER boot (the initial backlog loaded at startup must NOT
+// notify everyone). No-op unless FCM credentials are configured (see server/fcm.js).
+let pushReady = false;
+setTimeout(() => { pushReady = true; }, 20000);
+function studentsForDoc(d) {
+  if (!d) return [];
+  if (d.student_id) return [d.student_id];
+  return allEntity('students').filter(s =>
+    (!d.faculty_id || s.faculty_id === d.faculty_id) &&
+    (!d.department_id || s.department_id === d.department_id) &&
+    (!d.level_id || s.level_id === d.level_id)).map(s => s.id);
+}
+function tokensForStudents(ids) {
+  const set = new Set(ids); const out = [];
+  for (const tk of Object.keys(store.deviceTokens || {})) { const d = store.deviceTokens[tk]; if (d && d.kind === 'student' && set.has(d.id)) out.push(tk); }
+  return out;
+}
+function pruneStaleTokens(r) { if (r && r.stale && r.stale.length) { for (const t of r.stale) delete store.deviceTokens[t]; save(); } }
+async function pushNewRecords(recs) {
+  if (!pushReady || !fcm || !fcm.configured() || !recs || !recs.length) return;
+  for (const rec of recs) {
+    try {
+      const row = rec.row;
+      if (rec.entity === 'portal_documents') {
+        const tokens = tokensForStudents(studentsForDoc(row));
+        if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: 'New document', body: row.title || 'A new document was posted for you' }, { seg: 'documents', id: String(row.id || '') }));
+      } else if (rec.entity === 'results' && row.student_id) {
+        const tokens = tokensForStudents([row.student_id]);
+        if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: 'Result published', body: row.title || 'A new statement of result is available' }, { seg: 'results', id: String(row.id || '') }));
+      }
+    } catch (_) { /* best-effort */ }
+  }
+}
+/** Records whose arrival should trigger a push (new, not-deleted documents/results). */
+function collectPushable(entity, prev, row) {
+  if (entity !== 'portal_documents' && entity !== 'results') return false;
+  if (!row || row.deleted) return false;
+  return !prev || !prev.row || prev.row.deleted; // genuinely new (or un-deleted)
+}
 let portal = null;
 if (createPortal) {
   try {
@@ -182,6 +229,12 @@ if (createPortal) {
         row.updated_at = now;
         store.records[key] = { entity, id: row.id, row, updated_at: now };
         storeVersion = Date.now(); save(); return true;
+      },
+      // native app registers its FCM token here so we can push it when a document is posted
+      registerDevice: (token, account) => {
+        if (!token) return false;
+        store.deviceTokens[token] = { kind: account && account.kind, id: account && account.id, platform: (account && account.platform) || 'android', ts: Date.now() };
+        save(); return true;
       },
       institution: () => (store.branding && store.branding.name)
         ? store.branding
@@ -323,7 +376,7 @@ const server = http.createServer(async (req, res) => {
   if ((p === '/sync/push' || p === '/sync/pull' || p === '/email/send') && !tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized — missing or wrong sync token.' });
 
   if (p === '/sync/push' && req.method === 'POST') {
-    const body = await readBody(req); const changes = (body && body.changes) || []; let applied = 0; const changedRecs = [];
+    const body = await readBody(req); const changes = (body && body.changes) || []; let applied = 0; const changedRecs = []; const pushable = [];
     for (const ch of changes) {
       const entity = ch && ch.entity, row = ch && ch.row; if (!entity || !row || !row.id) continue;
       const key = `${entity}:${row.id}`; const updated_at = row.updated_at || new Date().toISOString();
@@ -334,9 +387,11 @@ const server = http.createServer(async (req, res) => {
       // sticky payment decisions: never revert a decided payment back to pending
       if (entity === 'payments' && prev && prev.row && ['completed', 'denied', 'voided'].includes(prev.row.status) && row.status === 'pending') continue;
       if (prev && prev.updated_at && updated_at <= prev.updated_at) continue;
+      if (collectPushable(entity, prev, row)) pushable.push({ entity, row });
       store.records[key] = { entity, id: row.id, row, updated_at }; changedRecs.push(store.records[key]); applied++;
     }
     if (applied) { storeVersion = Date.now(); save(); cloudUpsert(changedRecs); } // mirror hub-mode writes to the cloud
+    if (pushable.length) pushNewRecords(pushable); // native push when a document/result is posted
     return send(res, 200, { ok: true, applied, epoch: store.epoch });
   }
 
