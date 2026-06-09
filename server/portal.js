@@ -49,7 +49,7 @@ function numWords(num) { num = Math.floor(Number(num) || 0); if (num === 0) retu
 function amountWords(a, c) { const whole = Math.floor(Number(a) || 0); const k = Math.round((Number(a) - whole) * 100); let s = `${numWords(whole)} ${WORD_CCY[c] || c}`; if (k > 0) s += ` and ${numWords(k)}/100`; return s + ' only'; }
 
 module.exports = function createPortal(deps) {
-  const { all, one, getVersion, secret, institution, update } = deps;
+  const { all, one, getVersion, secret, institution, update, create } = deps;
   // the public base URL of THIS request (https://host) — used to print absolute,
   // scannable verification URLs in the QR on receipts/payslips. Set per request.
   let docBase = '';
@@ -1050,6 +1050,50 @@ ${head}
     return verifyToken(tok);
   }
 
+  // ---------------------------------------------------------------------------
+  // ONLINE ADMISSIONS — public application portal (/apply). Applicants are NOT accounts; they
+  // authenticate with a temporary pass (application number + passcode) which mints a short-lived
+  // 'applicant' token. Applications are WRITTEN here via the create/update hooks and sync to the
+  // registrar's desktop. Payment rails (Paystack secret / bank details) are read from server env —
+  // the FEE AMOUNT itself rides on the synced application (set by the registrar's Offer).
+  function genAppNo() {
+    const short = String(inst().short || 'WAUU').replace(/[^A-Za-z0-9]/g, '').toUpperCase() || 'WAUU';
+    const seq = all('admission_applications').length + 1;
+    return `${short}/APP/${new Date().getFullYear()}/${String(seq).padStart(5, '0')}`;
+  }
+  const genPasscode = () => crypto.randomBytes(5).toString('hex').toUpperCase().slice(0, 8);
+  const applicantToken = (id) => sign({ k: 'applicant', id, exp: Date.now() + 1000 * 60 * 60 * 24 * 30 }); // 30-day temp pass
+  function applicantFrom(req, u) { const t = authOf(req, u); if (!t || t.k !== 'applicant') return null; const a = one('admission_applications', t.id); return (a && !a.deleted) ? a : null; }
+  function appPublic(a) {
+    if (!a) return null;
+    const docs = all('admission_documents').filter(d => d.application_id === a.id && !d.deleted).map(d => ({ id: d.id, kind: d.kind, filename: d.filename, uploaded_at: d.uploaded_at }));
+    const { passcode_hash, ...rest } = a; // never expose the passcode hash to the client
+    return Object.assign(rest, { department_name: nameOf('departments', a.department_id), faculty_name: nameOf('faculties', a.faculty_id), level_name: nameOf('levels', a.level_id), documents: docs });
+  }
+  function programmesPayload() {
+    const faculties = all('faculties').filter(f => !f.deleted);
+    const departments = all('departments').filter(d => !d.deleted);
+    const levels = all('levels').filter(l => !l.deleted).sort((a, b) => (a.rank || 0) - (b.rank || 0)).map(l => ({ id: l.id, name: l.name }));
+    const grouped = faculties.map(f => ({ id: f.id, name: f.name, departments: departments.filter(d => d.faculty_id === f.id).map(d => ({ id: d.id, name: d.name })) })).filter(f => f.departments.length);
+    const orphans = departments.filter(d => !faculties.some(f => f.id === d.faculty_id));
+    if (orphans.length) grouped.push({ id: '_other', name: 'Other Programmes', departments: orphans.map(d => ({ id: d.id, name: d.name })) });
+    return { faculties: grouped, levels, open: (String(process.env.ADMISSIONS_OPEN || '1') !== '0') };
+  }
+  // minimal Paystack client (optional — only used when PAYSTACK_SECRET is set in the server env)
+  function paystackReq(pathName, method, payload) {
+    return new Promise((resolve) => {
+      try {
+        const https = require('https');
+        const data = payload ? JSON.stringify(payload) : null;
+        const r = https.request({ hostname: 'api.paystack.co', path: pathName, method, headers: Object.assign({ Authorization: 'Bearer ' + process.env.PAYSTACK_SECRET, 'Content-Type': 'application/json' }, data ? { 'Content-Length': Buffer.byteLength(data) } : {}) }, (resp) => {
+          let b = ''; resp.on('data', d => b += d); resp.on('end', () => { try { resolve(JSON.parse(b)); } catch (_) { resolve(null); } });
+        });
+        r.on('error', () => resolve(null));
+        if (data) r.write(data); r.end();
+      } catch (_) { resolve(null); }
+    });
+  }
+
   async function handle(req, res, u, method, readBody) {
     const p = u.pathname.replace(/\/+$/, '') || '/';
     docBase = buildBase(req); // so any document we render this request can build absolute verify URLs
@@ -1131,6 +1175,113 @@ ${head}
       const name = (acc.kind === 'student') ? `${acc.row.first_name || ''} ${acc.row.last_name || ''}`.trim()
         : (acc.kind === 'parent') ? (acc.row.parent_name || 'Parent/Guardian') : acc.row.full_name;
       return J(res, 200, { ok: true, token, user: { role: acc.role, kind: acc.kind, name } });
+    }
+
+    // ---- Online Admissions (public application portal, temporary-pass auth) ----
+    if (p === '/apply' && method === 'GET') { return H(res, 200, APPLY_PAGE); }
+    if (p === '/api/apply/programmes' && method === 'GET') { return J(res, 200, Object.assign({ ok: true }, programmesPayload())); }
+
+    if (p === '/api/apply/start' && method === 'POST') {
+      if (String(process.env.ADMISSIONS_OPEN || '1') === '0') return J(res, 200, { ok: false, error: 'Online admissions are currently closed.' });
+      const body = await readBody();
+      const first = String(body.first_name || '').trim(), last = String(body.last_name || '').trim(), email = String(body.email || '').trim();
+      if (!first || !last) return J(res, 200, { ok: false, error: 'Enter your first and last name.' });
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return J(res, 200, { ok: false, error: 'Enter a valid email address.' });
+      if (typeof create !== 'function') return J(res, 200, { ok: false, error: 'Applications are not available on this server.' });
+      const dept = body.department_id ? one('departments', body.department_id) : null;
+      const id = crypto.randomUUID(); const passcode = genPasscode(); const now = new Date().toISOString();
+      create('admission_applications', {
+        id, app_no: genAppNo(), passcode_hash: hashPass(passcode),
+        first_name: first, last_name: last, email, phone: String(body.phone || '').trim(),
+        faculty_id: dept ? dept.faculty_id : null, department_id: dept ? dept.id : (body.department_id || null), level_id: body.level_id || null, session_id: null,
+        status: 'draft', stage: 1, admission_fee_paid: 0, deleted: 0, created_at: now, updated_at: now, origin_node: 'portal',
+      });
+      return J(res, 200, { ok: true, app_no: one('admission_applications', id).app_no, passcode, token: applicantToken(id), application: appPublic(one('admission_applications', id)) });
+    }
+
+    if (p === '/api/apply/login' && method === 'POST') {
+      const body = await readBody();
+      const appNo = String(body.app_no || '').trim().toUpperCase();
+      const a = all('admission_applications').find(x => !x.deleted && String(x.app_no || '').toUpperCase() === appNo);
+      if (!a || !verifyPass(body.passcode, a.passcode_hash)) return J(res, 200, { ok: false, error: 'Invalid application number or passcode.' });
+      return J(res, 200, { ok: true, token: applicantToken(a.id), application: appPublic(a) });
+    }
+
+    if (p === '/api/apply/me' && method === 'GET') { const a = applicantFrom(req, u); if (!a) return J(res, 401, { ok: false }); return J(res, 200, { ok: true, application: appPublic(a) }); }
+
+    if (p === '/api/apply/save' && method === 'POST') {
+      const a = applicantFrom(req, u); if (!a) return J(res, 401, { ok: false });
+      if (a.status !== 'draft' && a.status !== 'submitted') return J(res, 200, { ok: false, error: 'This application can no longer be edited.' });
+      const body = await readBody();
+      const allowed = ['first_name', 'last_name', 'middle_name', 'email', 'phone', 'gender', 'date_of_birth', 'address', 'nationality', 'state_of_origin', 'department_id', 'level_id', 'jamb_no', 'jamb_score', 'olevel', 'prev_school', 'qualifications', 'guardian_name', 'guardian_email', 'guardian_phone', 'guardian_relation', 'stage'];
+      const patch = {}; for (const k of allowed) if (k in body) patch[k] = body[k];
+      if (patch.department_id) { const d = one('departments', patch.department_id); if (d) patch.faculty_id = d.faculty_id; }
+      if (patch.olevel && typeof patch.olevel !== 'string') patch.olevel = JSON.stringify(patch.olevel);
+      if (patch.qualifications && typeof patch.qualifications !== 'string') patch.qualifications = JSON.stringify(patch.qualifications);
+      if (typeof update === 'function') update('admission_applications', a.id, patch);
+      return J(res, 200, { ok: true, application: appPublic(one('admission_applications', a.id)) });
+    }
+
+    if (p === '/api/apply/doc' && method === 'POST') {
+      const a = applicantFrom(req, u); if (!a) return J(res, 401, { ok: false });
+      const body = await readBody();
+      if (!body.content || !/^data:/.test(String(body.content))) return J(res, 200, { ok: false, error: 'No file received.' });
+      if (String(body.content).length > 8 * 1024 * 1024) return J(res, 200, { ok: false, error: 'File too large (about 6MB max).' });
+      const id = crypto.randomUUID(); const now = new Date().toISOString();
+      const prior = all('admission_documents').find(d => d.application_id === a.id && d.kind === body.kind && !d.deleted);
+      if (prior && typeof update === 'function') update('admission_documents', prior.id, { deleted: 1 });
+      if (typeof create === 'function') create('admission_documents', { id, application_id: a.id, kind: String(body.kind || 'other'), filename: String(body.filename || 'upload'), content: String(body.content), uploaded_at: now, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+      return J(res, 200, { ok: true, application: appPublic(one('admission_applications', a.id)) });
+    }
+
+    if (p === '/api/apply/doc/delete' && method === 'POST') {
+      const a = applicantFrom(req, u); if (!a) return J(res, 401, { ok: false });
+      const body = await readBody(); const d = body.id ? one('admission_documents', body.id) : null;
+      if (d && d.application_id === a.id && typeof update === 'function') update('admission_documents', d.id, { deleted: 1 });
+      return J(res, 200, { ok: true, application: appPublic(one('admission_applications', a.id)) });
+    }
+
+    if (p === '/api/apply/submit' && method === 'POST') {
+      const a = applicantFrom(req, u); if (!a) return J(res, 401, { ok: false });
+      if (!a.first_name || !a.last_name || !a.email || !a.department_id) return J(res, 200, { ok: false, error: 'Please complete your name, email and chosen programme before submitting.' });
+      const now = new Date().toISOString();
+      if (typeof update === 'function') update('admission_applications', a.id, { status: 'submitted', submitted_at: a.submitted_at || now, stage: 6 });
+      return J(res, 200, { ok: true, application: appPublic(one('admission_applications', a.id)) });
+    }
+
+    if (p === '/api/apply/pay' && method === 'POST') {
+      const a = applicantFrom(req, u); if (!a) return J(res, 401, { ok: false });
+      if (!(Number(a.admission_fee_amount) > 0)) return J(res, 200, { ok: false, error: 'No admission fee has been set yet. Please wait for your offer.' });
+      const amount = Number(a.admission_fee_amount), currency = a.admission_fee_currency || 'NGN';
+      if (process.env.PAYSTACK_SECRET && a.email) {
+        const init = await paystackReq('/transaction/initialize', 'POST', { email: a.email, amount: Math.round(amount * 100), currency, reference: 'ADM-' + String(a.id).slice(0, 8) + '-' + Date.now(), callback_url: `${buildBase(req)}/api/apply/pay/callback`, metadata: { application_id: a.id, app_no: a.app_no } });
+        if (init && init.status && init.data && init.data.authorization_url) {
+          if (typeof update === 'function') update('admission_applications', a.id, { payment_ref: init.data.reference });
+          return J(res, 200, { ok: true, mode: 'paystack', authorization_url: init.data.authorization_url });
+        }
+      }
+      return J(res, 200, { ok: true, mode: 'manual', amount, currency, bank: process.env.ADMISSION_BANK || 'Contact the Bursary for the bank account details, then declare your payment below.' });
+    }
+
+    if (p === '/api/apply/pay/declare' && method === 'POST') {
+      const a = applicantFrom(req, u); if (!a) return J(res, 401, { ok: false });
+      const body = await readBody();
+      if (typeof update === 'function') update('admission_applications', a.id, { payment_ref: 'DECLARED:' + String(body.ref || 'bank transfer').slice(0, 60) });
+      return J(res, 200, { ok: true, application: appPublic(one('admission_applications', a.id)) });
+    }
+
+    if (p === '/api/apply/pay/callback' && method === 'GET') {
+      const reference = u.searchParams.get('reference') || u.searchParams.get('trxref') || '';
+      let okPaid = false;
+      if (process.env.PAYSTACK_SECRET && reference) {
+        const v = await paystackReq('/transaction/verify/' + encodeURIComponent(reference), 'GET', null);
+        if (v && v.status && v.data && v.data.status === 'success') {
+          const appId = (v.data.metadata && v.data.metadata.application_id) || '';
+          const a = appId ? one('admission_applications', appId) : null;
+          if (a && typeof update === 'function') { update('admission_applications', a.id, { admission_fee_paid: 1, payment_ref: reference, status: a.status === 'admitted' ? 'admitted' : 'fee_paid' }); okPaid = true; }
+        }
+      }
+      return H(res, 200, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:Segoe UI,Arial,sans-serif;background:#0b1220;color:#fff;text-align:center;padding:60px 20px"><div style="font-size:54px">${okPaid ? '✅' : '⚠️'}</div><h2>${okPaid ? 'Payment received' : 'Payment not confirmed'}</h2><p style="opacity:.8">${okPaid ? 'Your admission fee has been received. Your admission will be finalized shortly.' : 'We could not confirm your payment. If you were debited, contact the Bursary.'}</p><a href="/apply" style="display:inline-block;margin-top:18px;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Back to application</a></body>`);
     }
 
     if (p === '/api/reset-password' && method === 'POST') {
@@ -1396,6 +1547,7 @@ async function renderLogin(msg){
     +'<div class="field"><label>Password</label><input id="pw" type="password" autocomplete="current-password"></div>'
     +'<button class="btn" id="go">Sign In</button>'
     +'<div class="hintbar">Your login is emailed to you after registration. Forgot it? Ask the bursary or registrar to resend your portal login.</div>'
+    +'<div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(148,163,184,.3);text-align:center"><div class="sub" style="margin-bottom:8px">New here? Not yet a student?</div><a href="/apply" style="display:inline-block;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:9px;text-decoration:none;font-weight:700">🎓 Apply for Admission</a></div>'
     +'<div class="sub" style="margin-top:10px;text-align:center"><a href="/scan">🛡 Staff: open the Clearance Scanner →</a></div>'
     +'</div></div>');
   document.getElementById('app').appendChild(box);
@@ -1404,6 +1556,48 @@ async function renderLogin(msg){
   box.querySelector('#go').onclick=go;
   box.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',function(e){if(e.key==='Enter')go();}));
 }
+
+// ---- NATIVE NOTIFICATIONS (Android/iOS app) -------------------------------
+// When this portal runs INSIDE the mobile app (Capacitor WebView), fire a real OS notification
+// (heads-up + sound) for every NEW item in the student's derived feed, so they are alerted even
+// when they are not staring at the screen. On the plain web there is no Capacitor bridge → this is
+// a silent no-op (the in-app 🔔 Updates tab still shows everything). renderApp() re-runs whenever the
+// data version changes (every ~2.5s poll), so new receipts/results/fees trigger a notification within
+// seconds of syncing. A per-account marker prevents the same item from notifying twice.
+var NATIVE=(window.Capacitor&&window.Capacitor.Plugins&&window.Capacitor.Plugins.LocalNotifications)||null;
+function isNativeApp(){return !!(window.Capacitor&&(window.Capacitor.isNativePlatform?window.Capacitor.isNativePlatform():window.Capacitor.platform&&window.Capacitor.platform!=='web'));}
+var _notifReady=null;
+function ensureNotif(){
+  if(_notifReady)return _notifReady;
+  _notifReady=(async function(){
+    if(!NATIVE)return false;
+    try{
+      var pe=await NATIVE.checkPermissions();var granted=pe&&pe.display==='granted';
+      if(!granted){var rq=await NATIVE.requestPermissions();granted=rq&&rq.display==='granted';}
+      if(!granted)return false;
+      try{ if(NATIVE.createChannel) await NATIVE.createChannel({id:'ubu-updates',name:'Portal Updates',description:'Fees, results, receipts and announcements',importance:5,visibility:1}); }catch(_){}
+      return true;
+    }catch(_){return false;}
+  })();
+  return _notifReady;
+}
+async function nativeNotify(notifs,key){
+  if(!NATIVE||!notifs||!notifs.length)return;
+  var ok=await ensureNotif();if(!ok)return;
+  var markKey='ubu_notified_'+key;var last=localStorage.getItem(markKey)||'';var newest=String((notifs[0]&&notifs[0].date)||'');
+  if(!newest)return;
+  if(!last){localStorage.setItem(markKey,newest);return;} // first run on this device → set baseline, don't spam
+  var fresh=notifs.filter(function(n){return String(n.date||'')>last;});
+  if(!fresh.length)return;
+  var toFire=fresh.slice(0,5).reverse();var base=Date.now()%2000000000;
+  var arr=toFire.map(function(n,i){return {id:base+i,title:((n.icon?n.icon+' ':'')+(n.title||'Update')).slice(0,80),body:String(n.text||'').slice(0,180),channelId:'ubu-updates',extra:{seg:n.seg||null,doc:n.doc||null}};});
+  try{await NATIVE.schedule({notifications:arr});}catch(_){}
+  localStorage.setItem(markKey,newest);
+}
+// Tapping a notification opens the relevant section once the app is focused.
+if(NATIVE&&NATIVE.addListener){try{NATIVE.addListener('localNotificationActionPerformed',function(ev){try{var ex=ev&&ev.notification&&ev.notification.extra;if(ex&&ex.seg&&window.__goSeg)window.__goSeg(ex.seg);}catch(_){}});}catch(_){}}
+// Android hardware BACK button: navigate within the app (back to Overview) instead of closing it.
+(function(){var A=window.Capacitor&&window.Capacitor.Plugins&&window.Capacitor.Plugins.App;if(!A||!A.addListener)return;try{A.addListener('backButton',function(){try{var seg=window.__seg||'overview';if(seg&&seg!=='overview'&&window.__goSeg){window.__goSeg('overview');return;}if(A.minimizeApp)A.minimizeApp();else if(A.exitApp)A.exitApp();}catch(_){}});}catch(_){}})();
 
 async function renderApp(){
   const r=await api('/api/data');
@@ -1415,7 +1609,7 @@ async function renderApp(){
   if(d.kind==='student')studentView(w,d);
   else if(d.kind==='staff')staffView(w,d);
   else officerView(w,d);
-  if(d.kind==='student')mountChat();
+  if(d.kind==='student'){mountChat();try{nativeNotify(d.notifications,(d.profile&&(d.profile.matric_no||d.profile.full_name))||'me');}catch(_){}}
   VER=(await api('/api/version')).version||0;
   if(TIMER)clearInterval(TIMER);
   TIMER=setInterval(async()=>{try{const v=(await api('/api/version')).version;if(v!==VER){VER=v;var ae=document.activeElement;if(ae&&/^(SELECT|INPUT|TEXTAREA)$/.test(ae.tagName))return;renderApp();}}catch(_){}},2500);
@@ -1757,6 +1951,245 @@ if(TOKEN){renderApp().catch(()=>renderLogin());}else{renderLogin();}
 
 // ----------------------- installable app assets -----------------------
 const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512" rx="104" fill="#1e3a8a"/><text x="50%" y="55%" font-family="Segoe UI,Arial,sans-serif" font-size="220" font-weight="800" fill="#ffffff" text-anchor="middle" dominant-baseline="middle">UB</text></svg>`;
+// ---- Public Online Admission portal (/apply) — self-contained mini-SPA, temporary-pass auth ----
+const APPLY_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Apply for Admission</title>
+<link rel="icon" href="/favicon">
+<style>
+:root{--navy:#0f1e3d;--blue:#1e3a8a;--ind:#4338ca;--line:#e2e8f0;--muted:#64748b;--bg:#f1f5f9}
+*{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',Roboto,Arial,sans-serif;background:var(--bg);color:#0f172a}
+.top{background:linear-gradient(120deg,var(--navy),var(--blue));color:#fff;padding:12px 16px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:5}
+.top img{height:34px;width:34px;border-radius:8px;object-fit:contain;background:#fff}
+.top .t{font-weight:800;font-size:16px;line-height:1.1}.top .s{font-size:11px;opacity:.8}
+.top .sp{flex:1}.top a.lk{color:#cde;font-size:13px;text-decoration:none;border:1px solid rgba(255,255,255,.3);padding:6px 10px;border-radius:8px}
+.wrap{max-width:760px;margin:0 auto;padding:18px 14px 60px}
+.screen{display:none}.screen.on{display:block;animation:fu .25s ease}@keyframes fu{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:18px;margin:14px 0;box-shadow:0 1px 3px rgba(15,23,42,.05)}
+.hero{background:linear-gradient(120deg,var(--navy),var(--ind));color:#fff;border:none}
+.hero h1{margin:0 0 6px;font-size:26px}.hero p{margin:0;opacity:.9;line-height:1.5}
+h2{font-size:19px;margin:0 0 4px}h3{font-size:15px;margin:14px 0 6px}.muted{color:var(--muted);font-size:13px}
+label{display:block;font-size:12px;font-weight:600;color:#334155;margin:10px 0 4px}
+input,select,textarea{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px;font-family:inherit;background:#fff}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(30,58,138,.12)}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}@media(max-width:560px){.row{grid-template-columns:1fr}}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--blue);color:#fff;border:none;padding:12px 18px;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;text-decoration:none}
+.btn.alt{background:#fff;color:var(--blue);border:1.5px solid var(--blue)}.btn.gho{background:transparent;color:#334155;border:1px solid var(--line)}
+.btn:disabled{opacity:.6;cursor:default}.btn.full{width:100%}
+.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+.err{background:#fee2e2;color:#991b1b;border-radius:8px;padding:8px 12px;font-size:13px;margin:8px 0;display:none}
+.ok{background:#dcfce7;color:#166534;border-radius:8px;padding:8px 12px;font-size:13px;margin:8px 0}
+.fac{border:1px solid var(--line);border-radius:12px;margin:10px 0;overflow:hidden}
+.fac>.h{padding:12px 14px;font-weight:700;background:#f8fafc;cursor:pointer;display:flex;justify-content:space-between}
+.fac .deps{display:none;padding:6px 10px 12px}.fac.open .deps{display:block}
+.dep{display:block;width:100%;text-align:left;background:#fff;border:1px solid var(--line);border-radius:9px;padding:10px 12px;margin:6px 0;cursor:pointer;font-size:14px}
+.dep:hover{border-color:var(--blue);background:#f5f8ff}
+.steps{display:flex;gap:6px;margin:6px 0 14px;flex-wrap:wrap}
+.steps .st{flex:1;min-width:54px;text-align:center;font-size:11px;color:var(--muted);border-top:3px solid var(--line);padding-top:6px}
+.steps .st.on{color:var(--blue);border-color:var(--blue);font-weight:700}.steps .st.done{color:#166534;border-color:#16a34a}
+.passbox{background:#0f1e3d;color:#fff;border-radius:12px;padding:16px;text-align:center;margin:12px 0}
+.passbox .k{font-size:12px;opacity:.8}.passbox .v{font-size:22px;font-weight:800;letter-spacing:1px;margin:4px 0 10px;user-select:all}
+.olrow{display:grid;grid-template-columns:1fr 90px 34px;gap:8px;margin:6px 0}
+.docs{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}
+.doc{border:1px solid var(--line);border-radius:10px;padding:8px;width:120px;text-align:center;font-size:11px;position:relative}
+.doc img{width:100%;height:74px;object-fit:cover;border-radius:6px}.doc .del{position:absolute;top:-7px;right:-7px;background:#ef4444;color:#fff;border:none;border-radius:50%;width:22px;height:22px;cursor:pointer}
+.pill{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700}
+.tl{margin:14px 0}.tl .i{display:flex;gap:10px;align-items:flex-start;margin:0 0 2px}
+.tl .dot{width:22px;height:22px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-size:12px;background:#e2e8f0;color:#64748b}
+.tl .i.done .dot{background:#16a34a;color:#fff}.tl .i.now .dot{background:var(--blue);color:#fff}
+.tl .ln{font-size:13px;padding-top:2px}.tl .i .bar{width:2px;background:#e2e8f0;margin:0 10px;height:14px}
+.kv{display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:7px 0;font-size:14px}
+</style></head><body>
+<div class="top"><img id="logo" src="/favicon" alt=""><div><div class="t" id="instName">University Admissions</div><div class="s">Online Application Portal</div></div><div class="sp"></div><a class="lk" href="#" onclick="goContinue();return false">Continue application</a></div>
+<div class="wrap">
+
+  <div class="screen on" id="s-landing">
+    <div class="card hero"><h1>Apply for Admission</h1><p>Start your application online in minutes. Choose your programme, upload your documents and track your admission — all from here.</p>
+      <div class="btnrow"><button class="btn" style="background:#fff;color:#1e3a8a" onclick="show('s-start')">Start New Application</button><button class="btn" style="background:transparent;border:1.5px solid #fff;color:#fff" onclick="goContinue()">Continue / Check Status</button></div></div>
+    <div class="card"><h2>Choose a programme</h2><div class="muted">Browse our faculties and click the department you want to apply to.</div><div id="progs"></div></div>
+  </div>
+
+  <div class="screen" id="s-start">
+    <div class="card"><h2>Start your application</h2><div class="muted">We will give you a temporary application number and passcode to log back in.</div>
+      <div class="err" id="startErr"></div>
+      <div class="row"><div><label>First name</label><input id="f_first"></div><div><label>Last name</label><input id="f_last"></div></div>
+      <div class="row"><div><label>Email</label><input id="f_email" type="email"></div><div><label>Phone</label><input id="f_phone"></div></div>
+      <label>Programme (department)</label><select id="f_dept"></select>
+      <label>Entry level</label><select id="f_level"></select>
+      <div class="btnrow"><button class="btn gho" onclick="show('s-landing')">Back</button><button class="btn" id="startBtn" onclick="startApp()">Create Application</button></div>
+    </div>
+  </div>
+
+  <div class="screen" id="s-pass">
+    <div class="card"><h2>Save your temporary pass</h2><div class="muted">Write these down. You will use them to log back in and check your admission status.</div>
+      <div class="passbox"><div class="k">APPLICATION NUMBER</div><div class="v" id="pass_no"></div><div class="k">PASSCODE</div><div class="v" id="pass_code"></div></div>
+      <div class="ok">A copy is shown here only — keep it safe.</div>
+      <button class="btn full" onclick="openWizard()">Continue to application form</button>
+    </div>
+  </div>
+
+  <div class="screen" id="s-continue">
+    <div class="card"><h2>Continue your application</h2>
+      <div class="err" id="contErr"></div>
+      <label>Application number</label><input id="c_no" placeholder="e.g. WAUU/APP/2026/00001">
+      <label>Passcode</label><input id="c_code">
+      <div class="btnrow"><button class="btn gho" onclick="show('s-landing')">Back</button><button class="btn" id="contBtn" onclick="continueApp()">Continue</button></div>
+    </div>
+  </div>
+
+  <div class="screen" id="s-wizard">
+    <div class="steps" id="stepper"></div>
+    <div class="err" id="wizErr"></div>
+    <div class="card" id="wizBody"></div>
+  </div>
+
+  <div class="screen" id="s-status"><div id="statusBody"></div></div>
+
+</div>
+<script>
+var TOKEN=localStorage.getItem('ubu_app_token')||'';
+var APP=null, PROG={faculties:[],levels:[]}, STEP=1, OLEVEL=[];
+var STEP_NAMES=['Personal','Programme','Academic','Documents','Review'];
+function show(id){var els=document.querySelectorAll('.screen');for(var i=0;i<els.length;i++)els[i].classList.remove('on');document.getElementById(id).classList.add('on');window.scrollTo(0,0);}
+function el(id){return document.getElementById(id);}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});if(TOKEN)opts.headers.Authorization='Bearer '+TOKEN;try{var r=await fetch(path,opts);return await r.json();}catch(e){return{ok:false,error:'Network error.'};}}
+function err(id,msg){var e=el(id);if(!e)return;if(msg){e.textContent=msg;e.style.display='block';}else{e.style.display='none';}}
+
+async function boot(){
+  var b=await api('/api/branding');if(b&&b.name){el('instName').textContent=b.name+' — Admissions';if(b.logo)el('logo').src=b.logo;document.title='Apply — '+b.name;}
+  var pr=await api('/api/apply/programmes');if(pr&&pr.ok){PROG=pr;renderProgs();fillSelects();if(pr.open===false){el('progs').innerHTML='<div class="err" style="display:block">Online admissions are currently closed. Please check back later.</div>';}}
+  if(TOKEN){var me=await api('/api/apply/me');if(me&&me.ok){APP=me.application;if(APP.status&&APP.status!=='draft'){renderStatus();show('s-status');}else{openWizard();}}else{TOKEN='';localStorage.removeItem('ubu_app_token');}}
+}
+function renderProgs(){
+  var w=el('progs');var h='';
+  (PROG.faculties||[]).forEach(function(f,i){
+    h+='<div class="fac" id="fac'+i+'"><div class="h" onclick="document.getElementById(\\'fac'+i+'\\').classList.toggle(\\'open\\')"><span>'+esc(f.name)+'</span><span>+</span></div><div class="deps">';
+    f.departments.forEach(function(d){h+='<button class="dep" onclick="pickDept(\\''+d.id+'\\')">'+esc(d.name)+'</button>';});
+    h+='</div></div>';
+  });
+  w.innerHTML=h||'<div class="muted">No programmes published yet.</div>';
+}
+function fillSelects(){
+  var ds='<option value="">Select a department…</option>';
+  (PROG.faculties||[]).forEach(function(f){f.departments.forEach(function(d){ds+='<option value="'+d.id+'">'+esc(d.name)+' ('+esc(f.name)+')</option>';});});
+  el('f_dept').innerHTML=ds;
+  var ls='<option value="">Select…</option>';(PROG.levels||[]).forEach(function(l){ls+='<option value="'+l.id+'">'+esc(l.name)+'</option>';});
+  el('f_level').innerHTML=ls;if(PROG.levels&&PROG.levels[0])el('f_level').value=PROG.levels[0].id;
+}
+function pickDept(id){show('s-start');el('f_dept').value=id;}
+function goContinue(){show('s-continue');}
+
+async function startApp(){
+  err('startErr','');
+  var body={first_name:el('f_first').value.trim(),last_name:el('f_last').value.trim(),email:el('f_email').value.trim(),phone:el('f_phone').value.trim(),department_id:el('f_dept').value,level_id:el('f_level').value};
+  if(!body.first_name||!body.last_name){err('startErr','Enter your first and last name.');return;}
+  el('startBtn').disabled=true;
+  var r=await api('/api/apply/start',{method:'POST',body:JSON.stringify(body)});
+  el('startBtn').disabled=false;
+  if(!r.ok){err('startErr',r.error||'Could not start.');return;}
+  TOKEN=r.token;localStorage.setItem('ubu_app_token',TOKEN);APP=r.application;
+  el('pass_no').textContent=r.app_no;el('pass_code').textContent=r.passcode;show('s-pass');
+}
+async function continueApp(){
+  err('contErr','');el('contBtn').disabled=true;
+  var r=await api('/api/apply/login',{method:'POST',body:JSON.stringify({app_no:el('c_no').value.trim(),passcode:el('c_code').value.trim()})});
+  el('contBtn').disabled=false;
+  if(!r.ok){err('contErr',r.error||'Invalid details.');return;}
+  TOKEN=r.token;localStorage.setItem('ubu_app_token',TOKEN);APP=r.application;
+  if(APP.status&&APP.status!=='draft'){renderStatus();show('s-status');}else{openWizard();}
+}
+function openWizard(){STEP=APP&&APP.stage?Math.min(5,Math.max(1,APP.stage)):1;try{OLEVEL=APP&&APP.olevel?JSON.parse(APP.olevel):[];}catch(e){OLEVEL=[];}if(!OLEVEL.length)OLEVEL=[{exam:'',year:'',subjects:[{subject:'',grade:''}]}];renderWizard();show('s-wizard');}
+
+function val(k){return APP&&APP[k]!=null?APP[k]:'';}
+function renderStepper(){var h='';for(var i=1;i<=5;i++){h+='<div class="st '+(i===STEP?'on':(i<STEP?'done':''))+'">'+i+'. '+STEP_NAMES[i-1]+'</div>';}el('stepper').innerHTML=h;}
+function renderWizard(){
+  renderStepper();err('wizErr','');var b=el('wizBody');
+  if(STEP===1){
+    b.innerHTML='<h2>Personal details</h2>'+
+      '<div class="row"><div><label>First name</label><input id="w_first" value="'+esc(val('first_name'))+'"></div><div><label>Last name</label><input id="w_last" value="'+esc(val('last_name'))+'"></div></div>'+
+      '<div class="row"><div><label>Middle name</label><input id="w_middle" value="'+esc(val('middle_name'))+'"></div><div><label>Gender</label><select id="w_gender"><option value="">Select…</option><option'+(val('gender')==='male'?' selected':'')+'>male</option><option'+(val('gender')==='female'?' selected':'')+'>female</option></select></div></div>'+
+      '<div class="row"><div><label>Date of birth</label><input id="w_dob" type="date" value="'+esc(val('date_of_birth'))+'"></div><div><label>Phone</label><input id="w_phone" value="'+esc(val('phone'))+'"></div></div>'+
+      '<div class="row"><div><label>Nationality</label><input id="w_nat" value="'+esc(val('nationality'))+'"></div><div><label>State of origin</label><input id="w_state" value="'+esc(val('state_of_origin'))+'"></div></div>'+
+      '<label>Home address</label><textarea id="w_addr" rows="2">'+esc(val('address'))+'</textarea>'+
+      '<h3>Parent / Guardian</h3><div class="row"><div><label>Name</label><input id="w_gname" value="'+esc(val('guardian_name'))+'"></div><div><label>Relationship</label><input id="w_grel" value="'+esc(val('guardian_relation'))+'"></div></div>'+
+      '<div class="row"><div><label>Guardian phone</label><input id="w_gphone" value="'+esc(val('guardian_phone'))+'"></div><div><label>Guardian email</label><input id="w_gemail" value="'+esc(val('guardian_email'))+'"></div></div>'+
+      navBtns();
+  }else if(STEP===2){
+    var ds='<option value="">Select a department…</option>';(PROG.faculties||[]).forEach(function(f){f.departments.forEach(function(d){ds+='<option value="'+d.id+'"'+(val('department_id')===d.id?' selected':'')+'>'+esc(d.name)+' ('+esc(f.name)+')</option>';});});
+    var ls='<option value="">Select…</option>';(PROG.levels||[]).forEach(function(l){ls+='<option value="'+l.id+'"'+(val('level_id')===l.id?' selected':'')+'>'+esc(l.name)+'</option>';});
+    b.innerHTML='<h2>Programme</h2><label>Department / Programme</label><select id="w_dept">'+ds+'</select><label>Entry level</label><select id="w_level">'+ls+'</select><label>Email</label><input id="w_email" type="email" value="'+esc(val('email'))+'">'+navBtns();
+  }else if(STEP===3){
+    b.innerHTML='<h2>Academic background</h2><div class="row"><div><label>JAMB reg. no</label><input id="w_jamb" value="'+esc(val('jamb_no'))+'"></div><div><label>JAMB score</label><input id="w_jscore" type="number" value="'+esc(val('jamb_score'))+'"></div></div>'+
+      '<label>Previous school attended</label><input id="w_school" value="'+esc(val('prev_school'))+'">'+
+      '<h3>O\\'Level result</h3><div class="row"><div><label>Exam (e.g. WAEC)</label><input id="w_oexam" value="'+esc(OLEVEL[0].exam||'')+'"></div><div><label>Year</label><input id="w_oyear" value="'+esc(OLEVEL[0].year||'')+'"></div></div>'+
+      '<div id="olrows"></div><button class="btn gho" type="button" onclick="addOl()">+ Add subject</button>'+navBtns();
+    renderOl();
+  }else if(STEP===4){
+    b.innerHTML='<h2>Documents</h2><div class="muted">Upload clear scans or photos (JPG/PNG/PDF, ~6MB max).</div>'+
+      docUploader('Passport photograph','photo')+docUploader('O\\'Level result','olevel')+docUploader('Birth certificate / age declaration','birth_cert')+docUploader('Other supporting document','other')+
+      '<div class="docs" id="docList"></div>'+navBtns();
+    renderDocs();
+  }else{
+    var d=APP||{};
+    b.innerHTML='<h2>Review &amp; submit</h2><div class="muted">Confirm your details, then submit your application for review.</div>'+
+      kv('Name',esc((d.first_name||'')+' '+(d.last_name||'')))+kv('Email',esc(d.email))+kv('Phone',esc(d.phone))+kv('Programme',esc(d.department_name||'—'))+kv('Level',esc(d.level_name||'—'))+kv('JAMB',esc(d.jamb_no||'—'))+kv('Documents',(d.documents||[]).length+' uploaded')+
+      '<div class="btnrow"><button class="btn gho" onclick="STEP=4;renderWizard()">Back</button><button class="btn" id="subBtn" onclick="submitApp()">Submit Application</button></div>';
+  }
+}
+function navBtns(){return '<div class="btnrow">'+(STEP>1?'<button class="btn gho" onclick="prevStep()">Back</button>':'')+'<button class="btn" onclick="nextStep()">Save &amp; Continue</button></div>';}
+function kv(k,v){return '<div class="kv"><span class="muted">'+k+'</span><b>'+v+'</b></div>';}
+function docUploader(label,kind){return '<label>'+label+'</label><input type="file" accept="image/*,application/pdf" onchange="uploadDoc(\\''+kind+'\\',this)">';}
+function renderOl(){var w=el('olrows');var subs=OLEVEL[0].subjects||[];var h='';subs.forEach(function(s,i){h+='<div class="olrow"><input placeholder="Subject" value="'+esc(s.subject)+'" oninput="OLEVEL[0].subjects['+i+'].subject=this.value"><select onchange="OLEVEL[0].subjects['+i+'].grade=this.value">'+['','A1','B2','B3','C4','C5','C6','D7','E8','F9'].map(function(g){return '<option'+(s.grade===g?' selected':'')+'>'+g+'</option>';}).join('')+'</select><button class="btn gho" type="button" onclick="delOl('+i+')">×</button></div>';});w.innerHTML=h;}
+function addOl(){OLEVEL[0].subjects.push({subject:'',grade:''});renderOl();}
+function delOl(i){OLEVEL[0].subjects.splice(i,1);if(!OLEVEL[0].subjects.length)OLEVEL[0].subjects.push({subject:'',grade:''});renderOl();}
+function renderDocs(){var w=el('docList');if(!w)return;var ds=(APP&&APP.documents)||[];w.innerHTML=ds.map(function(d){return '<div class="doc"><div style="font-size:30px">📄</div><div>'+esc(d.kind)+'</div><button class="del" onclick="delDoc(\\''+d.id+'\\')">×</button></div>';}).join('')||'<div class="muted">No documents yet.</div>';}
+
+function collectStep(){
+  var patch={stage:STEP};
+  if(STEP===1){patch.first_name=el('w_first').value.trim();patch.last_name=el('w_last').value.trim();patch.middle_name=el('w_middle').value.trim();patch.gender=el('w_gender').value;patch.date_of_birth=el('w_dob').value;patch.phone=el('w_phone').value.trim();patch.nationality=el('w_nat').value.trim();patch.state_of_origin=el('w_state').value.trim();patch.address=el('w_addr').value.trim();patch.guardian_name=el('w_gname').value.trim();patch.guardian_relation=el('w_grel').value.trim();patch.guardian_phone=el('w_gphone').value.trim();patch.guardian_email=el('w_gemail').value.trim();}
+  else if(STEP===2){patch.department_id=el('w_dept').value;patch.level_id=el('w_level').value;patch.email=el('w_email').value.trim();}
+  else if(STEP===3){patch.jamb_no=el('w_jamb').value.trim();patch.jamb_score=el('w_jscore').value;patch.prev_school=el('w_school').value.trim();OLEVEL[0].exam=el('w_oexam').value.trim();OLEVEL[0].year=el('w_oyear').value.trim();patch.olevel=JSON.stringify(OLEVEL);}
+  return patch;
+}
+async function saveStep(){var r=await api('/api/apply/save',{method:'POST',body:JSON.stringify(collectStep())});if(r&&r.ok){APP=r.application;return true;}err('wizErr',(r&&r.error)||'Could not save.');return false;}
+async function nextStep(){if(STEP<=3){if(!await saveStep())return;}if(STEP<5){STEP++;renderWizard();}else{submitApp();}}
+async function prevStep(){if(STEP<=3)await saveStep();if(STEP>1){STEP--;renderWizard();}}
+async function uploadDoc(kind,input){
+  var f=input.files&&input.files[0];if(!f)return;err('wizErr','');
+  if(f.size>6*1024*1024){err('wizErr','That file is larger than 6MB.');return;}
+  var rd=new FileReader();rd.onload=async function(){var r=await api('/api/apply/doc',{method:'POST',body:JSON.stringify({kind:kind,filename:f.name,content:rd.result})});if(r&&r.ok){APP=r.application;renderDocs();}else{err('wizErr',(r&&r.error)||'Upload failed.');}};rd.readAsDataURL(f);
+}
+async function delDoc(id){var r=await api('/api/apply/doc/delete',{method:'POST',body:JSON.stringify({id:id})});if(r&&r.ok){APP=r.application;renderDocs();}}
+async function submitApp(){if(STEP===5){/* nothing extra to collect */}var sb=el('subBtn');if(sb)sb.disabled=true;var r=await api('/api/apply/submit',{method:'POST',body:JSON.stringify({})});if(sb)sb.disabled=false;if(!r.ok){err('wizErr',r.error||'Could not submit.');return;}APP=r.application;renderStatus();show('s-status');}
+
+function statusPill(s){var m={submitted:['#dbeafe','#1e40af','Submitted — under review'],under_review:['#fef3c7','#92400e','Under review'],offered:['#ede9fe','#5b21b6','Offer made — pay to accept'],fee_paid:['#dcfce7','#166534','Fee paid'],admitted:['#dcfce7','#166534','Admitted 🎉'],rejected:['#fee2e2','#991b1b','Not successful'],withdrawn:['#f1f5f9','#475569','Withdrawn']};var c=m[s]||['#f1f5f9','#475569',s];return '<span class="pill" style="background:'+c[0]+';color:'+c[1]+'">'+c[2]+'</span>';}
+function tlItem(label,done,now){return '<div class="i '+(done?'done':(now?'now':''))+'"><div class="dot">'+(done?'✓':'')+'</div><div class="ln">'+label+'</div></div>';}
+function renderStatus(){
+  var d=APP||{};var st=d.status;
+  var order=['submitted','under_review','offered','fee_paid','admitted'];var idx=order.indexOf(st);if(st==='accepted')idx=2;
+  var tl='<div class="tl">'+tlItem('Application submitted',idx>=0,idx===0)+tlItem('Under review',idx>=1,idx===1)+tlItem('Offer of admission',idx>=2,idx===2)+tlItem('Admission fee paid',idx>=3||d.admission_fee_paid,idx===3)+tlItem('Admitted',idx>=4,idx===4)+'</div>';
+  var pay='';
+  if((st==='offered'||st==='accepted')&&!d.admission_fee_paid&&Number(d.admission_fee_amount)>0){
+    pay='<div class="card"><h3>Accept your offer — pay the admission fee</h3><div class="kv"><span class="muted">Admission fee</span><b>'+esc(d.admission_fee_currency||'NGN')+' '+Number(d.admission_fee_amount).toLocaleString()+'</b></div><div class="err" id="payErr"></div><div id="payArea"><button class="btn full" id="payBtn" onclick="pay()">Pay admission fee</button></div></div>';
+  }
+  if(d.admission_fee_paid&&st!=='admitted'){pay='<div class="ok">Your admission fee has been received. Your admission is being finalized — watch your email.</div>';}
+  if(st==='admitted'){pay='<div class="card"><h3>Congratulations! 🎓</h3><div class="muted">You have been admitted. Your official admission letter and student portal login have been emailed to you. Sign in to the student portal to continue your registration.</div><a class="btn full" href="/" style="margin-top:10px">Go to student portal</a></div>';}
+  if(st==='rejected'){pay='<div class="card"><div class="muted">'+(d.decision_note?esc(d.decision_note):'We are unable to offer you admission at this time.')+'</div></div>';}
+  el('statusBody').innerHTML='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><h2 style="margin:0">'+esc((d.first_name||'')+' '+(d.last_name||''))+'</h2>'+statusPill(st)+'</div><div class="muted">Application '+esc(d.app_no||'')+' • '+esc(d.department_name||'')+'</div>'+tl+'</div>'+pay+'<div class="btnrow"><button class="btn gho" onclick="logoutApp()">Sign out</button></div>';
+}
+async function pay(){
+  err('payErr','');var pb=el('payBtn');if(pb)pb.disabled=true;
+  var r=await api('/api/apply/pay',{method:'POST',body:JSON.stringify({})});
+  if(pb)pb.disabled=false;
+  if(!r.ok){err('payErr',r.error||'Could not start payment.');return;}
+  if(r.mode==='paystack'&&r.authorization_url){location.href=r.authorization_url;return;}
+  el('payArea').innerHTML='<div class="ok" style="text-align:left">Pay the admission fee by bank transfer:<br><b>'+esc(r.bank)+'</b></div><label>Payment reference / teller number</label><input id="payRef" placeholder="Enter your transfer reference"><button class="btn full" style="margin-top:8px" onclick="declarePay()">I have paid — notify the Bursary</button>';
+}
+async function declarePay(){var ref=(el('payRef')&&el('payRef').value.trim())||'';var r=await api('/api/apply/pay/declare',{method:'POST',body:JSON.stringify({ref:ref})});if(r&&r.ok){APP=r.application;el('payArea').innerHTML='<div class="ok">Thank you. Your payment has been recorded and will be confirmed by the Bursary. You will be admitted once confirmed.</div>';}}
+function logoutApp(){TOKEN='';localStorage.removeItem('ubu_app_token');APP=null;show('s-landing');}
+boot();
+</script></body></html>`;
+
 const MANIFEST_PORTAL = JSON.stringify({ name: 'UniBursar Portal', short_name: 'Portal', start_url: '/', scope: '/', display: 'standalone', orientation: 'portrait', background_color: '#0f1e3d', theme_color: '#1e3a8a', icons: [{ src: '/favicon', sizes: '512x512', type: 'image/png', purpose: 'any' }, { src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'maskable' }] });
 const MANIFEST_SCAN = JSON.stringify({ name: 'UniBursar Clearance Scanner', short_name: 'Scanner', start_url: '/scan', scope: '/', display: 'standalone', orientation: 'portrait', background_color: '#0f1e3d', theme_color: '#0f1e3d', icons: [{ src: '/favicon', sizes: '512x512', type: 'image/png', purpose: 'any' }, { src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'maskable' }] });
 const SW_JS = `const C='ubu-portal-v2';

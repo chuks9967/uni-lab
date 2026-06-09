@@ -172,6 +172,17 @@ if (createPortal) {
         Object.assign(rec.row, patch); const now = new Date().toISOString(); rec.row.updated_at = now; rec.updated_at = now;
         storeVersion = Date.now(); save(); return true;
       },
+      // create a brand-new record (online admission applications + their documents) ON THE SERVER. It
+      // is stored exactly like a synced row so it flows to the registrar's desktop on the next
+      // /sync/pull (and persists via save()). Mirrors the `update` hook above.
+      create: (entity, row) => {
+        if (!row || !row.id) return false;
+        const key = entity + ':' + row.id;
+        const now = row.updated_at || new Date().toISOString();
+        row.updated_at = now;
+        store.records[key] = { entity, id: row.id, row, updated_at: now };
+        storeVersion = Date.now(); save(); return true;
+      },
       institution: () => (store.branding && store.branding.name)
         ? store.branding
         : { name: process.env.INSTITUTION_NAME || 'UniBursar University', short: process.env.INSTITUTION_SHORT || 'UBU', logo: process.env.INSTITUTION_LOGO || '', motto: process.env.INSTITUTION_MOTTO || '' },
