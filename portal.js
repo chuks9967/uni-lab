@@ -112,6 +112,221 @@ module.exports = function createPortal(deps) {
 
   // ---- shared computations ----
   const nameOf = (entity, id) => { const r = id ? one(entity, id) : null; return r ? r.name : null; };
+
+  // ---- live classes (Jitsi) -------------------------------------------------
+  // A class room name is DETERMINISTIC: the lecturer and every enrolled student derive the SAME
+  // hard-to-guess id from the (already-synced) allocation scope, so no writable state is needed.
+  // Knowing the id (only shown to the cohort + the lecturer) is the capability to join.
+  function classRoom(parts) {
+    const raw = [secret || 'unibursar', 'liveclass'].concat((parts || []).map(x => String(x || ''))).join('|');
+    const short = String(inst().short || 'WAUU').replace(/[^A-Za-z0-9]/g, '').toLowerCase() || 'wauu';
+    return short + '-' + crypto.createHash('sha256').update(raw).digest('hex').slice(0, 28);
+  }
+  // next scheduled time for a course, taken from the cohort's published LECTURE timetable (if any)
+  function classWhen(s, code) {
+    if (!code) return '';
+    const tts = all('timetables').filter(t => !t.deleted && t.status === 'published' && t.type === 'lecture' &&
+      (t.scope === 'faculty' ? t.faculty_id === s.faculty_id : (t.department_id === s.department_id && (!t.level_id || t.level_id === s.level_id))));
+    for (const t of tts) {
+      const sl = all('timetable_slots').find(x => x.timetable_id === t.id && !x.deleted && x.kind !== 'holiday' && String(x.course_code || '').toUpperCase() === String(code).toUpperCase());
+      if (sl) return [sl.day_or_date, (sl.start_time || '') + (sl.end_time ? '–' + sl.end_time : '')].filter(Boolean).join(' ');
+    }
+    return '';
+  }
+  function dedupeRooms(list) { const seen = {}; return list.filter(c => seen[c.room] ? false : (seen[c.room] = true)); }
+  /** A student's joinable live classes — one per course in their published course allocations. */
+  function liveClassesForStudent(s) {
+    const sets = all('allocation_sets').filter(a => !a.deleted && a.status === 'published' && a.department_id === s.department_id && a.level_id === s.level_id);
+    const out = [];
+    for (const a of sets) for (const r of all('course_allocations').filter(r => r.set_id === a.id && !r.deleted)) {
+      out.push({ code: r.course_code, title: r.course_title, lecturer: r.lecturer_name || '', moderator: false,
+        room: classRoom([a.department_id, a.level_id, a.session_id, r.course_code]), subject: [r.course_code, r.course_title].filter(Boolean).join(' '),
+        session: nameOf('academic_sessions', a.session_id), semester: nameOf('semesters', a.semester_id), when: classWhen(s, r.course_code) });
+    }
+    return dedupeRooms(out);
+  }
+  /** A lecturer's classes (they host) — courses they are allocated to teach. Same room ids as students. */
+  function liveClassesForLecturer(staff) {
+    const rows = all('course_allocations').filter(r => !r.deleted && (r.lecturer_id === staff.id ||
+      (r.lecturer_name && staff.full_name && String(r.lecturer_name).toLowerCase() === String(staff.full_name).toLowerCase())));
+    const out = [];
+    for (const r of rows) {
+      const a = one('allocation_sets', r.set_id);
+      if (!a || a.deleted || a.status !== 'published') continue;
+      out.push({ code: r.course_code, title: r.course_title, moderator: true,
+        room: classRoom([a.department_id, a.level_id, a.session_id, r.course_code]), subject: [r.course_code, r.course_title].filter(Boolean).join(' '),
+        department: nameOf('departments', a.department_id), level: nameOf('levels', a.level_id),
+        session: nameOf('academic_sessions', a.session_id), semester: nameOf('semesters', a.semester_id) });
+    }
+    return dedupeRooms(out);
+  }
+  /** Standalone page that embeds Jitsi Meet for one class room (capability URL: the room id is a secret). */
+  function classPageHTML(room, name, subject, host) {
+    const r = String(room || '').replace(/[^a-z0-9-]/gi, '').slice(0, 80);
+    const dn = esc(String(name || 'Guest').slice(0, 60));
+    const subj = esc(String(subject || 'Live Class').slice(0, 80));
+    const isHost = !!host;
+    const domain = (inst().jitsi_domain || 'meet.jit.si');
+    // MODERATOR LOCK: the lecturer (host) is the moderator and auto-enables the LOBBY, so students
+    // must be ADMITTED before they can join — the lecturer controls the class. Students get a
+    // restricted toolbar (no moderation / recording / security), join muted, and cannot start
+    // screen-share over the host. (On the public meet.jit.si moderator status is best-effort;
+    // for cryptographic enforcement self-host Jitsi and set institution setting `jitsi_domain`
+    // + issue a JWT with a moderator claim — the page already passes the role through.)
+    const HOST_TOOLBAR = "['microphone','camera','desktop','chat','raisehand','participants-pane','tileview','toggle-camera','select-background','security','recording','mute-everyone','mute-video-everyone','settings','fullscreen','hangup','invite','sharedvideo']";
+    const STUDENT_TOOLBAR = "['microphone','camera','chat','raisehand','tileview','toggle-camera','select-background','settings','fullscreen','hangup']";
+    return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>${subj} — Live Class</title>
+<style>html,body{height:100%;margin:0;background:#0b1220;font-family:'Segoe UI',Arial,sans-serif;color:#fff}
+#bar{height:46px;display:flex;align-items:center;gap:10px;padding:0 14px;background:#0f1e3d}
+#bar b{font-size:14px}#bar .role{font-size:11px;background:${isHost ? '#16a34a' : '#334155'};padding:3px 9px;border-radius:999px;font-weight:700}#bar .sp{flex:1}#bar a{color:#bcd;font-size:13px;text-decoration:none;background:#1e3a8a;padding:7px 12px;border-radius:8px}
+#meet{position:absolute;top:46px;left:0;right:0;bottom:0}
+#wait{position:absolute;top:46px;left:0;right:0;bottom:0;display:none;align-items:center;justify-content:center;text-align:center;padding:24px}
+#err{padding:24px;max-width:520px;margin:40px auto;background:#111c33;border-radius:12px;line-height:1.6}
+</style></head><body>
+<div id="bar"><b>🎥 ${subj}</b> <span class="role">${isHost ? 'Lecturer (Host)' : 'Student'}</span><span class="sp"></span><a href="/">⤺ Back to portal</a></div>
+<div id="meet"></div>
+<div id="wait"><div><div style="font-size:40px">⏳</div><h3>Waiting for the lecturer to admit you…</h3><p style="opacity:.8">The class opens once your lecturer starts it and lets you in.</p></div></div>
+<div id="err" style="display:none"><h3>Could not start the class</h3><p>Check your internet connection and that the app has camera & microphone permission, then reopen the class.</p><p><a href="/" style="color:#9bd">Back to portal</a></p></div>
+<script src="https://${domain}/external_api.js"></script>
+<script>
+(function(){
+  var isHost=${isHost ? 'true' : 'false'};
+  function fail(){var e=document.getElementById('err');if(e)e.style.display='block';var m=document.getElementById('meet');if(m)m.style.display='none';}
+  if(typeof JitsiMeetExternalAPI!=='function'){fail();return;}
+  try{
+    var api=new JitsiMeetExternalAPI(${JSON.stringify(domain)},{
+      roomName:${JSON.stringify(r)},
+      parentNode:document.getElementById('meet'),
+      userInfo:{displayName:${JSON.stringify(dn)}},
+      configOverwrite:{prejoinPageEnabled:true,startWithAudioMuted:${isHost ? 'false' : 'true'},startWithVideoMuted:false,disableDeepLinking:true,subject:${JSON.stringify(subj)},disableReactions:false},
+      interfaceConfigOverwrite:{MOBILE_APP_PROMO:false,SHOW_JITSI_WATERMARK:false,DEFAULT_BACKGROUND:'#0b1220',TOOLBAR_BUTTONS:${isHost ? HOST_TOOLBAR : STUDENT_TOOLBAR}}
+    });
+    api.addEventListener('readyToClose',function(){location.href='/';});
+    if(isHost){
+      // The lecturer hosts: enable the lobby so students must be admitted, and label the room.
+      api.addEventListener('videoConferenceJoined',function(){
+        try{api.executeCommand('subject',${JSON.stringify(subj)});}catch(e){}
+        try{api.executeCommand('toggleLobby',true);}catch(e){}
+      });
+    } else {
+      // A student knocks; show a waiting message until the lecturer admits them.
+      var w=document.getElementById('wait');
+      api.addEventListener('videoConferenceJoined',function(){ if(w)w.style.display='none'; });
+      api.addEventListener('knockingParticipant',function(){});
+      setTimeout(function(){ /* if still not joined, the lobby waiting screen is Jitsi's own */ },1500);
+    }
+  }catch(e){fail();}
+})();
+</script>
+</body></html>`;
+  }
+
+  // ---- student notification feed (derived from synced data — no writable state needed) ----
+  // Surfaces every important update so a student never misses anything: receipts, new fees,
+  // results, documents, timetables, course allocations, clearance and disciplinary updates.
+  function catLabel(key) { const c = all('fee_categories').find(x => x.key === key && !x.deleted); return c ? c.name : (key ? String(key)[0].toUpperCase() + String(key).slice(1).replace(/_/g, ' ') : 'Fee'); }
+  function buildNotifications(s) {
+    const out = [];
+    const add = (type, icon, title, text, date, seg, docUrl) => { if (!date) return; out.push({ id: type + ':' + (docUrl || date), type, icon, title, text: text || '', date, seg: seg || null, doc: docUrl || null }); };
+    for (const p of all('payments').filter(p => p.student_id === s.id && p.status === 'completed'))
+      add('receipt', '🧾', 'Payment receipt issued', `${p.receipt_no ? 'Receipt ' + p.receipt_no + ' · ' : ''}${money(p.amount, p.currency)} for ${catLabel(p.category)}`, p.decided_at || p.created_at, 'receipts', p.receipt_no ? '/doc/receipt/' + p.id : null);
+    for (const c of all('charges').filter(c => c.student_id === s.id))
+      add('fee', '💳', 'New fee on your account', `${catLabel(c.category)} — ${money(c.amount, c.currency)}`, c.created_at, 'fees', null);
+    for (const r of all('results').filter(r => r.student_id === s.id))
+      add('result', '📑', 'Result published', r.title || 'A new statement of result is available', r.created_at, 'results', null);
+    for (const d of all('portal_documents').filter(d => (!d.student_id || d.student_id === s.id) && (!d.faculty_id || d.faculty_id === s.faculty_id) && (!d.department_id || d.department_id === s.department_id) && (!d.level_id || d.level_id === s.level_id)))
+      add('document', '📂', 'New document available', d.title || 'A document was published for you', d.created_at, 'documents', '/doc/portal-document/' + d.id);
+    for (const t of all('timetables').filter(t => !t.deleted && t.status === 'published' && (t.scope === 'faculty' ? t.faculty_id === s.faculty_id : (t.department_id === s.department_id && (!t.level_id || t.level_id === s.level_id)))))
+      add('timetable', '🗓', 'Timetable published', t.title || 'A new timetable is available', t.published_at, 'timetable', '/doc/timetable/' + t.id);
+    for (const a of all('allocation_sets').filter(a => !a.deleted && a.status === 'published' && a.department_id === s.department_id && a.level_id === s.level_id))
+      add('allocation', '👩‍🏫', 'Course allocation published', a.title || 'Lecturers have been assigned to your courses', a.published_at, 'liveclasses', null);
+    for (const v of all('exam_validations').filter(v => v.student_id === s.id))
+      add('clearance', '✅', 'Examination clearance update', (v.status === 'valid' ? 'You have been cleared for exams' : 'Your clearance status changed') + (v.reason ? ' — ' + v.reason : ''), v.created_at, 'clearance', null);
+    for (const m of all('misconducts').filter(m => m.student_id === s.id && !m.deleted))
+      add('discipline', '⚖️', 'Disciplinary record update', m.offense || 'A disciplinary record was updated', m.occurred_at || m.created_at, null, null);
+    out.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    return out.slice(0, 80);
+  }
+
+  // ---- E-library -----------------------------------------------------------
+  // Books the student may see: global, or matching their faculty/department/level.
+  function libraryForStudent(s) {
+    return all('library_books').filter(b => !b.deleted &&
+      (!b.faculty_id || b.faculty_id === s.faculty_id) &&
+      (!b.department_id || b.department_id === s.department_id) &&
+      (!b.level_id || b.level_id === s.level_id))
+      .map(b => ({ id: b.id, title: b.title, author: b.author || '', category: b.category || 'General', description: b.description || '', cover: b.cover || '', mime: b.mime || '', pages: b.pages || 0, filename: b.filename || 'book', readable: /pdf$/i.test(b.mime || '') || /^image\//i.test(b.mime || ''), date: b.created_at }))
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  }
+  function libraryVisibleTo(b, s) {
+    return b && !b.deleted && (!b.faculty_id || b.faculty_id === s.faculty_id) && (!b.department_id || b.department_id === s.department_id) && (!b.level_id || b.level_id === s.level_id);
+  }
+  /** Advanced in-app e-book reader (PDF via pdf.js with lazy page rendering + zoom; images inline). */
+  function libraryReaderHTML(book, token) {
+    const isPdf = /pdf$/i.test(book.mime || '');
+    const isImg = /^image\//i.test(book.mime || '');
+    const fileUrl = '/library/file/' + book.id + '?t=' + encodeURIComponent(token || '');
+    const dl = '/library/download/' + book.id + '?t=' + encodeURIComponent(token || '');
+    const title = esc(book.title || 'Book');
+    const head = `<div id="bar"><b>📖 ${title}</b><span class="au">${esc(book.author || '')}</span><span class="sp"></span>`
+      + (isPdf ? `<button onclick="zo(-1)">−</button><span id="zl">100%</span><button onclick="zo(1)">+</button>` : '')
+      + `<a href="${dl}">⬇ Download</a><a href="/">⤺ Back</a></div>`;
+    if (isImg) {
+      return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
+<style>html,body{margin:0;background:#0b1220;color:#fff;font-family:'Segoe UI',Arial,sans-serif}#bar{height:46px;display:flex;align-items:center;gap:10px;padding:0 14px;background:#0f1e3d}#bar .au{opacity:.7;font-size:12px}#bar .sp{flex:1}#bar a{color:#bcd;text-decoration:none;background:#1e3a8a;padding:7px 12px;border-radius:8px;font-size:13px}img{display:block;max-width:100%;margin:16px auto}</style></head>
+<body>${head}<img src="${fileUrl}"></body></html>`;
+    }
+    if (!isPdf) {
+      return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
+<style>body{margin:0;background:#0f1e3d;color:#fff;font-family:'Segoe UI',Arial,sans-serif;text-align:center;padding:60px 20px}a{color:#9bd}</style></head>
+<body><h2>📘 ${title}</h2><p>This file type can't be read in the browser. Please download it to open in a reader app.</p><p><a href="${dl}">⬇ Download book</a> &nbsp; <a href="/">⤺ Back to portal</a></p></body></html>`;
+    }
+    // PDF reader (pdf.js, lazy per-page canvas rendering)
+    return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>${title}</title>
+<style>html,body{margin:0;background:#1f2733;color:#fff;font-family:'Segoe UI',Arial,sans-serif}
+#bar{position:sticky;top:0;z-index:5;height:46px;display:flex;align-items:center;gap:8px;padding:0 12px;background:#0f1e3d}
+#bar b{font-size:14px}#bar .au{opacity:.7;font-size:12px}#bar .sp{flex:1}
+#bar button{background:#1e3a8a;color:#fff;border:0;width:30px;height:30px;border-radius:7px;font-size:16px;cursor:pointer}
+#bar #zl{font-size:12px;min-width:42px;text-align:center}
+#bar a{color:#bcd;text-decoration:none;background:#1e3a8a;padding:7px 11px;border-radius:8px;font-size:13px}
+#doc{padding:16px 8px 60px;display:flex;flex-direction:column;align-items:center;gap:14px}
+.pg{background:#fff;box-shadow:0 6px 24px rgba(0,0,0,.4);max-width:100%}
+#msg{padding:40px;text-align:center;opacity:.85}
+</style></head><body>
+${head}
+<div id="doc"><div id="msg">Loading book…</div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+(function(){
+  var FILE=${JSON.stringify(fileUrl)};
+  if(!window['pdfjsLib']){document.getElementById('msg').textContent='Could not load the reader. Check your connection and try again, or download the book.';return;}
+  pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  var scale=1.2, pdf=null, doc=document.getElementById('doc'), io;
+  function setZoom(){document.getElementById('zl').textContent=Math.round(scale/1.2*100)+'%';}
+  window.zo=function(d){scale=Math.min(3,Math.max(0.5,scale+ d*0.2));setZoom();render(true);};
+  function makeCanvases(){
+    doc.innerHTML='';
+    io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){draw(e.target);io.unobserve(e.target);}});},{rootMargin:'600px'});
+    for(var i=1;i<=pdf.numPages;i++){var cv=document.createElement('canvas');cv.className='pg';cv.dataset.p=i;doc.appendChild(cv);io.observe(cv);}
+  }
+  function draw(cv){
+    var n=+cv.dataset.p;
+    pdf.getPage(n).then(function(page){
+      var vp=page.getViewport({scale:scale});
+      var ratio=window.devicePixelRatio||1;
+      cv.width=vp.width*ratio;cv.height=vp.height*ratio;cv.style.width=vp.width+'px';cv.style.height=vp.height+'px';
+      var ctx=cv.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);
+      page.render({canvasContext:ctx,viewport:vp});
+    });
+  }
+  function render(re){ if(!pdf)return; if(re){makeCanvases();} }
+  pdfjsLib.getDocument(FILE).promise.then(function(p){pdf=p;setZoom();makeCanvases();}).catch(function(){document.getElementById('msg').textContent='Could not open this book. Try downloading it instead.';});
+})();
+</script>
+</body></html>`;
+  }
+
   function studentCharges(sid) { return all('charges').filter(c => c.student_id === sid); }
   function studentPaymentsCompleted(sid) { return all('payments').filter(p => p.student_id === sid && p.status === 'completed'); }
   function balancesFor(sid) {
@@ -223,6 +438,9 @@ module.exports = function createPortal(deps) {
       scores: scoresFor(s.id),
       timetables: myTimetables,
       allocations: myAllocations,
+      liveClasses: liveClassesForStudent(s),
+      notifications: buildNotifications(s),
+      library: libraryForStudent(s),
       documents: all('portal_documents').filter(d => (!d.student_id || d.student_id === s.id) && (!d.faculty_id || d.faculty_id === s.faculty_id) && (!d.department_id || d.department_id === s.department_id) && (!d.level_id || d.level_id === s.level_id))
         .map(d => ({ id: d.id, title: d.title, category: d.category, office: d.office, by: userName(d.uploaded_by), mime: d.mime, date: d.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       misconduct: all('misconducts').filter(m => m.student_id === s.id && !m.deleted).map(m => ({ offense: m.offense, severity: m.severity, action: m.action, fine: m.penalty_amount || 0, currency: m.currency, status: m.status, date: m.occurred_at || m.created_at, note: m.resolution_note || m.description || '' })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
@@ -245,7 +463,7 @@ module.exports = function createPortal(deps) {
       const run = one('payroll_runs', p.run_id) || {};
       return { id: p.id, period: run.period, status: run.status, run_type: run.run_type, gross: p.gross, allowances: p.allowances, bonus: p.bonus, deductions: p.deductions, loan_deduction: p.loan_deduction, net: p.net, currency: p.currency };
     }).sort((a, b) => String(b.period).localeCompare(String(a.period)));
-    return { profile: staffProfile(s), payslips: slips };
+    return { profile: staffProfile(s), payslips: slips, liveClasses: s.staff_type === 'lecturer' ? liveClassesForLecturer(s) : [] };
   }
 
   // Build a period filter from query params: basis = day|week|month|semester|session|all
@@ -695,6 +913,60 @@ module.exports = function createPortal(deps) {
     return docShell(typeName + ' Clearance', body, 'STUDENT COPY');
   }
 
+  /** Resolve a published timetable + the slots that apply to THIS student (cohort-scoped),
+   *  mirroring the dashboard's myTimetables logic. Returns null if the student is out of scope. */
+  function studentTimetable(t, s) {
+    if (!t || t.deleted || t.status !== 'published') return null;
+    const inScope = t.scope === 'faculty' ? t.faculty_id === s.faculty_id
+      : (t.department_id === s.department_id && (!t.level_id || t.level_id === s.level_id));
+    if (!inScope) return null;
+    let slots = all('timetable_slots').filter(sl => sl.timetable_id === t.id && !sl.deleted);
+    if (t.scope === 'faculty') slots = slots.filter(sl => sl.kind === 'holiday' || (sl.department_id === s.department_id && (!sl.level_id || sl.level_id === s.level_id)));
+    return { t, slots };
+  }
+  const DAY_ORDER = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+  /** Clean, downloadable TABULAR timetable for the student portal. Lectures render as a
+   *  days × time grid (the familiar timetable layout); exams/tests as a chronological table. */
+  function timetableHTML(t, slots) {
+    const ttName = t.type === 'lecture' ? 'Lecture Timetable' : t.type === 'midsemester' ? 'Mid-Semester Test Timetable' : 'Examination Timetable';
+    const meta = [['Department', nameOf('departments', t.department_id)], ['Faculty', nameOf('faculties', t.faculty_id)], ['Level', nameOf('levels', t.level_id)], ['Session', nameOf('academic_sessions', t.session_id)], ['Semester', nameOf('semesters', t.semester_id)]]
+      .filter(x => x[1]).map(x => `<div class="f"><span>${esc(x[0])}</span><b>${esc(x[1])}</b></div>`).join('');
+    const classes = (slots || []).filter(s => s.kind !== 'holiday');
+    const holidays = (slots || []).filter(s => s.kind === 'holiday');
+    const timeLabel = (s) => esc((s.start_time || '') + (s.end_time ? '–' + s.end_time : ''));
+    const courseCell = (s) => `<b>${esc(s.course_code || '')}</b>${s.course_title ? '<br><span style="font-size:10.5px;color:#475569">' + esc(s.course_title) + '</span>' : ''}${s.venue ? '<br><span style="font-size:10px;color:#64748b">📍 ' + esc(s.venue) + '</span>' : ''}${s.lecturer_name ? '<br><span style="font-size:10px;color:#64748b">👤 ' + esc(s.lecturer_name) + '</span>' : ''}`;
+    let bodyTable;
+    if (t.type === 'lecture') {
+      // build a days × time grid
+      const days = []; for (const c of classes) { const d = String(c.day_or_date || '').trim(); if (d && !days.includes(d)) days.push(d); }
+      days.sort((a, b) => (DAY_ORDER.indexOf(a.toLowerCase()) + 100) % 1000 - (DAY_ORDER.indexOf(b.toLowerCase()) + 100) % 1000 || a.localeCompare(b));
+      const times = []; for (const c of classes) { const k = (c.start_time || '') + '|' + (c.end_time || ''); if (!times.find(x => x.k === k)) times.push({ k, start: c.start_time || '', end: c.end_time || '', label: timeLabel(c) }); }
+      times.sort((a, b) => String(a.start).localeCompare(String(b.start)));
+      if (!days.length || !times.length) {
+        bodyTable = `<table><thead><tr><th>Day</th><th>Time</th><th>Course</th><th>Venue</th><th>Lecturer</th></tr></thead><tbody>${classes.map(s => `<tr><td>${esc(s.day_or_date || '—')}</td><td>${timeLabel(s) || '—'}</td><td><b>${esc(s.course_code || '')}</b> ${esc(s.course_title || '')}</td><td>${esc(s.venue || '—')}</td><td>${esc(s.lecturer_name || '—')}</td></tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:#94a3b8">No classes scheduled.</td></tr>'}</tbody></table>`;
+      } else {
+        const head = `<tr><th style="background:#1e3a8a;color:#fff">Time</th>${days.map(d => `<th style="background:#1e3a8a;color:#fff">${esc(d)}</th>`).join('')}</tr>`;
+        const rows = times.map(tm => {
+          const cells = days.map(d => {
+            const hit = classes.find(c => String(c.day_or_date || '').trim() === d && (c.start_time || '') === tm.start && (c.end_time || '') === tm.end);
+            return `<td style="vertical-align:top">${hit ? courseCell(hit) : '<span style="color:#cbd5e1">—</span>'}</td>`;
+          }).join('');
+          return `<tr><td style="font-weight:700;white-space:nowrap;background:#f8fafc">${tm.label || '—'}</td>${cells}</tr>`;
+        }).join('');
+        bodyTable = `<table style="table-layout:fixed">${head}${rows}</table>`;
+      }
+    } else {
+      const sorted = classes.slice().sort((a, b) => String(a.day_or_date || '').localeCompare(String(b.day_or_date || '')) || String(a.start_time || '').localeCompare(String(b.start_time || '')));
+      bodyTable = `<table><thead><tr><th>Date</th><th>Time</th><th>Course</th><th>Venue</th><th>Invigilator</th></tr></thead><tbody>${sorted.map(s => `<tr><td>${esc(s.day_or_date || '—')}</td><td>${timeLabel(s) || '—'}</td><td><b>${esc(s.course_code || '')}</b> ${esc(s.course_title || '')}</td><td>${esc(s.venue || '—')}</td><td>${esc(s.lecturer_name || '—')}</td></tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:#94a3b8">No sittings scheduled.</td></tr>'}</tbody></table>`;
+    }
+    const holHtml = holidays.length ? `<div class="bar">Breaks / Holidays</div><table><tbody>${holidays.map(h => `<tr><td>${esc(h.day_or_date || '—')}</td><td>${esc(h.course_title || h.venue || 'Holiday / Break')}</td></tr>`).join('')}</tbody></table>` : '';
+    const body = `<div class="grid" style="margin-bottom:6px">${meta}</div>
+      <div class="bar">${esc(t.title || ttName)}</div>
+      ${bodyTable}${holHtml}
+      <p style="margin-top:14px;color:#64748b;font-size:11px">Computer-generated ${esc(ttName.toLowerCase())} from ${esc(inst().name)}. Times are shown in the institution's local time.</p>`;
+    return docShell(t.title || ttName, body, null, { fit: true });
+  }
+
   function moneyMapHTML(m) { const e = Object.entries(m || {}); return e.length ? e.map(([c, v]) => money(v, c)).join(' · ') : money(0); }
   function officerReportHTML(data, periodLabel) {
     const ROLE = { finance: 'Bursary / Administration', registrar: data.role === 'student_affairs' ? 'Student Affairs' : 'Registrar', dean: 'Faculty Head', affairs: 'Student Affairs' };
@@ -728,6 +1000,29 @@ module.exports = function createPortal(deps) {
     docBase = buildBase(req); // so any document we render this request can build absolute verify URLs
 
     if (p === '/' && method === 'GET') { H(res, 200, PAGE); return true; }
+    // Live class room (Jitsi). The room id is a secret capability shown only to the cohort + lecturer.
+    if (method === 'GET' && p.startsWith('/class/')) {
+      const room = p.slice('/class/'.length);
+      return H(res, 200, classPageHTML(room, u.searchParams.get('n') || 'Guest', u.searchParams.get('s') || 'Live Class', u.searchParams.get('host') === '1'));
+    }
+    // E-library: read online (in-app pdf.js viewer), stream the file, or download. Student-scoped.
+    if (method === 'GET' && p.startsWith('/library/')) {
+      const t = authOf(req, u); if (!t) return H(res, 401, '<p>Session expired. Please sign in again.</p>');
+      const parts = p.split('/'); const action = parts[2]; const id = parts[3];
+      const s = (t.k === 'student' || t.k === 'parent') ? (one('students', t.id)) : null;
+      const book = id ? one('library_books', id) : null;
+      if (!book || book.deleted) return H(res, 404, '<p>Book not found.</p>');
+      if (s && !libraryVisibleTo(book, s)) return H(res, 403, '<p>This book is not available to you.</p>');
+      if (action === 'read') return H(res, 200, libraryReaderHTML(book, u.searchParams.get('t') || ''));
+      if (action === 'file' || action === 'download') {
+        if (!book.file) return H(res, 404, '<p>This book has no file.</p>');
+        const buf = Buffer.from(book.file, 'base64');
+        const disp = action === 'download' ? 'attachment' : 'inline';
+        res.writeHead(200, { 'Content-Type': book.mime || 'application/octet-stream', 'Content-Disposition': disp + '; filename="' + String(book.filename || 'book').replace(/[\\/:*?"<>|]+/g, '-') + '"', 'Cache-Control': 'private, max-age=3600' });
+        res.end(buf); return true;
+      }
+      return H(res, 404, '<p>Not found.</p>');
+    }
     if (p === '/api/version' && method === 'GET') { J(res, 200, { version: getVersion() }); return true; }
     if (p === '/api/branding' && method === 'GET') { const i = inst(); return J(res, 200, { ok: true, name: i.name, short: i.short, logo: i.logo, motto: i.motto }); }
 
@@ -878,6 +1173,14 @@ module.exports = function createPortal(deps) {
         const buf = Buffer.from(r.file, 'base64');
         res.writeHead(200, { 'Content-Type': r.mime || 'application/octet-stream', 'Content-Disposition': 'attachment; filename="' + (r.filename || 'result') + '"' });
         res.end(buf); return true;
+      }
+      if (type === 'timetable' && studentish) {
+        const s = accountById('student', t.id) || one('students', t.id);
+        if (!s) return H(res, 404, '<p>Student not found.</p>');
+        const tt = one('timetables', id);
+        const scoped = tt && studentTimetable(tt, s);
+        if (!scoped) return H(res, 404, '<p>Timetable not found or not for your cohort.</p>');
+        return H(res, 200, timetableHTML(scoped.t, scoped.slots));
       }
       if (type === 'portal-document' || type === 'document') {
         const d = one('portal_documents', id);
@@ -1055,6 +1358,13 @@ async function renderApp(){
 }
 function tbl(cols,rows,empty){if(!rows||!rows.length)return '<div class="empty">'+(empty||'Nothing to show.')+'</div>';return '<div class="tscroll"><table><thead><tr>'+cols.map(c=>'<th class="'+(c.r?'r':'')+'">'+c.t+'</th>').join('')+'</tr></thead><tbody>'+rows.map(row=>'<tr>'+cols.map(c=>'<td class="'+(c.r?'r':'')+'">'+c.f(row)+'</td>').join('')+'</tr>').join('')+'</tbody></table></div>';}
 function doc(path){window.open(path+(path.includes('?')?'&':'?')+'t='+encodeURIComponent(TOKEN),'_blank');}
+// Open a live class room (Jitsi). Navigate in the SAME webview so the app's camera/mic permission
+// applies; Jitsi's "Back to portal" returns here. name is already URL-encoded.
+function joinClass(room,subjEnc){var n=window.__lcName||encodeURIComponent('Guest');var host=window.__lcHost?'1':'0';location.href='/class/'+room+'?n='+n+'&s='+subjEnc+'&host='+host;}
+// E-library: read in-app (navigate so the pdf.js viewer fills the screen; "Back" returns here) / download
+function readBook(id){location.href='/library/read/'+id+'?t='+encodeURIComponent(TOKEN);}
+function downloadBook(id){window.open('/library/download/'+id+'?t='+encodeURIComponent(TOKEN),'_blank');}
+function goSeg(s){if(window.__goSeg)window.__goSeg(s);}
 
 function studentView(w,d){
   var p=d.profile;
@@ -1064,7 +1374,13 @@ function studentView(w,d){
   var photo=p.photo?'<img src="'+p.photo+'">':'<div class="ph">🎓</div>';
   // --- section tabs ---
   var ttCount=(d.timetables||[]).length+(d.allocations||[]).length;
-  var segs=[['overview','🏠','Overview',0],['fees','💳','Fees & Payments',owingCount],['receipts','🧾','Receipts',0],['timetable','🗓','Timetable',ttCount],['results','📑','Results',0],['clearance','✅','Clearance',0],['documents','📂','Documents',0]];
+  var liveCount=(d.liveClasses||[]).length;
+  var notifs=d.notifications||[];
+  var seenKey='ubu_seen_'+((p.matric_no||p.full_name||'me'));
+  var lastSeen=localStorage.getItem(seenKey)||'';
+  var unread=notifs.filter(function(n){return String(n.date||'')>lastSeen;}).length;
+  window.__seenKey=seenKey; window.__notifMax=(notifs[0]&&notifs[0].date)||'';
+  var segs=[['overview','🏠','Overview',0],['notifications','🔔','Updates',unread],['fees','💳','Fees & Payments',owingCount],['receipts','🧾','Receipts',0],['timetable','🗓','Timetable',ttCount],['liveclasses','🎥','Live Classes',liveCount],['library','📚','Library',0],['results','📑','Results',0],['clearance','✅','Clearance',0],['documents','📂','Documents',0]];
   if(d.misconduct&&d.misconduct.length)segs.push(['discipline','⚖️','Discipline',d.misconduct.length]);
   segs.push(['profile','👤','Profile',0]);
   var navHtml=segs.map(function(s){return '<a data-seg="'+s[0]+'"><span class="ic">'+s[1]+'</span><span class="lbl">'+s[2]+'</span>'+(s[3]?'<span class="pill">'+s[3]+'</span>':'')+'</a>';}).join('');
@@ -1096,6 +1412,17 @@ function studentView(w,d){
     +'<div class="exbar '+clrCls+'">'+clrTxt+'</div>'
     +'<div class="qa"><button class="btn sm" onclick="doc(\\'/doc/statement\\')">📄 Download full statement</button><button class="btn sm ghost" onclick="changePassword()">🔑 Change password</button></div>'
     +'<div class="panel"><h3>Who You Owe — by Office</h3>'+tbl([{t:'Office',f:function(r){return eh(r.office);}},{t:'Charged',r:1,f:function(r){return mapMoney(r.charged);}},{t:'Paid',r:1,f:function(r){return mapMoney(r.paid);}},{t:'Outstanding',r:1,f:function(r){return Object.keys(r.owing).length?'<span class=neg>'+mapMoney(r.owing)+'</span>':'<span class=pos>Cleared</span>';}}],d.byOffice,'No charges on your account.')+'</div>');
+  // NOTIFICATIONS / UPDATES — derived feed of receipts, results, documents, fees, timetables…
+  var notifHtml=notifs.length?notifs.map(function(n){
+    var isNew=String(n.date||'')>lastSeen;
+    var act=n.doc?(' onclick="doc(\\''+n.doc+'\\')"'):(n.seg?(' onclick="goSeg(\\''+n.seg+'\\')"'):'');
+    return '<div class="panel ntf'+(isNew?' new':'')+'"'+act+' style="cursor:'+((n.doc||n.seg)?'pointer':'default')+';display:flex;gap:12px;align-items:flex-start">'
+      +'<div style="font-size:22px;line-height:1">'+eh(n.icon||'🔔')+'</div>'
+      +'<div style="flex:1;min-width:0"><div style="font-weight:800">'+eh(n.title||'')+(isNew?' <span class="pill" style="background:#ef4444">new</span>':'')+'</div>'
+      +'<div class="muted" style="font-size:12.5px;margin-top:2px">'+eh(n.text||'')+'</div>'
+      +'<div class="muted" style="font-size:11px;margin-top:4px">'+fmt(n.date)+'</div></div></div>';
+  }).join(''):'<div class="empty">No updates yet. New receipts, results, documents, fees and timetable releases will appear here so you never miss anything.</div>';
+  html+=seg('notifications','<h2 class="sectitle">🔔 Updates &amp; Notifications</h2>'+notifHtml);
   // FEES
   html+=seg('fees',
     '<h2 class="sectitle">💳 Fees &amp; Payments</h2>'
@@ -1112,8 +1439,9 @@ function studentView(w,d){
     var rows=(t.slots||[]).filter(function(s){return s.kind!=='holiday';});
     var hol=(t.slots||[]).filter(function(s){return s.kind==='holiday';});
     var isLec=t.type==='lecture';
-    ttHtml+='<div class="panel"><h3>'+(isLec?'📘':t.type==='exam'?'📝':'🧪')+' '+eh(t.title||ttTypeName(t.type))+'</h3>'
-      +'<div class="muted" style="font-size:12px;margin-bottom:8px">'+eh([t.semester,t.session].filter(Boolean).join(' · ')||'')+'</div>'
+    ttHtml+='<div class="panel"><div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><h3 style="margin:0">'+(isLec?'📘':t.type==='exam'?'📝':'🧪')+' '+eh(t.title||ttTypeName(t.type))+'</h3>'
+      +'<button class="btn sm" onclick="doc(\\'/doc/timetable/'+t.id+'\\')">⬇️ Download PDF</button></div>'
+      +'<div class="muted" style="font-size:12px;margin:4px 0 8px">'+eh([t.semester,t.session].filter(Boolean).join(' · ')||'')+'</div>'
       +tbl([
         {t:isLec?'Day':'Date',f:function(r){return eh(r.day||'—');}},
         {t:'Time',f:function(r){return eh((r.start||'')+(r.end?('–'+r.end):''));}},
@@ -1138,6 +1466,37 @@ function studentView(w,d){
   html+=seg('timetable',
     '<h2 class="sectitle">🗓 My Timetable &amp; Course Allocation</h2>'
     +(ttHtml||'<div class="empty">No timetables or course allocations published yet. They will appear here (and arrive by email) once your department releases them.</div>'));
+  // LIVE CLASSES — join the lecturer's live video class (Jitsi) for each registered course
+  var lcName=encodeURIComponent(((p.full_name||'Student'))+(p.matric_no?(' ('+p.matric_no+')'):''));
+  window.__lcName=lcName; window.__lcHost=false;
+  var lcHtml=(d.liveClasses||[]).map(function(c){
+    return '<div class="panel"><div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">'
+      +'<div><div style="font-weight:800;font-size:15px">'+eh(c.code||'')+' — '+eh(c.title||'')+'</div>'
+      +'<div class="muted" style="font-size:12px;margin-top:2px">'+(c.lecturer?('👤 '+eh(c.lecturer)+' · '):'')+eh([c.semester,c.session].filter(Boolean).join(' · '))+(c.when?(' · 🕒 '+eh(c.when)):'')+'</div></div>'
+      +'<button class="btn" onclick="joinClass(\\''+c.room+'\\',\\''+encodeURIComponent(c.subject||c.code||'Live Class')+'\\')">🎥 Join Live Class</button>'
+      +'</div></div>';
+  }).join('');
+  html+=seg('liveclasses',
+    '<h2 class="sectitle">🎥 Live Classes</h2>'
+    +'<div class="muted" style="font-size:12.5px;margin-bottom:10px">Join your lecturer\\'s live video class for any of your registered courses. You can use your camera and microphone, see shared screens/documents, and chat. The class opens when your lecturer starts it.</div>'
+    +(lcHtml||'<div class="empty">No live classes available yet. Once your courses are allocated to lecturers, each course will appear here with a <b>Join</b> button.</div>'));
+  // E-LIBRARY — read e-books / study materials online (in-app reader) or download
+  var libHtml=(d.library||[]).length?('<div class="lib-grid">'+(d.library||[]).map(function(b){
+    var cover=b.cover?('<img class="lib-cover" src="'+b.cover+'" alt="">'):('<div class="lib-cover noc">📘</div>');
+    var read=b.readable?('<button class="btn sm" onclick="readBook(\\''+b.id+'\\')">📖 Read</button>'):'';
+    return '<div class="lib-card">'+cover
+      +'<div class="lib-body"><div class="lib-title">'+eh(b.title||'Untitled')+'</div>'
+      +'<div class="muted" style="font-size:11.5px">'+eh(b.author||'Unknown author')+(b.pages?(' · '+b.pages+' pages'):'')+'</div>'
+      +'<div style="margin:5px 0"><span class="badge">'+eh(b.category||'General')+'</span></div>'
+      +(b.description?('<div class="muted" style="font-size:11.5px;margin-bottom:6px">'+eh(String(b.description).slice(0,140))+'</div>'):'')
+      +'<div class="qa" style="margin-top:auto">'+read+'<button class="btn sm ghost" onclick="downloadBook(\\''+b.id+'\\')">⬇ Download</button></div>'
+      +'</div></div>';
+  }).join('')+'</div>'):'<div class="empty">No books in the library yet. E-books and study materials published by the school will appear here to read online or download.</div>';
+  html+=seg('library',
+    '<h2 class="sectitle">📚 E-Library</h2>'
+    +'<div class="muted" style="font-size:12.5px;margin-bottom:10px">Read e-books and study materials online in the built-in reader, or download them to read offline.</div>'
+    +'<style>.lib-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px}.lib-card{display:flex;flex-direction:column;background:#fff;border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:0 3px 12px rgba(15,23,42,.05)}.lib-cover{width:100%;height:150px;object-fit:cover;background:#eef2f8}.lib-cover.noc{display:flex;align-items:center;justify-content:center;font-size:46px;color:#94a3b8}.lib-body{padding:11px 12px;display:flex;flex-direction:column;flex:1}.lib-title{font-weight:800;font-size:14px;line-height:1.25;margin-bottom:2px}</style>'
+    +libHtml);
   // RESULTS — list each level + semester with a downloadable PDF statement of result
   var sc=d.scores||{courses:[],semesters:[],cgpa:0,totalUnits:0};
   var myLevel=(d.profile&&d.profile.level)||'—';
@@ -1191,8 +1550,12 @@ function studentView(w,d){
     Array.prototype.forEach.call(content.querySelectorAll('.seg'),function(el){el.classList.toggle('on',el.getAttribute('data-seg')===s);});
     Array.prototype.forEach.call(navEl.querySelectorAll('a'),function(a){a.classList.toggle('active',a.getAttribute('data-seg')===s);});
     window.__seg=s;
+    // opening Updates marks everything seen → clears the unread pill
+    if(s==='notifications'){ try{ if(window.__notifMax) localStorage.setItem(window.__seenKey, window.__notifMax); }catch(_){}
+      var nb=navEl.querySelector('a[data-seg="notifications"] .pill'); if(nb)nb.remove(); }
     try{window.scrollTo(0,0);}catch(_){}   // show the top of the chosen section
   }
+  window.__goSeg=show;
   Array.prototype.forEach.call(navEl.querySelectorAll('a'),function(a){a.onclick=function(){show(a.getAttribute('data-seg'));};});
   var want=window.__seg||'overview';
   if(!content.querySelector('.seg[data-seg="'+want+'"]'))want='overview';
@@ -1203,6 +1566,17 @@ function staffView(w,d){
   w.appendChild($('<div class="panel"><div class="prof">'+(p.photo?'<img src="'+p.photo+'">':'<div class="ph">👤</div>')+'<div><div class="nm">'+p.full_name+' <span class="badge">'+p.type+'</span></div><div class="meta">'+(p.staff_no||'—')+' · '+(p.position||p.title||'—')+'</div><div class="meta">'+(p.department||p.faculty||'')+' · '+(p.email||'')+'</div></div></div></div>'));
   w.appendChild($('<div class="kpis"><div class="kpi"><div class="l">Base / Default Pay</div><div class="v">'+money(p.base_salary,p.currency)+'</div></div><div class="kpi"><div class="l">Payslips</div><div class="v">'+d.payslips.length+'</div></div><div class="kpi"><div class="l">Bank</div><div class="v" style="font-size:15px">'+(p.bank_name||'—')+'</div></div></div>'));
   w.appendChild($('<div class="panel"><h3>My Payslips</h3>'+tbl([{t:'Period',f:r=>r.period||'—'},{t:'Type',f:r=>cap(r.run_type||'staff')},{t:'Status',f:r=>'<span class="badge">'+cap(r.status||'draft')+'</span>'},{t:'Net Pay',r:1,f:r=>money(r.net,r.currency)},{t:'',r:1,f:r=>'<button class="btn sm" onclick="doc(\\'/doc/payslip/'+r.id+'\\')">Payslip</button>'}],d.payslips,'No payslips yet.')+'</div>'));
+  // LIVE CLASSES — a lecturer HOSTS the live video class for each course they teach
+  if(d.liveClasses&&d.liveClasses.length){
+    window.__lcName=encodeURIComponent((p.full_name||'Lecturer')+' (Lecturer)'); window.__lcHost=true;
+    var rows=d.liveClasses.map(function(c){
+      return '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--line)">'
+        +'<div><div style="font-weight:800">'+eh(c.code||'')+' — '+eh(c.title||'')+'</div>'
+        +'<div class="muted" style="font-size:12px;margin-top:2px">'+eh([c.department,c.level,c.semester,c.session].filter(Boolean).join(' · '))+'</div></div>'
+        +'<button class="btn" onclick="joinClass(\\''+c.room+'\\',\\''+encodeURIComponent(c.subject||c.code||'Live Class')+'\\')">🎥 Start / Host Class</button></div>';
+    }).join('');
+    w.appendChild($('<div class="panel"><h3>🎥 My Live Classes</h3><div class="muted" style="font-size:12.5px;margin-bottom:6px">Start a live video class for any course you teach. Students registered for the course join from their portal. You can share your screen and documents, and chat live.</div>'+rows+'</div>'));
+  }
 }
 function officerControls(w,d){
   var per=d.period||{};var ps=d.periods||{sessions:[],semesters:[]};
