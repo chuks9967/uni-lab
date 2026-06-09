@@ -450,6 +450,61 @@ ${head}
     };
   }
 
+  // ---- student assistant (deterministic intent engine over the student's own data) ----
+  // Answers the common portal questions ("my results", "how much do I owe", "when are my exams",
+  // "am I cleared") from the SAME data the dashboard shows. No AI key needed — works on any portal.
+  function sumByCur(items) { const m = {}; for (const it of items) m[it.currency] = (m[it.currency] || 0) + it.amount; return Object.keys(m).map(c => money(m[c], c)).join(' + ') || money(0); }
+  function studentAssistant(s, message, isParent) {
+    const d = studentData(s);
+    const q = String(message || '').toLowerCase().trim();
+    const who = isParent ? 'your ward' : 'you'; const has = (s2) => isParent ? (s2 + 's') : s2; // verb agreement helper
+    const fname = s.first_name || (d.profile && (d.profile.full_name || '').split(' ')[0]) || 'there';
+    const re = (rx) => rx.test(q);
+
+    if (re(/\b(owe|owing|balance|outstanding|debt|arrears)\b/) || (/how much/.test(q) && /(owe|pay|fee|balance|left)/.test(q))) {
+      const owe = (d.outstanding || []).filter(o => o.outstanding > 0.001);
+      if (!owe.length) return `Good news — ${who} ${isParent ? 'has' : 'have'} no outstanding balance. ✅`;
+      const lines = owe.map(o => '• ' + catLabel(o.category) + ': ' + money(o.outstanding, o.currency) + ' outstanding (of ' + money(o.billed, o.currency) + ' billed)').join('\n');
+      return `Here is what ${who} currently ${has('owe')}:\n${lines}\nTotal: ${sumByCur(owe.map(o => ({ currency: o.currency, amount: o.outstanding })))}\nOpen the Fees tab to pay or download a statement.`;
+    }
+    if (re(/\b(my fees|school fees|tuition|charges|fee breakdown|bill)\b/) || (/what.*fee/.test(q))) {
+      const ch = d.charges || [];
+      if (!ch.length) return `No fees have been billed to ${who} yet.`;
+      const g = {}; for (const c of ch) { const k = c.category + '|' + c.currency; g[k] = (g[k] || 0) + c.amount; }
+      const lines = Object.keys(g).map(k => { const [cat, cur] = k.split('|'); return '• ' + catLabel(cat) + ': ' + money(g[k], cur); }).join('\n');
+      return `Fees billed to ${who}:\n${lines}\nSee the Fees tab for the full statement and to pay.`;
+    }
+    if (re(/\b(result|results|score|scores|gpa|cgpa|grade|grades|my marks?|how did i do)\b/)) {
+      const sc = d.scores || [], rs = d.results || [];
+      if (!sc.length && !rs.length) return `No results have been published for ${who} yet. ${isParent ? 'They' : 'You'} will be notified when they are ready, and can download them from the Results tab.`;
+      const sems = new Set(sc.map(x => (x.session || '') + '|' + (x.semester || ''))).size;
+      let msg = `${isParent ? 'Your ward has' : 'You have'} published results in ${sems || rs.length} semester(s).`;
+      if (rs[0] && rs[0].gpa) msg += ' Most recent GPA: ' + rs[0].gpa + '.';
+      return msg + ' Open the Results tab to view or download each statement.';
+    }
+    if (re(/\b(exam|exams|test|paper|timetable|time table|schedule|class|classes|lecture|lectures)\b/) || /when (is|are|do)/.test(q)) {
+      const examSlots = [];
+      for (const t of (d.timetables || []).filter(t => t.type === 'exam')) for (const sl of (t.slots || [])) if (sl.kind !== 'holiday' && sl.course_code) examSlots.push(sl);
+      examSlots.sort((a, b) => String(a.day).localeCompare(String(b.day)));
+      if (/exam|test|paper/.test(q) && examSlots.length) {
+        const next = examSlots.slice(0, 4).map(sl => '• ' + sl.course_code + (sl.course_title ? (' ' + sl.course_title) : '') + ': ' + fmtDate(sl.day) + (sl.start ? (' at ' + sl.start) : '') + (sl.venue ? (' — ' + sl.venue) : '')).join('\n');
+        return 'Upcoming exams:\n' + next + '\nFull details are in the Timetable tab.';
+      }
+      const lectures = (d.timetables || []).filter(t => t.type === 'lecture');
+      if (lectures.length) return 'Your lecture timetable is published — open the Timetable tab for your weekly classes.' + (examSlots.length ? ' Your exam timetable is there too.' : '');
+      if (examSlots.length) return 'Your exam timetable is published — open the Timetable tab.';
+      return 'No timetable has been published yet. You will be notified when it is out.';
+    }
+    if (re(/\b(clearance|cleared|exam card)\b/)) {
+      const clr = d.examClearance || {};
+      return clr.cleared ? `${isParent ? 'Your ward is' : 'You are'} cleared for exams ✅. Download the certificate from the Clearance tab.` : `${isParent ? 'Your ward is' : 'You are'} not cleared for exams yet${clr.reason ? (': ' + clr.reason) : ''}. Clear any outstanding fees, then check with the bursary.`;
+    }
+    if (re(/\b(document|documents|admission letter|transcript|certificate|library|book|e-?book)\b/)) return 'Your documents (admission letter, transcript, etc.) are in the Documents tab, and e-books are in the Library tab.';
+    if (re(/\b(help|what can you|how do i|navigate|where|menu|guide|assist)\b/)) return `I can help ${who} with:\n• Results & GPA — “show my results”\n• School fees & balance — “how much do I owe?”\n• Exam clearance — “am I cleared?”\n• Timetable & exams — “when are my exams?”\nUse the tabs at the top for Fees, Results, Timetable, Documents and Library.`;
+    if (re(/^(hi|hello|hey|yo|good (morning|afternoon|evening))\b/)) return `Hi ${fname}! I can help you check your results, school fees, balance, clearance and timetable. What would you like to know?`;
+    return 'I can help with your results, school fees, how much you owe, exam clearance and timetable. Try “How much do I owe?”, “Show my results”, or “When are my exams?”.';
+  }
+
   function staffProfile(s) {
     return {
       id: s.id, full_name: s.full_name, staff_no: s.staff_no, type: s.staff_type === 'lecturer' ? 'Lecturer' : 'Staff',
@@ -1124,6 +1179,14 @@ ${head}
       return J(res, 200, { ok: true, data });
     }
 
+    // student/parent assistant — deterministic answers from their own data (no AI key needed)
+    if (p === '/api/assistant' && method === 'POST') {
+      const t = authOf(req, u); if (!t || (t.k !== 'student' && t.k !== 'parent')) return J(res, 401, { ok: false });
+      const row = accountById(t.k, t.id); if (!row) return J(res, 401, { ok: false });
+      const body = await readBody();
+      return J(res, 200, { ok: true, reply: studentAssistant(row, (body && body.message) || '', t.k === 'parent') });
+    }
+
     // documents (open in a tab; token via ?t=)
     if (p.startsWith('/doc/') && method === 'GET') {
       const t = authOf(req, u); if (!t) return H(res, 401, '<p>Session expired. Please sign in again.</p>');
@@ -1352,12 +1415,29 @@ async function renderApp(){
   if(d.kind==='student')studentView(w,d);
   else if(d.kind==='staff')staffView(w,d);
   else officerView(w,d);
+  if(d.kind==='student')mountChat();
   VER=(await api('/api/version')).version||0;
   if(TIMER)clearInterval(TIMER);
   TIMER=setInterval(async()=>{try{const v=(await api('/api/version')).version;if(v!==VER){VER=v;var ae=document.activeElement;if(ae&&/^(SELECT|INPUT|TEXTAREA)$/.test(ae.tagName))return;renderApp();}}catch(_){}},2500);
 }
 function tbl(cols,rows,empty){if(!rows||!rows.length)return '<div class="empty">'+(empty||'Nothing to show.')+'</div>';return '<div class="tscroll"><table><thead><tr>'+cols.map(c=>'<th class="'+(c.r?'r':'')+'">'+c.t+'</th>').join('')+'</tr></thead><tbody>'+rows.map(row=>'<tr>'+cols.map(c=>'<td class="'+(c.r?'r':'')+'">'+c.f(row)+'</td>').join('')+'</tr>').join('')+'</tbody></table></div>';}
 function doc(path){window.open(path+(path.includes('?')?'&':'?')+'t='+encodeURIComponent(TOKEN),'_blank');}
+let CHAT_MOUNTED=false;
+function mountChat(){
+  if(CHAT_MOUNTED)return;CHAT_MOUNTED=true;
+  var fab=document.createElement('button');fab.textContent='💬';fab.title='Ask the assistant';
+  fab.style.cssText='position:fixed;right:18px;bottom:18px;z-index:9000;width:54px;height:54px;border-radius:50%;border:none;cursor:pointer;background:linear-gradient(135deg,#1e3a8a,#4338ca);color:#fff;font-size:24px;box-shadow:0 6px 18px rgba(30,58,138,.4)';
+  var panel=document.createElement('div');
+  panel.style.cssText='position:fixed;right:18px;bottom:82px;z-index:9000;width:340px;max-width:calc(100vw - 28px);height:480px;max-height:calc(100vh - 120px);display:none;flex-direction:column;background:#fff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;box-shadow:0 18px 50px rgba(2,6,23,.28)';
+  panel.innerHTML='<div style="padding:11px 13px;background:linear-gradient(135deg,#1e3a8a,#4338ca);color:#fff;font-weight:800;display:flex;justify-content:space-between;align-items:center"><span>💬 Student Assistant</span><span id="cx" style="cursor:pointer;font-size:20px">×</span></div><div id="clog" style="flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px;background:#f8fafc"></div><div style="display:flex;gap:8px;padding:10px;border-top:1px solid #e2e8f0"><input id="cin" placeholder="Ask about results, fees, exams…" style="flex:1;border:1px solid #cbd5e1;border-radius:10px;padding:9px 11px;font-size:13px"><button id="csend" style="border:none;background:#1e3a8a;color:#fff;border-radius:10px;padding:0 14px;cursor:pointer;font-size:16px">&#10148;</button></div>';
+  document.body.appendChild(fab);document.body.appendChild(panel);
+  var log=panel.querySelector('#clog'),inp=panel.querySelector('#cin');
+  function bub(role,text){var b=document.createElement('div');var me=role==='me';b.style.cssText='align-self:'+(me?'flex-end':'flex-start')+';max-width:85%;padding:8px 11px;border-radius:12px;font-size:13px;line-height:1.4;white-space:pre-wrap;'+(me?'background:#1e3a8a;color:#fff':'background:#fff;color:#0f172a;border:1px solid #e2e8f0');b.textContent=text;log.appendChild(b);log.scrollTop=log.scrollHeight;return b;}
+  function open(){var o=panel.style.display==='none';panel.style.display=o?'flex':'none';if(o){if(!log.childNodes.length)bub('bot','Hi! I can check your results, school fees, balance, exam clearance and timetable. Try “How much do I owe?” or “When are my exams?”.');inp.focus();}}
+  fab.onclick=open;panel.querySelector('#cx').onclick=open;
+  async function send(){var t=inp.value.trim();if(!t)return;inp.value='';bub('me',t);var w=bub('bot','…');try{var r=await api('/api/assistant',{method:'POST',body:JSON.stringify({message:t})});w.textContent=r.reply||'Sorry, I could not answer that.';}catch(e){w.textContent='⚠ Could not reach the assistant.';}}
+  panel.querySelector('#csend').onclick=send;inp.addEventListener('keydown',function(e){if(e.key==='Enter')send();});
+}
 // Open a live class room (Jitsi). Navigate in the SAME webview so the app's camera/mic permission
 // applies; Jitsi's "Back to portal" returns here. name is already URL-encoded.
 function joinClass(room,subjEnc){var n=window.__lcName||encodeURIComponent('Guest');var host=window.__lcHost?'1':'0';location.href='/class/'+room+'?n='+n+'&s='+subjEnc+'&host='+host;}
