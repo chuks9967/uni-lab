@@ -49,7 +49,7 @@ function numWords(num) { num = Math.floor(Number(num) || 0); if (num === 0) retu
 function amountWords(a, c) { const whole = Math.floor(Number(a) || 0); const k = Math.round((Number(a) - whole) * 100); let s = `${numWords(whole)} ${WORD_CCY[c] || c}`; if (k > 0) s += ` and ${numWords(k)}/100`; return s + ' only'; }
 
 module.exports = function createPortal(deps) {
-  const { all, one, getVersion, secret, institution, update, create } = deps;
+  const { all, one, getVersion, secret, institution, update, create, registerDevice } = deps;
   // the public base URL of THIS request (https://host) — used to print absolute,
   // scannable verification URLs in the QR on receipts/payslips. Set per request.
   let docBase = '';
@@ -1302,6 +1302,17 @@ ${head}
       const row = accountById(t.k, t.id); if (!row) return J(res, 401, { ok: false });
       const name = t.k === 'student' ? `${row.first_name || ''} ${row.last_name || ''}`.trim() : row.full_name;
       return J(res, 200, { ok: true, user: { role: t.role, kind: t.k, name } });
+    }
+
+    // Native app registers its Firebase Cloud Messaging token here so the server can push it a
+    // notification when a document is posted (etc.). No-op if the host has no FCM credentials.
+    if (p === '/api/register-device' && method === 'POST') {
+      const t = authOf(req, u); if (!t || (t.k !== 'student' && t.k !== 'parent')) return J(res, 401, { ok: false });
+      const body = await readBody();
+      const tok = body && (body.token || body.fcm || body.fcmToken);
+      if (!tok) return J(res, 400, { ok: false, error: 'No device token.' });
+      if (registerDevice) { try { registerDevice(String(tok), { kind: t.k, id: t.id, platform: String((body && body.platform) || 'android') }); } catch (_) {} }
+      return J(res, 200, { ok: true });
     }
 
     if (p === '/api/officer-report' && method === 'GET') {
