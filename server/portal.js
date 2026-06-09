@@ -144,10 +144,23 @@ module.exports = function createPortal(deps) {
     const sets = all('allocation_sets').filter(a => !a.deleted && a.status === 'published' && a.department_id === s.department_id && a.level_id === s.level_id);
     const out = [];
     for (const a of sets) for (const r of all('course_allocations').filter(r => r.set_id === a.id && !r.deleted)) {
-      out.push({ code: r.course_code, title: r.course_title, lecturer: r.lecturer_name || '', moderator: false,
+      out.push({ code: r.course_code, title: r.course_title, lecturer: r.lecturer_name || '', moderator: false, live: false,
         room: classRoom([a.department_id, a.level_id, a.session_id, r.course_code]), subject: [r.course_code, r.course_title].filter(Boolean).join(' '),
         session: nameOf('academic_sessions', a.session_id), semester: nameOf('semesters', a.semester_id), when: classWhen(s, r.course_code) });
     }
+    // Merge LIVE-NOW sessions a host just started (≤3h): mark matching allocation classes live, and add
+    // any cohort/ad-hoc session whose room isn't an allocation class — so a class a lecturer started
+    // REFLECTS on the student app immediately and is joinable, even without a course allocation.
+    const liveCut = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    const liveSessions = all('live_sessions').filter(v => !v.deleted && v.active && v.department_id === s.department_id && v.level_id === s.level_id && String(v.started_at || '') >= liveCut);
+    const liveRooms = new Set(liveSessions.map(v => v.room));
+    for (const c of out) if (liveRooms.has(c.room)) { c.live = true; c.when = 'Live now'; }
+    for (const v of liveSessions) {
+      if (out.find(c => c.room === v.room)) continue;
+      out.push({ code: v.course_code || '', title: v.course_title || v.subject || 'Live class', lecturer: '', moderator: false, live: true,
+        room: v.room, subject: v.subject || v.course_title || 'Live Class', session: nameOf('academic_sessions', v.session_id), semester: '', when: 'Live now' });
+    }
+    out.sort((a, b) => (b.live ? 1 : 0) - (a.live ? 1 : 0)); // live classes first
     return dedupeRooms(out);
   }
   /** A lecturer's classes (they host) — courses they are allocated to teach. Same room ids as students. */
