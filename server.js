@@ -25,7 +25,7 @@ let createPortal = null;
 try { createPortal = require('./portal'); }
 catch (e) { console.error('[UniBursar] portal.js not loaded (' + e.message + ') — upload server/portal.js to enable the web portal. Sync/email still work.'); }
 
-const BUILD = 'portal-18'; // bump when server changes — visible at /health to confirm the live code
+const BUILD = 'portal-19'; // bump when server changes — visible at /health to confirm the live code
 const PORT = process.env.PORT || 4000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const SYNC_TOKEN = process.env.SYNC_TOKEN || ''; // optional shared secret
@@ -344,11 +344,19 @@ const server = http.createServer(async (req, res) => {
   if (p === '/branding' && req.method === 'POST') {
     if (!tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized.' });
     const body = await readBody(req);
-    store.branding = { name: body.name || '', short: body.short || '', logo: body.logo || '', motto: body.motto || '', session: body.session || '', semester: body.semester || '' };
+    store.branding = {
+      name: body.name || '', short: body.short || '', logo: body.logo || '', motto: body.motto || '',
+      // extra identity fields so a fresh client can recover the FULL branding via GET /branding
+      address: body.address || '', email: body.email || '', phone: body.phone || '', base_currency: body.base_currency || '', portal_url: body.portal_url || '',
+      updated_at: body.updated_at || new Date().toISOString(),
+      session: body.session || '', semester: body.semester || '',
+    };
     storeVersion = Date.now(); save();
     cloudSetMeta('branding', JSON.stringify(store.branding));
     return send(res, 200, { ok: true });
   }
+  // a fresh client pulls the institution name/logo back into its own settings (they aren't synced rows)
+  if (p === '/branding' && req.method === 'GET') return send(res, 200, store.branding || {});
 
   if (p === '/sync/pull' && req.method === 'GET') {
     const since = u.searchParams.get('since') || null; const out = [];
