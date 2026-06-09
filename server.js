@@ -217,7 +217,12 @@ if (createPortal) {
         const rec = store.records[entity + ':' + id];
         if (!rec || !rec.row) return false;
         Object.assign(rec.row, patch); const now = new Date().toISOString(); rec.row.updated_at = now; rec.updated_at = now;
-        storeVersion = Date.now(); save(); return true;
+        storeVersion = Date.now(); save();
+        // Mirror portal-side writes (admission status changes, password resets, …) to Supabase so they
+        // reach the desktop app in cloud-sync mode — the desktop pulls from Supabase, NOT this hub's
+        // /sync/pull, so without this an applicant's update would never propagate. No-op in hub mode.
+        try { cloudUpsert([{ entity, id, row: rec.row, updated_at: now }]); } catch (_) {}
+        return true;
       },
       // create a brand-new record (online admission applications + their documents) ON THE SERVER. It
       // is stored exactly like a synced row so it flows to the registrar's desktop on the next
@@ -228,7 +233,12 @@ if (createPortal) {
         const now = row.updated_at || new Date().toISOString();
         row.updated_at = now;
         store.records[key] = { entity, id: row.id, row, updated_at: now };
-        storeVersion = Date.now(); save(); return true;
+        storeVersion = Date.now(); save();
+        // Mirror brand-new portal rows (online admission applications + their documents, plus the
+        // admissions-desk notifications below) to Supabase so they sync DOWN to the registrar's
+        // desktop in cloud-sync mode. Without this the admissions dashboard stays empty. No-op in hub mode.
+        try { cloudUpsert([{ entity, id: row.id, row, updated_at: now }]); } catch (_) {}
+        return true;
       },
       // native app registers its FCM token here so we can push it when a document is posted
       registerDevice: (token, account) => {
@@ -239,6 +249,16 @@ if (createPortal) {
       institution: () => (store.branding && store.branding.name)
         ? store.branding
         : { name: process.env.INSTITUTION_NAME || 'UniBursar University', short: process.env.INSTITUTION_SHORT || 'UBU', logo: process.env.INSTITUTION_LOGO || '', motto: process.env.INSTITUTION_MOTTO || '' },
+      // Live-class video config (8x8 JaaS / self-hosted Jitsi). Set these env vars on the host to remove
+      // the meet.jit.si Google-login wall: JITSI_MODE=jaas, JAAS_APP_ID, JAAS_KID, JAAS_PRIVATE_KEY
+      // (the RSA private key PEM — newlines may be written as \n). Leave unset for plain meet.jit.si.
+      jitsiConfig: () => ({
+        mode: process.env.JITSI_MODE || '',
+        domain: process.env.JITSI_DOMAIN || '',
+        jaasAppId: process.env.JAAS_APP_ID || '',
+        jaasKid: process.env.JAAS_KID || '',
+        jaasKey: process.env.JAAS_PRIVATE_KEY || '',
+      }),
     });
   } catch (e) { console.error('[UniBursar] portal init failed:', e.message); portal = null; }
 }

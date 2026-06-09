@@ -14,6 +14,8 @@ const crypto = require('crypto');
 // pure-Node QR encoder (no npm deps — keeps the hub zero-dependency). Used to print a
 // SCANNABLE verification QR on portal receipts & payslips.
 let qrcode = null; try { qrcode = require('./qrcode'); } catch (_) { qrcode = null; }
+// 8x8 JaaS / self-host JWT helper (zero-dep) — removes the meet.jit.si Google-login wall for live classes.
+let jitsi = null; try { jitsi = require('./jitsi'); } catch (_) { jitsi = null; }
 function verifyQrSvg(targetUrl) {
   if (!qrcode || !targetUrl) return '';
   // force a fixed display size (viewBox keeps it crisp + scannable at any QR version)
@@ -49,7 +51,10 @@ function numWords(num) { num = Math.floor(Number(num) || 0); if (num === 0) retu
 function amountWords(a, c) { const whole = Math.floor(Number(a) || 0); const k = Math.round((Number(a) - whole) * 100); let s = `${numWords(whole)} ${WORD_CCY[c] || c}`; if (k > 0) s += ` and ${numWords(k)}/100`; return s + ' only'; }
 
 module.exports = function createPortal(deps) {
-  const { all, one, getVersion, secret, institution, update, create, registerDevice } = deps;
+  const { all, one, getVersion, secret, institution, update, create, registerDevice, jitsiConfig } = deps;
+  // Live-class video config (8x8 JaaS app id/key, or a self-hosted Jitsi domain). On the hosted hub
+  // this comes from server env; on the embedded desktop portal it comes from app settings.
+  const jitsiCfg = () => { try { return (typeof jitsiConfig === 'function' ? jitsiConfig() : {}) || {}; } catch (_) { return {}; } };
   // the public base URL of THIS request (https://host) — used to print absolute,
   // scannable verification URLs in the QR on receipts/payslips. Set per request.
   let docBase = '';
@@ -162,11 +167,15 @@ module.exports = function createPortal(deps) {
   }
   /** Standalone page that embeds Jitsi Meet for one class room (capability URL: the room id is a secret). */
   function classPageHTML(room, name, subject, host) {
-    const r = String(room || '').replace(/[^a-z0-9-]/gi, '').slice(0, 80);
     const dn = esc(String(name || 'Guest').slice(0, 60));
     const subj = esc(String(subject || 'Live Class').slice(0, 80));
     const isHost = !!host;
-    const domain = (inst().jitsi_domain || 'meet.jit.si');
+    // JaaS/self-host aware: mint a per-user JWT (moderator for the lecturer) so there is NO Google
+    // login and students join reliably. Falls back to plain meet.jit.si when nothing is configured.
+    const emb = jitsi ? jitsi.classEmbed(jitsiCfg(), { room, displayName: String(name || 'Guest').slice(0, 60), moderator: isHost })
+      : { domain: 'meet.jit.si', roomName: String(room || '').replace(/[^a-zA-Z0-9-]/g, '').slice(0, 80), jwt: '', scriptUrl: 'https://meet.jit.si/external_api.js', mode: 'public' };
+    const domain = emb.domain;
+    const r = emb.roomName;
     // MODERATOR LOCK: the lecturer (host) is the moderator and auto-enables the LOBBY, so students
     // must be ADMITTED before they can join — the lecturer controls the class. Students get a
     // restricted toolbar (no moderation / recording / security), join muted, and cannot start
@@ -188,7 +197,7 @@ module.exports = function createPortal(deps) {
 <div id="meet"></div>
 <div id="wait"><div><div style="font-size:40px">⏳</div><h3>Waiting for the lecturer to admit you…</h3><p style="opacity:.8">The class opens once your lecturer starts it and lets you in.</p></div></div>
 <div id="err" style="display:none"><h3>Could not start the class</h3><p>Check your internet connection and that the app has camera & microphone permission, then reopen the class.</p><p><a href="/" style="color:#9bd">Back to portal</a></p></div>
-<script src="https://${domain}/external_api.js"></script>
+<script src="${emb.scriptUrl}"></script>
 <script>
 (function(){
   var isHost=${isHost ? 'true' : 'false'};
@@ -197,6 +206,7 @@ module.exports = function createPortal(deps) {
   try{
     var api=new JitsiMeetExternalAPI(${JSON.stringify(domain)},{
       roomName:${JSON.stringify(r)},
+      ${emb.jwt ? 'jwt:' + JSON.stringify(emb.jwt) + ',' : ''}
       parentNode:document.getElementById('meet'),
       userInfo:{displayName:${JSON.stringify(dn)}},
       configOverwrite:{prejoinPageEnabled:true,startWithAudioMuted:${isHost ? 'false' : 'true'},startWithVideoMuted:false,disableDeepLinking:true,subject:${JSON.stringify(subj)},disableReactions:false},
@@ -1245,7 +1255,21 @@ ${head}
       const a = applicantFrom(req, u); if (!a) return J(res, 401, { ok: false });
       if (!a.first_name || !a.last_name || !a.email || !a.department_id) return J(res, 200, { ok: false, error: 'Please complete your name, email and chosen programme before submitting.' });
       const now = new Date().toISOString();
+      const firstSubmit = a.status !== 'submitted'; // only alert the desk on the first submission
       if (typeof update === 'function') update('admission_applications', a.id, { status: 'submitted', submitted_at: a.submitted_at || now, stage: 6 });
+      // Notify the admissions desk (registrar + admin). The notification is a normal SYNCED row, so it
+      // shows up in the officer's 🔔 bell on the desktop (and any other signed-in machine) the moment it
+      // syncs — no extra wiring needed. create() mirrors it to the cloud so it reaches cloud-sync desktops.
+      if (firstSubmit && typeof create === 'function') {
+        try {
+          const dept = a.department_id ? nameOf('departments', a.department_id) : '';
+          const who = `${a.first_name || ''} ${a.last_name || ''}`.trim() || 'A new applicant';
+          const body = who + (dept ? ` applied to ${dept}` : ' submitted an admission application') + (a.app_no ? ` (App. No. ${a.app_no})` : '');
+          for (const role of ['registrar', 'admin']) {
+            create('notifications', { id: crypto.randomUUID(), target_user: null, target_role: role, title: 'New admission application 🎓', body, type: 'admission', payload: JSON.stringify({ application_id: a.id, app_no: a.app_no }), is_read: 0, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+          }
+        } catch (_) { /* notification is best-effort — never block the submission */ }
+      }
       return J(res, 200, { ok: true, application: appPublic(one('admission_applications', a.id)) });
     }
 
@@ -1347,6 +1371,22 @@ ${head}
       const row = accountById(t.k, t.id); if (!row) return J(res, 401, { ok: false });
       const body = await readBody();
       return J(res, 200, { ok: true, reply: studentAssistant(row, (body && body.message) || '', t.k === 'parent') });
+    }
+
+    // Native app: mint a per-user live-class JWT (8x8 JaaS / self-host) so the app can join the Jitsi
+    // room in-app with NO Google login. The room id is an unguessable capability the student already
+    // holds (it comes from /api/data → liveClasses), so we mint for whatever room they ask for.
+    // Students join as guests; staff/officers as moderators. An empty jwt => plain meet.jit.si.
+    if (p === '/api/class-jwt' && method === 'GET') {
+      const t = authOf(req, u); if (!t) return J(res, 401, { ok: false });
+      const row = accountById(t.k, t.id); if (!row) return J(res, 401, { ok: false });
+      const room = u.searchParams.get('room') || '';
+      if (!room) return J(res, 200, { ok: false, error: 'No room specified.' });
+      const name = t.k === 'student' ? `${row.first_name || ''} ${row.last_name || ''}`.trim() : (row.full_name || 'Guest');
+      const moderator = (t.k === 'staff' || t.k === 'user');
+      const emb = jitsi ? jitsi.classEmbed(jitsiCfg(), { room, displayName: name, email: row.email || '', moderator, userId: t.id })
+        : { domain: 'meet.jit.si', roomName: String(room).replace(/[^a-zA-Z0-9-]/g, '').slice(0, 80), jwt: '', mode: 'public' };
+      return J(res, 200, { ok: true, domain: emb.domain, roomName: emb.roomName, jwt: emb.jwt, mode: emb.mode });
     }
 
     // documents (open in a tab; token via ?t=)
