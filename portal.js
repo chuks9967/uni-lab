@@ -238,6 +238,25 @@ module.exports = function createPortal(deps) {
       api.addEventListener('videoConferenceJoined',function(){ if(w)w.style.display='none'; });
       api.addEventListener('knockingParticipant',function(){});
       setTimeout(function(){ /* if still not joined, the lobby waiting screen is Jitsi's own */ },1500);
+      // AUTO-LEAVE when the host ends the class. The APK keeps this page open, so without a signal the
+      // Jitsi room kept running after the lecturer ended it. Poll the live-session state and, once the
+      // session that made this class live has ended, dispose Jitsi and return to the portal.
+      var LC_ROOM=${JSON.stringify(String(room || ''))};
+      var lcDone=false;
+      function lcEnded(){
+        if(lcDone)return; lcDone=true;
+        try{api.dispose();}catch(e){}
+        var m=document.getElementById('meet'); if(m)m.style.display='none';
+        if(w){w.style.display='flex';w.innerHTML='<div><div style="font-size:40px">\\uD83D\\uDCF4</div><h3>The class has ended</h3><p style="opacity:.8">Your lecturer ended this live class.</p><p><a href="/" style="color:#9bd">Back to portal</a></p></div>';}
+        setTimeout(function(){location.href='/';},4000);
+      }
+      if(LC_ROOM){
+        var lcPoll=setInterval(function(){
+          fetch('/api/class-live?room='+encodeURIComponent(LC_ROOM)).then(function(r){return r.json();}).then(function(d){
+            if(d&&d.ended){clearInterval(lcPoll);lcEnded();}
+          }).catch(function(){});
+        },12000);
+      }
     }
   }catch(e){fail();}
 })();
@@ -1150,6 +1169,20 @@ ${head}
       return H(res, 404, '<p>Not found.</p>');
     }
     if (p === '/api/version' && method === 'GET') { J(res, 200, { version: getVersion() }); return true; }
+    // Is a live class still running? The (already-open) student class page polls this and auto-leaves the
+    // moment the host ends it — otherwise the class kept running on the APK after the lecturer ended it.
+    // `ended` is true only once a session for this room existed and is no longer active, so a scheduled
+    // class a student opened with no host session is never force-closed. (Room id is a secret capability.)
+    if (p === '/api/class-live' && method === 'GET') {
+      const room = u.searchParams.get('room') || '';
+      const now = Date.now();
+      const liveCut = new Date(now - 3 * 60 * 60 * 1000).toISOString();
+      const recentCut = new Date(now - 12 * 60 * 60 * 1000).toISOString();
+      const rows = all('live_sessions').filter(v => !v.deleted && v.room === room && String(v.started_at || '') >= recentCut);
+      const live = rows.some(v => v.active && String(v.started_at || '') >= liveCut);
+      const ended = !live && rows.length > 0;
+      return J(res, 200, { ok: true, live, ended });
+    }
     if (p === '/api/branding' && method === 'GET') { const i = inst(); return J(res, 200, { ok: true, name: i.name, short: i.short, logo: i.logo, motto: i.motto }); }
 
     // ---- installable app assets + public clearance verification (no login) ----
