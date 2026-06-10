@@ -210,16 +210,20 @@ async function pushNewRecords(recs) {
         if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: 'Result published', body: row.title || 'A new statement of result is available' }, { seg: 'results', id: String(row.id || '') }));
       } else if (rec.entity === 'live_sessions' && row.active && !row.deleted) {
         await pushLiveSession(row); // A class just went live — push every enrolled student so they can tap in.
+      } else if (rec.entity === 'malpractice_flags' && row.student_id && !row.deleted) {
+        const tokens = tokensForStudents([row.student_id]);
+        if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: '⚠️ Exam conduct notice', body: 'A possible malpractice was recorded during your exam — tap to see the evidence and appeal if it was a mistake.' }, { seg: 'surveillance', id: String(row.id || '') }));
       }
     } catch (_) { /* best-effort */ }
   }
 }
 /** Records whose arrival should trigger a push (new, not-deleted documents/results). */
 function collectPushable(entity, prev, row) {
-  if (entity !== 'portal_documents' && entity !== 'results' && entity !== 'live_sessions') return false;
+  if (entity !== 'portal_documents' && entity !== 'results' && entity !== 'live_sessions' && entity !== 'malpractice_flags') return false;
   if (!row || row.deleted) return false;
   if (entity === 'live_sessions' && !row.active) return false; // only a started (active) session pushes
-  return !prev || !prev.row || prev.row.deleted; // genuinely new (or un-deleted) — re-opening the same room won't re-push
+  if (entity === 'malpractice_flags' && !row.student_id) return false; // only an identified student can be pushed/notified
+  return !prev || !prev.row || prev.row.deleted; // genuinely new (or un-deleted)
 }
 let portal = null;
 if (createPortal) {
