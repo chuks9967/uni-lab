@@ -738,6 +738,28 @@ ${head}
     };
   }
 
+  // Public STUDENT identity check (no login) — backs the digital student ID card's QR. Resolves a
+  // student by matric number (preferred) or id and returns ONLY public identity (name/faculty/dept/
+  // level/status/photo) — never any financials — so security/gate staff can confirm enrolment.
+  function verifyStudent(matricOrId) {
+    const key = String(matricOrId || '').trim();
+    if (!key) return { valid: false };
+    let s = all('students').find(x => !x.deleted && String(x.matric_no || '').toLowerCase() === key.toLowerCase());
+    if (!s) s = one('students', key);
+    if (!s || s.deleted) return { valid: false };
+    return {
+      valid: true, kind: 'student',
+      ref: String(s.id).replace(/-/g, '').slice(0, 8).toUpperCase(),
+      student: {
+        name: `${s.first_name || ''} ${s.last_name || ''}`.trim() || 'Unknown',
+        matric: s.matric_no || '—', photo: s.photo || '',
+        faculty: nameOf('faculties', s.faculty_id) || '—', department: nameOf('departments', s.department_id) || '—',
+        level: nameOf('levels', s.level_id) || '—', status: s.status || 'active',
+      },
+      session: nameOf('academic_sessions', s.session_id) || (inst().session || '—'),
+    };
+  }
+
   // Public receipt authenticity check (no login). Resolves a payment by id, short
   // id-ref, OR its printed receipt number, and returns the genuine details so anyone
   // can confirm a receipt presented to them isn't forged or altered.
@@ -1231,6 +1253,11 @@ ${head}
     if (method === 'GET' && p === '/scan') return H(res, 200, SCAN_PAGE);
     if (method === 'GET' && p === '/verify') return H(res, 200, VERIFY_PAGE);
     if (method === 'GET' && p === '/api/verify') {
+      let sid = u.searchParams.get('student') || '';
+      if (sid) { // a student ID-card link/QR
+        const msd = /[?&]student=([^&\\s]+)/.exec(sid); if (msd) sid = decodeURIComponent(msd[1]);
+        return J(res, 200, { ok: true, ...verifyStudent(sid.trim()) });
+      }
       let pid = u.searchParams.get('p') || '';
       if (pid) { // a payslip code/link
         const mp = /[?&]p=([^&\\s]+)/.exec(pid); if (mp) pid = decodeURIComponent(mp[1]);
@@ -1384,6 +1411,64 @@ ${head}
         }
       }
       return H(res, 200, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:Segoe UI,Arial,sans-serif;background:#0b1220;color:#fff;text-align:center;padding:60px 20px"><div style="font-size:54px">${okPaid ? '✅' : '⚠️'}</div><h2>${okPaid ? 'Payment received' : 'Payment not confirmed'}</h2><p style="opacity:.8">${okPaid ? 'Your admission fee has been received. Your admission will be finalized shortly.' : 'We could not confirm your payment. If you were debited, contact the Bursary.'}</p><a href="/apply" style="display:inline-block;margin-top:18px;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Back to application</a></body>`);
+    }
+
+    // ---- Student fee payment (Paystack) — pay an outstanding fee from inside the app/portal ----
+    // init → returns a Paystack authorization_url (when PAYSTACK_SECRET is set) or manual bank details.
+    if (p === '/api/pay/init' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student to pay.' });
+      const s = accountById('student', t.id); if (!s) return J(res, 401, { ok: false });
+      const body = await readBody();
+      const amount = Math.round((Number(body.amount) || 0) * 100) / 100;
+      const currency = String(body.currency || 'NGN').toUpperCase();
+      const category = String(body.category || 'tuition').slice(0, 40);
+      if (!(amount > 0)) return J(res, 200, { ok: false, error: 'Enter a valid amount to pay.' });
+      if (process.env.PAYSTACK_SECRET && s.email) {
+        const reference = 'STU-' + String(s.id).slice(0, 8) + '-' + Date.now();
+        const init = await paystackReq('/transaction/initialize', 'POST', {
+          email: s.email, amount: Math.round(amount * 100), currency, reference,
+          callback_url: `${buildBase(req)}/api/pay/callback`,
+          metadata: { student_id: s.id, category, currency },
+        });
+        if (init && init.status && init.data && init.data.authorization_url)
+          return J(res, 200, { ok: true, mode: 'paystack', authorization_url: init.data.authorization_url, reference: init.data.reference });
+        return J(res, 200, { ok: false, error: 'Could not start the online payment right now. Please try again later.' });
+      }
+      return J(res, 200, { ok: true, mode: 'manual', amount, currency, bank: process.env.FEES_BANK || process.env.ADMISSION_BANK || 'Online card payment is not enabled. Contact the Bursary for the bank account to pay into.' });
+    }
+
+    // callback → Paystack redirects the WebView here after payment. We VERIFY server-side and record a
+    // COMPLETED payment for the student (idempotent on the Paystack reference) so it shows as a receipt
+    // and reduces the balance — reusing the normal ledger (raised_role='accountant' = bursary/online).
+    if (p === '/api/pay/callback' && method === 'GET') {
+      const reference = u.searchParams.get('reference') || u.searchParams.get('trxref') || '';
+      let okPaid = false; let paidText = '';
+      if (process.env.PAYSTACK_SECRET && reference) {
+        const v = await paystackReq('/transaction/verify/' + encodeURIComponent(reference), 'GET', null);
+        if (v && v.status && v.data && v.data.status === 'success') {
+          const md = v.data.metadata || {};
+          const s = md.student_id ? one('students', md.student_id) : null;
+          const dup = all('payments').find(x => !x.deleted && String(x.decision_note || '') === 'paystack:' + reference);
+          if (dup) { okPaid = true; }
+          else if (s && typeof create === 'function') {
+            const now = new Date().toISOString();
+            const amt = (Number(v.data.amount) || 0) / 100;
+            const cur = String(v.data.currency || md.currency || 'NGN').toUpperCase();
+            const ym = now.slice(0, 7).replace('-', '');
+            create('payments', {
+              id: crypto.randomUUID(), receipt_no: 'ONL-' + ym + '-' + crypto.randomBytes(3).toString('hex').toUpperCase(),
+              student_id: s.id, charge_id: null, category: String(md.category || 'tuition'),
+              description: 'Online payment (Paystack)', currency: cur, amount: amt,
+              method: 'online', channel: 'card', status: 'completed',
+              raised_by: null, raised_role: 'accountant', decided_by: null, decided_at: now,
+              decision_note: 'paystack:' + reference, session_id: null, semester_id: null,
+              created_at: now, updated_at: now, deleted: 0, origin_node: 'portal',
+            });
+            okPaid = true; paidText = money(amt, cur);
+          }
+        }
+      }
+      return H(res, 200, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:Segoe UI,Arial,sans-serif;background:#0b1220;color:#fff;text-align:center;padding:60px 20px"><div style="font-size:54px">${okPaid ? '✅' : '⚠️'}</div><h2>${okPaid ? 'Payment received' : 'Payment not confirmed'}</h2><p style="opacity:.8">${okPaid ? ('Your payment' + (paidText ? ' of ' + esc(paidText) : '') + ' has been recorded. Your receipt is now in the app under Fees.') : 'We could not confirm your payment. If you were debited, contact the Bursary with your transaction reference.'}</p><p style="opacity:.6;font-size:13px">You can close this window and return to the app.</p></body>`);
     }
 
     if (p === '/api/reset-password' && method === 'POST') {
@@ -2392,6 +2477,13 @@ function renderResult(el,d){
      '<table>'+row('Type',d.staffType)+row('Department',ps.department)+row('Pay period',d.period)+row('Net pay',d.net)+row('Gross',d.gross)+row('Pay date',d.dateText)+row('Verification ref',d.ref)+'</table>'+
      '<button class="btn" onclick="resetView&&resetView()">Check another</button></div>';
     return;}
+  if(d.kind==='student'){var su=d.student;var act=String(su.status||'').toLowerCase()==='active';
+    el.innerHTML='<div class="rcard '+(act?'valid':'warn')+'">'+
+     '<div class="big">'+(act?'✓ GENUINE STUDENT':'⚠ '+String(su.status||'INACTIVE').toUpperCase())+'</div>'+
+     '<div class="who">'+(su.photo?'<img src="'+su.photo+'" alt="photo">':'<div class="ph">🎓</div>')+'<div><div class="nm">'+esc(su.name)+'</div><div class="mt">'+esc(su.matric)+'</div></div></div>'+
+     '<table>'+row('Faculty',su.faculty)+row('Department',su.department)+row('Level',su.level)+row('Student status',su.status)+(d.session?row('Session',d.session):'')+row('Verification ref',d.ref)+'</table>'+
+     '<button class="btn" onclick="resetView&&resetView()">Check another</button></div>';
+    return;}
   if(d.kind==='result'){var rs=d.student;
     el.innerHTML='<div class="rcard valid">'+
      '<div class="big">✓ GENUINE RESULT</div>'+
@@ -2495,9 +2587,10 @@ ${RESULT_CSS}
 ${RESULT_JS}
 function resetView(){location.href='/scan';}
 var el=document.getElementById('result');
-var q=new URLSearchParams(location.search);var rr=q.get('r');var pp=q.get('p');var c=q.get('c')||q.get('ref');
+var q=new URLSearchParams(location.search);var rr=q.get('r');var pp=q.get('p');var st=q.get('student');var c=q.get('c')||q.get('ref');
 document.getElementById('lk').onclick=function(){doVerify(el,extractCode(document.getElementById('code').value));};
-if(pp){document.getElementById('code').value=pp;doVerify(el,{type:'p',id:pp});}
+if(st){document.getElementById('code').value=st;doVerify(el,{type:'student',id:st});}
+else if(pp){document.getElementById('code').value=pp;doVerify(el,{type:'p',id:pp});}
 else if(rr){document.getElementById('code').value=rr;doVerify(el,{type:'r',id:rr});}
 else if(c){document.getElementById('code').value=c;doVerify(el,extractCode(c));}
 </script></body></html>`;
