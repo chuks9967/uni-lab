@@ -55,6 +55,12 @@ module.exports = function createPortal(deps) {
   // Live-class video config (8x8 JaaS app id/key, or a self-hosted Jitsi domain). On the hosted hub
   // this comes from server env; on the embedded desktop portal it comes from app settings.
   const jitsiCfg = () => { try { return (typeof jitsiConfig === 'function' ? jitsiConfig() : {}) || {}; } catch (_) { return {}; } };
+  // ---- Online-exam proctor frames (transient, in-memory; never synced) ----
+  // examFrames[examId][studentId] = { jpeg(base64), audioLevel, ts, ring:[base64,…] }
+  const examFrames = {};
+  const lastFrameTs = {};                         // per-student rate-limit
+  function winState(now, start, end) { const n = now || Date.now(); const s = start ? Date.parse(start) : null, e = end ? Date.parse(end) : null; if (s && n < s) return 'upcoming'; if (e && n > e) return 'closed'; return 'open'; }
+  function seededShuffle(seed, arr) { const a = (arr || []).slice(); let s = 0; const str = String(seed || ''); for (let i = 0; i < str.length; i++) s = (s * 31 + str.charCodeAt(i)) >>> 0; s = s || 1; const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
   // the public base URL of THIS request (https://host) — used to print absolute,
   // scannable verification URLs in the QR on receipts/payslips. Set per request.
   let docBase = '';
@@ -319,6 +325,10 @@ module.exports = function createPortal(deps) {
       add('clearance', '✅', 'Examination clearance update', (v.status === 'valid' ? 'You have been cleared for exams' : 'Your clearance status changed') + (v.reason ? ' — ' + v.reason : ''), v.created_at, 'clearance', null);
     for (const m of all('misconducts').filter(m => m.student_id === s.id && !m.deleted))
       add('discipline', '⚖️', 'Disciplinary record update', m.offense || 'A disciplinary record was updated', m.occurred_at || m.created_at, null, null);
+    for (const f of all('malpractice_flags').filter(f => f.student_id === s.id && !f.deleted))
+      add('surveillance', '🛡️', 'Exam conduct notice', (MALPRACTICE_LABELS[f.type] || 'A conduct alert was recorded') + ' — tap to see the evidence and appeal if it was a mistake', f.occurred_at || f.created_at, 'surveillance', null);
+    for (const e of all('online_exams').filter(e => examVisibleTo(e, s)))
+      add('exam', '📝', 'Online exam: ' + (e.title || e.course_code || 'Exam'), (e.start_at ? 'Scheduled ' + fmtDate(e.start_at) : 'Open now') + ' — tap to open it in the Exams tab', e.published_at || e.created_at, 'exam', null);
     out.sort((a, b) => String(b.date).localeCompare(String(a.date)));
     return out.slice(0, 80);
   }
@@ -355,6 +365,27 @@ module.exports = function createPortal(deps) {
       }))
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
     return { attendance, flags };
+  }
+
+  // ---- Online exams the student can see/sit (matched to their cohort) ----
+  function examVisibleTo(e, s) {
+    return e && !e.deleted && (e.status === 'published' || e.status === 'live') &&
+      (!e.department_id || e.department_id === s.department_id) &&
+      (!e.level_id || e.level_id === s.level_id) &&
+      (!e.faculty_id || e.faculty_id === s.faculty_id);
+  }
+  function examsForStudent(s) {
+    const now = Date.now();
+    return all('online_exams').filter(e => examVisibleTo(e, s)).map(e => {
+      const at = all('exam_attempts').find(a => !a.deleted && a.exam_id === e.id && a.student_id === s.id);
+      return {
+        id: e.id, title: e.title || e.course_code, course_code: e.course_code, course_title: e.course_title,
+        instructions: e.instructions || '', duration_min: e.duration_min || 60, start_at: e.start_at, end_at: e.end_at,
+        question_count: all('exam_questions').filter(q => !q.deleted && q.exam_id === e.id).length,
+        total_marks: e.total_marks || 0, require_camera: e.require_camera !== 0, window: winState(now, e.start_at, e.end_at),
+        attempt: at ? { id: at.id, status: at.status, score: at.score, max_score: at.max_score, submitted_at: at.submitted_at } : null,
+      };
+    }).sort((a, b) => String(a.start_at || '').localeCompare(String(b.start_at || '')));
   }
   /** Advanced in-app e-book reader (PDF via pdf.js with lazy page rendering + zoom; images inline). */
   function libraryReaderHTML(book, token) {
@@ -536,6 +567,7 @@ ${head}
       notifications: buildNotifications(s),
       library: libraryForStudent(s),
       surveillance: surveillanceForStudent(s),
+      exams: examsForStudent(s),
       documents: all('portal_documents').filter(d => (!d.student_id || d.student_id === s.id) && (!d.faculty_id || d.faculty_id === s.faculty_id) && (!d.department_id || d.department_id === s.department_id) && (!d.level_id || d.level_id === s.level_id))
         .map(d => ({ id: d.id, title: d.title, category: d.category, office: d.office, by: userName(d.uploaded_by), mime: d.mime, date: d.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       misconduct: all('misconducts').filter(m => m.student_id === s.id && !m.deleted).map(m => ({ offense: m.offense, severity: m.severity, action: m.action, fine: m.penalty_amount || 0, currency: m.currency, status: m.status, date: m.occurred_at || m.created_at, note: m.resolution_note || m.description || '' })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
@@ -1544,6 +1576,94 @@ ${head}
           payload: JSON.stringify({ appeal_flag: flag.id }), is_read: 0, created_at: now, updated_at: now, deleted: 0 });
       } catch (_) {}
       return J(res, 200, { ok: true });
+    }
+
+    // ===== Online examinations =====
+    // Student: list the exams available to them (also in /api/data.exams; this is for polling).
+    if (p === '/api/exam/active' && method === 'GET') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
+      const s = one('students', t.id); if (!s) return J(res, 401, { ok: false });
+      return J(res, 200, { ok: true, exams: examsForStudent(s) });
+    }
+    // Student: start (or resume) an attempt → shuffled questions (NO answers) + a server-authoritative end time.
+    if (p === '/api/exam/start' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
+      const body = await readBody(); const s = one('students', t.id);
+      const e = body.exam_id ? one('online_exams', body.exam_id) : null;
+      if (!e || !examVisibleTo(e, s)) return J(res, 404, { ok: false, error: 'Exam not found.' });
+      const win = winState(Date.now(), e.start_at, e.end_at);
+      if (win === 'upcoming') return J(res, 200, { ok: false, error: 'This exam has not started yet.' });
+      if (win === 'closed') return J(res, 200, { ok: false, error: 'This exam has closed.' });
+      if (typeof create !== 'function') return J(res, 200, { ok: false, error: 'Exams are unavailable on this server.' });
+      let at = all('exam_attempts').find(a => !a.deleted && a.exam_id === e.id && a.student_id === t.id);
+      const now = new Date().toISOString();
+      if (at && (at.status === 'submitted' || at.status === 'auto_submitted' || at.status === 'graded')) return J(res, 200, { ok: false, error: 'You have already submitted this exam.' });
+      if (!at) { const id = 'att-' + Math.random().toString(16).slice(2) + Date.now().toString(16); at = { id, exam_id: e.id, student_id: t.id, status: 'in_progress', started_at: now, answers: '{}', live_requested: 0, created_at: now, updated_at: now, deleted: 0 }; create('exam_attempts', at); }
+      const startedMs = Date.parse(at.started_at || now);
+      const durEnd = startedMs + (Number(e.duration_min) || 60) * 60000;
+      const winEnd = e.end_at ? Date.parse(e.end_at) : durEnd;
+      const endsAt = new Date(Math.min(durEnd, winEnd)).toISOString();
+      let qs = all('exam_questions').filter(q => !q.deleted && q.exam_id === e.id)
+        .map(q => ({ id: q.id, seq: q.seq, type: q.type, text: q.text, options: (function () { try { return JSON.parse(q.options || '[]'); } catch (_) { return []; } })(), marks: q.marks, image: q.image || null }));
+      if (e.shuffle !== 0) qs = seededShuffle(e.id + ':' + t.id, qs);
+      let answers = {}; try { answers = JSON.parse(at.answers || '{}'); } catch (_) {}
+      return J(res, 200, { ok: true, attempt_id: at.id, endsAt, duration_min: e.duration_min || 60, room: 'exam-' + e.id, exam: { id: e.id, title: e.title || e.course_code, instructions: e.instructions || '', require_camera: e.require_camera !== 0 }, answers, questions: qs });
+    }
+    // Student: autosave answers (during the exam).
+    if (p === '/api/exam/answer' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
+      const body = await readBody(); const at = body.attempt_id ? one('exam_attempts', body.attempt_id) : null;
+      if (!at || at.student_id !== t.id) return J(res, 404, { ok: false });
+      if (at.status !== 'in_progress') return J(res, 200, { ok: false, error: 'This attempt is closed.' });
+      if (typeof update === 'function') { let ans = {}; try { ans = JSON.parse(at.answers || '{}'); } catch (_) {} Object.assign(ans, body.answers || {}); update('exam_attempts', at.id, { answers: JSON.stringify(ans) }); }
+      return J(res, 200, { ok: true });
+    }
+    // Student: submit (final / auto). Grading is done on the desktop, not here.
+    if (p === '/api/exam/submit' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
+      const body = await readBody(); const at = body.attempt_id ? one('exam_attempts', body.attempt_id) : null;
+      if (!at || at.student_id !== t.id) return J(res, 404, { ok: false });
+      if (typeof update === 'function') { let ans = {}; try { ans = JSON.parse(at.answers || '{}'); } catch (_) {} Object.assign(ans, body.answers || {}); update('exam_attempts', at.id, { answers: JSON.stringify(ans), status: body.auto ? 'auto_submitted' : 'submitted', submitted_at: new Date().toISOString() }); }
+      return J(res, 200, { ok: true });
+    }
+    // Student: upload a proctor frame (camera JPEG + mic level). Returns whether the officer wants live A/V.
+    if (p === '/api/exam/frame' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
+      const body = await readBody(); const examId = String(body.exam_id || ''); if (!examId) return J(res, 400, { ok: false });
+      const now = Date.now(); const key = examId + ':' + t.id;
+      if (lastFrameTs[key] && now - lastFrameTs[key] < 1000) return J(res, 200, { ok: true, throttled: true });
+      lastFrameTs[key] = now;
+      const jpeg = String(body.image_base64 || '').replace(/^data:[^;]+;base64,/, '');
+      if (jpeg) { examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][t.id] || { ring: [] }; cur.jpeg = jpeg; cur.audioLevel = Number(body.audioLevel) || 0; cur.ts = now; cur.ring = (cur.ring || []).concat([jpeg]).slice(-20); examFrames[examId][t.id] = cur; }
+      const at = all('exam_attempts').find(a => !a.deleted && a.exam_id === examId && a.student_id === t.id);
+      return J(res, 200, { ok: true, live_requested: !!(at && at.live_requested), room: 'exam-' + examId });
+    }
+    // Officer: monitor roster — who is online, audio level, last-seen, status.
+    if (p === '/api/exam/monitor' && method === 'GET') {
+      const t = authOf(req, u); if (!t || t.k !== 'user') return J(res, 401, { ok: false });
+      const examId = u.searchParams.get('exam_id') || ''; const now = Date.now(); const frames = examFrames[examId] || {};
+      const rows = all('exam_attempts').filter(a => !a.deleted && a.exam_id === examId).map(a => {
+        const st = one('students', a.student_id) || {}; const f = frames[a.student_id];
+        return { student_id: a.student_id, name: `${st.first_name || ''} ${st.last_name || ''}`.trim(), matric: st.matric_no || '', status: a.status, score: a.score, live_requested: !!a.live_requested, hasFrame: !!(f && f.jpeg), audioLevel: f ? f.audioLevel : 0, lastSeen: f ? f.ts : 0, online: !!(f && now - f.ts < 8000) };
+      });
+      return J(res, 200, { ok: true, room: 'exam-' + examId, students: rows });
+    }
+    // Officer: latest frame JPEG for a student tile in the live grid.
+    if (method === 'GET' && p === '/api/exam/frame') {
+      const t = authOf(req, u); if (!t || t.k !== 'user') return H(res, 401, '<p>Unauthorized.</p>');
+      const examId = u.searchParams.get('exam_id') || ''; const sid = u.searchParams.get('student_id') || '';
+      const f = (examFrames[examId] || {})[sid];
+      if (!f || !f.jpeg) return H(res, 404, '<p>No frame.</p>');
+      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' }); res.end(Buffer.from(f.jpeg, 'base64')); return true;
+    }
+    // Officer: request (or stop) a student's real-time camera+mic (they then join the exam Jitsi room).
+    if (p === '/api/exam/request-live' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'user') return J(res, 401, { ok: false });
+      const body = await readBody();
+      const at = body.attempt_id ? one('exam_attempts', body.attempt_id) : all('exam_attempts').find(a => !a.deleted && a.exam_id === body.exam_id && a.student_id === body.student_id);
+      if (!at) return J(res, 404, { ok: false });
+      if (typeof update === 'function') update('exam_attempts', at.id, { live_requested: body.clear ? 0 : 1 });
+      return J(res, 200, { ok: true, room: 'exam-' + at.exam_id });
     }
 
     if (p === '/api/me' && method === 'GET') {

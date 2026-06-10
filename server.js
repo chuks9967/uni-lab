@@ -213,16 +213,24 @@ async function pushNewRecords(recs) {
       } else if (rec.entity === 'malpractice_flags' && row.student_id && !row.deleted) {
         const tokens = tokensForStudents([row.student_id]);
         if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: '⚠️ Exam conduct notice', body: 'A possible malpractice was recorded during your exam — tap to see the evidence and appeal if it was a mistake.' }, { seg: 'surveillance', id: String(row.id || '') }));
+      } else if (rec.entity === 'online_exams' && (row.status === 'published' || row.status === 'live') && !row.deleted) {
+        // notify the cohort that an exam is scheduled / live
+        const studs = allEntity('students').filter(s => s.status !== 'alumni'
+          && (!row.faculty_id || row.faculty_id === s.faculty_id) && (!row.department_id || row.department_id === s.department_id) && (!row.level_id || row.level_id === s.level_id))
+          .map(s => s.id);
+        const tokens = tokensForStudents(studs);
+        if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: '📝 ' + (row.title || row.course_code || 'Online exam'), body: 'Your online exam is ' + (row.status === 'live' ? 'live now' : 'scheduled') + ' — open the Exams tab to begin when it starts.' }, { seg: 'exam', id: String(row.id || '') }));
       }
     } catch (_) { /* best-effort */ }
   }
 }
 /** Records whose arrival should trigger a push (new, not-deleted documents/results). */
 function collectPushable(entity, prev, row) {
-  if (entity !== 'portal_documents' && entity !== 'results' && entity !== 'live_sessions' && entity !== 'malpractice_flags') return false;
+  if (entity !== 'portal_documents' && entity !== 'results' && entity !== 'live_sessions' && entity !== 'malpractice_flags' && entity !== 'online_exams') return false;
   if (!row || row.deleted) return false;
   if (entity === 'live_sessions' && !row.active) return false; // only a started (active) session pushes
   if (entity === 'malpractice_flags' && !row.student_id) return false; // only an identified student can be pushed/notified
+  if (entity === 'online_exams') { if (row.status !== 'published' && row.status !== 'live') return false; return !prev || !prev.row || (prev.row.status !== 'published' && prev.row.status !== 'live'); } // push when it first becomes published/live
   return !prev || !prev.row || prev.row.deleted; // genuinely new (or un-deleted)
 }
 let portal = null;
