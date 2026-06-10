@@ -336,6 +336,26 @@ module.exports = function createPortal(deps) {
   function libraryVisibleTo(b, s) {
     return b && !b.deleted && (!b.faculty_id || b.faculty_id === s.faculty_id) && (!b.department_id || b.department_id === s.department_id) && (!b.level_id || b.level_id === s.level_id);
   }
+
+  // ---- Exam Surveillance: the student's own attendance + any malpractice flag + evidence ----
+  const MALPRACTICE_LABELS = { multiple_faces: 'Another person in your frame', absence: 'You left your seat', left_seat: 'You left your seat', looking_away: 'Looking away from your paper', talking: 'Talking during the exam', phone: 'Phone use', earbuds: 'Earbuds / earphones detected', neck_movement: 'Head/neck turning to a neighbour', notes: 'Unauthorised notes / material', unknown_face: 'Unrecognised face', impersonation: 'Possible impersonation', manual: 'Flagged by an exam officer' };
+  function examTitleOf(examId) { const e = examId ? one('surveillance_sessions', examId) : null; return e ? (e.title || e.course_code || 'Exam') : 'Exam'; }
+  function surveillanceForStudent(s) {
+    const attendance = all('surveillance_attendance').filter(a => !a.deleted && a.student_id === s.id)
+      .map(a => ({ exam: examTitleOf(a.exam_id), status: a.status, method: a.method, date: a.last_seen_at || a.created_at }))
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    const appealsByFlag = {};
+    for (const ap of all('malpractice_appeals').filter(a => !a.deleted && a.student_id === s.id)) appealsByFlag[ap.flag_id] = { status: ap.status, filed_at: ap.filed_at };
+    const flags = all('malpractice_flags').filter(f => !f.deleted && f.student_id === s.id)
+      .map(f => ({
+        id: f.id, exam: examTitleOf(f.exam_id), type: f.type, label: MALPRACTICE_LABELS[f.type] || f.type,
+        severity: f.severity, detail: f.detail || '', status: f.status, date: f.occurred_at || f.created_at,
+        evidence: all('malpractice_evidence').filter(e => !e.deleted && e.flag_id === f.id).map(e => ({ id: e.id, kind: e.kind, mime: e.mime, filename: e.filename, bytes: e.bytes })),
+        appeal: appealsByFlag[f.id] || null,
+      }))
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    return { attendance, flags };
+  }
   /** Advanced in-app e-book reader (PDF via pdf.js with lazy page rendering + zoom; images inline). */
   function libraryReaderHTML(book, token) {
     const isPdf = /pdf$/i.test(book.mime || '');
@@ -515,6 +535,7 @@ ${head}
       liveClasses: liveClassesForStudent(s),
       notifications: buildNotifications(s),
       library: libraryForStudent(s),
+      surveillance: surveillanceForStudent(s),
       documents: all('portal_documents').filter(d => (!d.student_id || d.student_id === s.id) && (!d.faculty_id || d.faculty_id === s.faculty_id) && (!d.department_id || d.department_id === s.department_id) && (!d.level_id || d.level_id === s.level_id))
         .map(d => ({ id: d.id, title: d.title, category: d.category, office: d.office, by: userName(d.uploaded_by), mime: d.mime, date: d.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       misconduct: all('misconducts').filter(m => m.student_id === s.id && !m.deleted).map(m => ({ offense: m.offense, severity: m.severity, action: m.action, fine: m.penalty_amount || 0, currency: m.currency, status: m.status, date: m.occurred_at || m.created_at, note: m.resolution_note || m.description || '' })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
@@ -1218,6 +1239,20 @@ ${head}
       }
       return H(res, 404, '<p>Not found.</p>');
     }
+    // Exam-conduct evidence: the flagged student downloads the video/audio/image clip that was
+    // recorded — full transparency, so they can see exactly what was captured and appeal if wrong.
+    if (method === 'GET' && p.startsWith('/surveillance/evidence/')) {
+      const t = authOf(req, u); if (!t) return H(res, 401, '<p>Session expired. Please sign in again.</p>');
+      const id = p.split('/')[3];
+      const ev = id ? one('malpractice_evidence', id) : null;
+      if (!ev || ev.deleted) return H(res, 404, '<p>Evidence not found.</p>');
+      // a student may only fetch evidence attached to their OWN flag
+      if ((t.k === 'student' || t.k === 'parent') && ev.student_id !== t.id) return H(res, 403, '<p>This evidence is not available to you.</p>');
+      if (!ev.data) return H(res, 404, '<p>This evidence has no file.</p>');
+      const dl = u.searchParams.get('dl') === '1';
+      res.writeHead(200, { 'Content-Type': ev.mime || 'application/octet-stream', 'Content-Disposition': (dl ? 'attachment' : 'inline') + '; filename="' + String(ev.filename || 'evidence').replace(/[\\/:*?"<>|]+/g, '-') + '"', 'Cache-Control': 'private, max-age=3600' });
+      res.end(Buffer.from(ev.data, 'base64')); return true;
+    }
     if (p === '/api/version' && method === 'GET') { J(res, 200, { version: getVersion() }); return true; }
     // Is a live class still running? The (already-open) student class page polls this and auto-leaves the
     // moment the host ends it — otherwise the class kept running on the APK after the lecturer ended it.
@@ -1482,6 +1517,33 @@ ${head}
       const entity = (t.k === 'student' || t.k === 'parent') ? 'students' : (t.k === 'user' ? 'users' : 'staff');
       const done = update(entity, t.id, { [field]: hashPass(body.newPassword) });
       return J(res, 200, { ok: !!done, error: done ? null : 'Could not save the new password.' });
+    }
+
+    // A student appeals a malpractice flag ("the AI got the wrong person / it wasn't me"). Creates an
+    // appeal row + marks the flag 'appealed' + notifies the exam officers — all of which sync to the
+    // desktop so the officer reviews it. Ensures a wrongly-flagged student is never penalised silently.
+    if (p === '/api/surveillance/appeal' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
+      const body = await readBody();
+      const flag = body.flag_id ? one('malpractice_flags', body.flag_id) : null;
+      if (!flag || flag.deleted || flag.student_id !== t.id) return J(res, 404, { ok: false, error: 'Flag not found.' });
+      if (typeof create !== 'function') return J(res, 200, { ok: false, error: 'Appeals are unavailable on this server.' });
+      const existing = all('malpractice_appeals').find(a => !a.deleted && a.flag_id === flag.id && a.student_id === t.id && a.status === 'pending');
+      if (existing) return J(res, 200, { ok: true, already: true });
+      const now = new Date().toISOString();
+      const id = 'mpa-' + Math.random().toString(16).slice(2) + Date.now().toString(16);
+      create('malpractice_appeals', { id, flag_id: flag.id, exam_id: flag.exam_id, student_id: t.id,
+        reason: String(body.reason || 'misidentification').slice(0, 40), message: String(body.message || '').slice(0, 1500),
+        status: 'pending', filed_at: now, created_at: now, updated_at: now, deleted: 0 });
+      if (typeof update === 'function') update('malpractice_flags', flag.id, { status: 'appealed' });
+      // notify the exam officers (shows on the desktop bell + sync)
+      try {
+        const sn = one('students', t.id); const nm = sn ? `${sn.first_name || ''} ${sn.last_name || ''}`.trim() : 'A student';
+        create('notifications', { id: 'ntf-' + Math.random().toString(16).slice(2) + Date.now().toString(16), target_user: null, target_role: 'registrar',
+          title: '📨 Exam-conduct appeal filed', body: nm + ' is appealing a malpractice flag (' + examTitleOf(flag.exam_id) + ')', type: 'system',
+          payload: JSON.stringify({ appeal_flag: flag.id }), is_read: 0, created_at: now, updated_at: now, deleted: 0 });
+      } catch (_) {}
+      return J(res, 200, { ok: true });
     }
 
     if (p === '/api/me' && method === 'GET') {
@@ -1896,6 +1958,13 @@ function joinClass(room,subjEnc){var n=window.__lcName||encodeURIComponent('Gues
 function readBook(id){location.href='/library/read/'+id+'?t='+encodeURIComponent(TOKEN);}
 function downloadBook(id){window.open('/library/download/'+id+'?t='+encodeURIComponent(TOKEN),'_blank');}
 function goSeg(s){if(window.__goSeg)window.__goSeg(s);}
+async function appealFlag(id){
+  var msg=prompt('Tell the exam officer why you believe this flag is a mistake (e.g. "the camera identified the wrong person" or "I was not talking"):','');
+  if(msg===null)return;
+  var r=await api('/api/surveillance/appeal',{method:'POST',body:JSON.stringify({flag_id:id,reason:'misidentification',message:String(msg||'')})});
+  if(r&&r.ok){alert(r.already?'You already have a pending appeal for this flag.':'Appeal submitted. An exam officer will review it and you will be notified of the outcome.');if(window.renderApp)renderApp();}
+  else alert((r&&r.error)||'Could not submit the appeal. Please try again.');
+}
 
 function studentView(w,d){
   var p=d.profile;
@@ -1906,6 +1975,8 @@ function studentView(w,d){
   // --- section tabs ---
   var ttCount=(d.timetables||[]).length+(d.allocations||[]).length;
   var liveCount=(d.liveClasses||[]).length;
+  var sv=d.surveillance||{flags:[],attendance:[]};
+  var openFlags=(sv.flags||[]).filter(function(f){return f.status==='open'||f.status==='appealed';}).length;
   var notifs=d.notifications||[];
   var seenKey='ubu_seen_'+((p.matric_no||p.full_name||'me'));
   var lastSeen=localStorage.getItem(seenKey)||'';
@@ -1913,6 +1984,7 @@ function studentView(w,d){
   window.__seenKey=seenKey; window.__notifMax=(notifs[0]&&notifs[0].date)||'';
   var segs=[['overview','🏠','Overview',0],['notifications','🔔','Updates',unread],['fees','💳','Fees & Payments',owingCount],['receipts','🧾','Receipts',0],['timetable','🗓','Timetable',ttCount],['liveclasses','🎥','Live Classes',liveCount],['library','📚','Library',0],['results','📑','Results',0],['clearance','✅','Clearance',0],['documents','📂','Documents',0]];
   if(d.misconduct&&d.misconduct.length)segs.push(['discipline','⚖️','Discipline',d.misconduct.length]);
+  if((sv.flags&&sv.flags.length)||(sv.attendance&&sv.attendance.length))segs.push(['surveillance','🛡','Exam Conduct',openFlags]);
   segs.push(['profile','👤','Profile',0]);
   var navHtml=segs.map(function(s){return '<a data-seg="'+s[0]+'"><span class="ic">'+s[1]+'</span><span class="lbl">'+s[2]+'</span>'+(s[3]?'<span class="pill">'+s[3]+'</span>':'')+'</a>';}).join('');
   // --- profile + photo pinned at the TOP (full width) ---
@@ -2028,6 +2100,27 @@ function studentView(w,d){
     +'<div class="muted" style="font-size:12.5px;margin-bottom:10px">Read e-books and study materials online in the built-in reader, or download them to read offline.</div>'
     +'<style>.lib-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px}.lib-card{display:flex;flex-direction:column;background:#fff;border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:0 3px 12px rgba(15,23,42,.05)}.lib-cover{width:100%;height:150px;object-fit:cover;background:#eef2f8}.lib-cover.noc{display:flex;align-items:center;justify-content:center;font-size:46px;color:#94a3b8}.lib-body{padding:11px 12px;display:flex;flex-direction:column;flex:1}.lib-title{font-weight:800;font-size:14px;line-height:1.25;margin-bottom:2px}</style>'
     +libHtml);
+  // EXAM CONDUCT — the student's exam attendance + any AI malpractice flag, with the actual
+  // recorded evidence to download and a one-tap Appeal (transparency: nobody is penalised unseen).
+  function svSev(s){var c=s==='high'?'background:#fee2e2;color:#991b1b':s==='medium'?'background:#fef3c7;color:#92400e':'background:#e5e7eb;color:#374151';return '<span class="badge" style="'+c+'">'+cap(s||'low')+'</span>';}
+  function svStat(s){var m={open:['Under review','#fef3c7','#92400e'],appealed:['Appeal filed','#dbeafe','#1e40af'],upheld:['Upheld','#fee2e2','#991b1b'],dismissed:['Cleared ✓','#dcfce7','#166534'],reviewed:['Reviewed','#e5e7eb','#374151']}[s]||['Open','#fef3c7','#92400e'];return '<span class="badge" style="background:'+m[1]+';color:'+m[2]+'">'+m[0]+'</span>';}
+  var attRows=(sv.attendance||[]).map(function(a){return '<tr><td>'+eh(a.exam)+'</td><td>'+(a.status==='present'?'<span class="badge" style="background:#dcfce7;color:#166534">Present</span>':'<span class="badge" style="background:#fee2e2;color:#991b1b">Absent</span>')+'</td><td class="muted">'+(a.method==='face'?'Face recognition':'Officer')+'</td><td class="muted">'+eh(fmt(a.date))+'</td></tr>';}).join('');
+  var attHtml=attRows?('<div class="panel"><h3>Attendance</h3><table class="tb"><thead><tr><th>Exam</th><th>Status</th><th>Marked by</th><th>When</th></tr></thead><tbody>'+attRows+'</tbody></table></div>'):'';
+  var flagHtml=(sv.flags||[]).length?((sv.flags||[]).map(function(f){
+    var ev=(f.evidence||[]).map(function(e){var icon=e.kind==='video'?'🎬':e.kind==='audio'?'🔊':'🖼';return '<button class="btn sm" onclick="doc(\\'/surveillance/evidence/'+e.id+'\\')">'+icon+' View evidence</button> <button class="btn sm ghost" onclick="doc(\\'/surveillance/evidence/'+e.id+'?dl=1\\')">⬇ Download</button>';}).join(' ');
+    var canAppeal=f.status!=='dismissed'&&!(f.appeal&&f.appeal.status==='pending');
+    var appealBtn=canAppeal?('<button class="btn sm warn" onclick="appealFlag(\\''+f.id+'\\')">⚖️ Appeal / report wrong person</button>'):(f.appeal&&f.appeal.status==='pending'?'<span class="muted" style="font-size:12px">⏳ Your appeal is under review</span>':(f.appeal&&f.appeal.status==='accepted'?'<span class="muted" style="font-size:12px;color:#166534">✓ Appeal accepted — cleared</span>':''));
+    return '<div class="panel" style="border-left:4px solid '+(f.severity==='high'?'#ef4444':f.severity==='medium'?'#f59e0b':'#94a3b8')+'">'
+      +'<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><div style="font-weight:800">'+eh(f.label||f.type)+'</div><div>'+svSev(f.severity)+' '+svStat(f.status)+'</div></div>'
+      +'<div class="muted" style="font-size:12px;margin:4px 0">'+eh(f.exam)+' · '+eh(fmt(f.date))+'</div>'
+      +(f.detail?('<div style="font-size:13px;margin-bottom:7px">'+eh(f.detail)+'</div>'):'')
+      +'<div class="qa" style="gap:6px;flex-wrap:wrap">'+(ev||'<span class="muted" style="font-size:12px">No clip attached.</span>')+'</div>'
+      +'<div style="margin-top:8px">'+appealBtn+'</div></div>';
+  }).join('')):'<div class="empty">No exam-conduct flags on your record. 🎉</div>';
+  html+=seg('surveillance',
+    '<h2 class="sectitle">🛡️ Exam Conduct</h2>'
+    +'<div class="muted" style="font-size:12.5px;margin-bottom:10px">Your exam attendance and any conduct alert raised by the AI monitoring system. We show you the exact evidence that was recorded — if you believe a flag is a mistake (for example the system identified the wrong person), tap <b>Appeal</b> and an exam officer will review it.</div>'
+    +attHtml+flagHtml);
   // RESULTS — list each level + semester with a downloadable PDF statement of result
   var sc=d.scores||{courses:[],semesters:[],cgpa:0,totalUnits:0};
   var myLevel=(d.profile&&d.profile.level)||'—';
