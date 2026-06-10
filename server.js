@@ -189,6 +189,14 @@ function tokensForStudents(ids) {
 }
 function persistDeviceTokens() { if (supaEnabled()) { try { cloudSetMeta('deviceTokens', JSON.stringify(store.deviceTokens)); } catch (_) {} } }
 function pruneStaleTokens(r) { if (r && r.stale && r.stale.length) { for (const t of r.stale) delete store.deviceTokens[t]; save(); persistDeviceTokens(); } }
+/** Push every enrolled student in a live class's cohort that it just went live. Shared by the desktop
+ *  sync path (pushNewRecords) and the portal-host path (the onLiveStart dep) so both notify identically. */
+async function pushLiveSession(row) {
+  if (!pushReady || !fcm || !fcm.configured() || !row || !row.active || row.deleted) return;
+  const ids = allEntity('students').filter(s => s.department_id === row.department_id && s.level_id === row.level_id).map(s => s.id);
+  const tokens = tokensForStudents(ids);
+  if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: '🔴 Live class started', body: (row.subject || row.course_code || 'Your class') + ' is live now — tap to join' }, { seg: 'liveclasses', id: String(row.id || ''), room: String(row.room || '') }));
+}
 async function pushNewRecords(recs) {
   if (!pushReady || !fcm || !fcm.configured() || !recs || !recs.length) return;
   for (const rec of recs) {
@@ -201,10 +209,7 @@ async function pushNewRecords(recs) {
         const tokens = tokensForStudents([row.student_id]);
         if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: 'Result published', body: row.title || 'A new statement of result is available' }, { seg: 'results', id: String(row.id || '') }));
       } else if (rec.entity === 'live_sessions' && row.active && !row.deleted) {
-        // A class just went live — push every enrolled student in the cohort so they can tap in to join.
-        const ids = allEntity('students').filter(s => s.department_id === row.department_id && s.level_id === row.level_id).map(s => s.id);
-        const tokens = tokensForStudents(ids);
-        if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: '🔴 Live class started', body: (row.subject || row.course_code || 'Your class') + ' is live now — tap to join' }, { seg: 'liveclasses', id: String(row.id || ''), room: String(row.room || '') }));
+        await pushLiveSession(row); // A class just went live — push every enrolled student so they can tap in.
       }
     } catch (_) { /* best-effort */ }
   }
@@ -250,6 +255,10 @@ if (createPortal) {
         try { cloudUpsert([{ entity, id: row.id, row, updated_at: now }]); } catch (_) {}
         return true;
       },
+      // A class started FROM THE PORTAL (a lecturer hosting on the web) → push the cohort, exactly like a
+      // desktop-started class does via the sync ingest. portal.js calls this ONLY for a genuinely new
+      // session (it skips a re-host), so there is no duplicate notification. Best-effort + async.
+      onLiveStart: (row) => { try { pushLiveSession(row).catch(() => {}); } catch (_) {} },
       // native app registers its FCM token here so we can push it when a document is posted
       registerDevice: (token, account) => {
         if (!token) return false;

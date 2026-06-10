@@ -51,7 +51,7 @@ function numWords(num) { num = Math.floor(Number(num) || 0); if (num === 0) retu
 function amountWords(a, c) { const whole = Math.floor(Number(a) || 0); const k = Math.round((Number(a) - whole) * 100); let s = `${numWords(whole)} ${WORD_CCY[c] || c}`; if (k > 0) s += ` and ${numWords(k)}/100`; return s + ' only'; }
 
 module.exports = function createPortal(deps) {
-  const { all, one, getVersion, secret, institution, update, create, registerDevice, jitsiConfig } = deps;
+  const { all, one, getVersion, secret, institution, update, create, registerDevice, jitsiConfig, onLiveStart } = deps;
   // Live-class video config (8x8 JaaS app id/key, or a self-hosted Jitsi domain). On the hosted hub
   // this comes from server env; on the embedded desktop portal it comes from app settings.
   const jitsiCfg = () => { try { return (typeof jitsiConfig === 'function' ? jitsiConfig() : {}) || {}; } catch (_) { return {}; } };
@@ -178,6 +178,23 @@ module.exports = function createPortal(deps) {
     }
     return dedupeRooms(out);
   }
+  /** Resolve a course class's cohort scope (dept/level/session) from its room id. The room is a one-way
+   *  hash of the allocation scope, so we MATCH it against every published allocation rather than reverse
+   *  it. Used when a lecturer starts a class from the portal so the cohort can be notified + auto-ended.
+   *  Returns null for ad-hoc/cohort rooms that aren't a course allocation (nothing to notify). */
+  function scopeForRoom(room) {
+    if (!room) return null;
+    const sets = all('allocation_sets').filter(a => !a.deleted && a.status === 'published');
+    for (const a of sets) {
+      for (const r of all('course_allocations').filter(r => r.set_id === a.id && !r.deleted)) {
+        if (classRoom([a.department_id, a.level_id, a.session_id, r.course_code]) === room)
+          return { department_id: a.department_id, level_id: a.level_id, session_id: a.session_id,
+            course_code: r.course_code, course_title: r.course_title,
+            subject: [r.course_code, r.course_title].filter(Boolean).join(' ') };
+      }
+    }
+    return null;
+  }
   /** Standalone page that embeds Jitsi Meet for one class room (capability URL: the room id is a secret). */
   function classPageHTML(room, name, subject, host) {
     const dn = esc(String(name || 'Guest').slice(0, 60));
@@ -214,6 +231,13 @@ module.exports = function createPortal(deps) {
 <script>
 (function(){
   var isHost=${isHost ? 'true' : 'false'};
+  var LC_ROOM=${JSON.stringify(String(room || ''))};
+  var LC_SUBJ=${JSON.stringify(subj)};
+  function lcTok(){try{return new URLSearchParams(location.search).get('t')||localStorage.getItem('ubu_token')||'';}catch(e){return '';}}
+  // The host ENDS the class for the whole cohort when they leave/close, so it stops on the students' APK
+  // too. sendBeacon survives the page unload; the token comes from ?t= (native app) or localStorage (web).
+  var lcEndSent=false;
+  function lcEndClass(){if(lcEndSent||!isHost||!LC_ROOM)return;lcEndSent=true;try{navigator.sendBeacon('/api/class-end?t='+encodeURIComponent(lcTok())+'&room='+encodeURIComponent(LC_ROOM));}catch(e){}}
   function fail(){var e=document.getElementById('err');if(e)e.style.display='block';var m=document.getElementById('meet');if(m)m.style.display='none';}
   if(typeof JitsiMeetExternalAPI!=='function'){fail();return;}
   try{
@@ -225,12 +249,17 @@ module.exports = function createPortal(deps) {
       configOverwrite:{prejoinPageEnabled:true,startWithAudioMuted:${isHost ? 'false' : 'true'},startWithVideoMuted:false,disableDeepLinking:true,subject:${JSON.stringify(subj)},disableReactions:false},
       interfaceConfigOverwrite:{MOBILE_APP_PROMO:false,SHOW_JITSI_WATERMARK:false,DEFAULT_BACKGROUND:'#0b1220',TOOLBAR_BUTTONS:${isHost ? HOST_TOOLBAR : STUDENT_TOOLBAR}}
     });
-    api.addEventListener('readyToClose',function(){location.href='/';});
+    api.addEventListener('readyToClose',function(){lcEndClass();location.href='/';});
     if(isHost){
-      // The lecturer hosts: enable the lobby so students must be admitted, and label the room.
+      // The lecturer hosts: enable the lobby so students must be admitted, label the room, and MARK the
+      // class live for the cohort (so it shows "Live now", the app can join, and there is a session to
+      // AUTO-END when the host leaves — which is what stops the class on the students' APK).
+      window.addEventListener('pagehide',lcEndClass);
+      window.addEventListener('beforeunload',lcEndClass);
       api.addEventListener('videoConferenceJoined',function(){
-        try{api.executeCommand('subject',${JSON.stringify(subj)});}catch(e){}
+        try{api.executeCommand('subject',LC_SUBJ);}catch(e){}
         try{api.executeCommand('toggleLobby',true);}catch(e){}
+        if(LC_ROOM){try{fetch('/api/class-start?t='+encodeURIComponent(lcTok())+'&room='+encodeURIComponent(LC_ROOM)+'&subject='+encodeURIComponent(LC_SUBJ),{method:'POST'});}catch(e){}}
       });
     } else {
       // A student knocks; show a waiting message until the lecturer admits them.
@@ -241,7 +270,6 @@ module.exports = function createPortal(deps) {
       // AUTO-LEAVE when the host ends the class. The APK keeps this page open, so without a signal the
       // Jitsi room kept running after the lecturer ended it. Poll the live-session state and, once the
       // session that made this class live has ended, dispose Jitsi and return to the portal.
-      var LC_ROOM=${JSON.stringify(String(room || ''))};
       var lcDone=false;
       function lcEnded(){
         if(lcDone)return; lcDone=true;
@@ -1437,6 +1465,49 @@ ${head}
       const emb = jitsi ? jitsi.classEmbed(jitsiCfg(), { room, displayName: name, email: row.email || '', moderator, userId: t.id })
         : { domain: 'meet.jit.si', roomName: String(room).replace(/[^a-zA-Z0-9-]/g, '').slice(0, 80), jwt: '', mode: 'public' };
       return J(res, 200, { ok: true, domain: emb.domain, roomName: emb.roomName, jwt: emb.jwt, mode: emb.mode });
+    }
+
+    // A lecturer started hosting a class FROM THE PORTAL → mark it LIVE for the cohort, exactly like the
+    // desktop host does. This records a live_session so the class shows "Live now" + is joinable on the
+    // students' app AND — crucially — gives the host's leave something to AUTO-END, which is what stops
+    // the class on the students' APK (without this, a portal-hosted class kept running there). The room is
+    // a one-way hash, so we resolve the cohort by MATCHING it against the lecturer's published allocations.
+    if (p === '/api/class-start' && method === 'POST') {
+      const t = authOf(req, u); if (!t) return J(res, 401, { ok: false });
+      if (t.k !== 'staff' && t.k !== 'user') return J(res, 403, { ok: false, error: 'Only teaching staff can start a class.' });
+      const room = u.searchParams.get('room') || '';
+      if (!room) return J(res, 200, { ok: false, error: 'No room specified.' });
+      const sc = scopeForRoom(room);
+      if (!sc || !sc.department_id || !sc.level_id) return J(res, 200, { ok: true, started: false }); // ad-hoc room: nobody to notify
+      const now = new Date().toISOString();
+      const recentCut = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+      const existing = all('live_sessions').find(v => v.room === room && !v.deleted && String(v.started_at || '') >= recentCut);
+      if (existing) { // re-host within the window (or the desktop already started it) → refresh, don't duplicate
+        if (typeof update === 'function') update('live_sessions', existing.id, { active: 1, started_at: now });
+        return J(res, 200, { ok: true, started: true, id: existing.id });
+      }
+      if (typeof create !== 'function') return J(res, 200, { ok: true, started: false }); // LAN portal w/o create hook
+      const id = crypto.randomUUID();
+      const row = { id, room, subject: u.searchParams.get('subject') || sc.subject, course_code: sc.course_code, course_title: sc.course_title,
+        department_id: sc.department_id, level_id: sc.level_id, session_id: sc.session_id || null, started_by: t.id,
+        started_at: now, active: 1, deleted: 0, created_at: now, updated_at: now, origin_node: 'portal' };
+      create('live_sessions', row);
+      // notify the cohort (FCM push) — ONLY for this genuinely-new session, mirroring the desktop host
+      try { if (typeof onLiveStart === 'function') onLiveStart(row); } catch (_) {}
+      return J(res, 200, { ok: true, started: true, id });
+    }
+    // The host left/closed the class on the portal → END every active session for the room so it stops on
+    // the cohort's app/APK (the student class page polls /api/class-live and leaves). Sent via sendBeacon.
+    if (p === '/api/class-end' && method === 'POST') {
+      const t = authOf(req, u); if (!t) return J(res, 401, { ok: false });
+      if (t.k !== 'staff' && t.k !== 'user') return J(res, 403, { ok: false });
+      const room = u.searchParams.get('room') || '';
+      if (!room) return J(res, 200, { ok: false, error: 'No room specified.' });
+      let ended = 0;
+      if (typeof update === 'function')
+        for (const v of all('live_sessions').filter(v => v.room === room && !v.deleted && v.active))
+          if (update('live_sessions', v.id, { active: 0 })) ended++;
+      return J(res, 200, { ok: true, ended });
     }
 
     // documents (open in a tab; token via ?t=)
