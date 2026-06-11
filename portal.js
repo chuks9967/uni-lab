@@ -1192,11 +1192,14 @@ ${head}
   function J(res, code, obj) { const b = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(b); return true; }
   function H(res, code, html) { res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(html); return true; }
   function S(res, code, body, type) { res.writeHead(code, { 'Content-Type': type, 'Access-Control-Allow-Origin': '*' }); res.end(body); return true; }
-  function authOf(req, u) {
-    const hdr = req.headers['authorization'] || '';
-    const bearer = /^Bearer\s+(.+)$/i.exec(hdr);
-    const tok = (bearer && bearer[1]) || u.searchParams.get('t');
-    return verifyToken(tok);
+  function rawBearer(req, u) { const hdr = req.headers['authorization'] || ''; const b = /^Bearer\s+(.+)$/i.exec(hdr); return (b && b[1]) || u.searchParams.get('t') || ''; }
+  function authOf(req, u) { return verifyToken(rawBearer(req, u)); }
+  // Exam-monitor caller = a portal OFFICER (user) OR the trusted desktop sync node presenting the
+  // sync token (so an officer needn't have a separate portal login to monitor exams).
+  function isExamOfficer(req, u) {
+    const t = authOf(req, u); if (t && t.k === 'user') return t;
+    const raw = rawBearer(req, u); if (raw && secret && raw === secret) return { k: 'sync', role: 'officer', id: 'sync' };
+    return null;
   }
 
   // ---------------------------------------------------------------------------
@@ -1631,34 +1634,44 @@ ${head}
       const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
       const body = await readBody(); const examId = String(body.exam_id || ''); if (!examId) return J(res, 400, { ok: false });
       const now = Date.now(); const key = examId + ':' + t.id;
-      if (lastFrameTs[key] && now - lastFrameTs[key] < 1000) return J(res, 200, { ok: true, throttled: true });
+      if (!body.kyc && lastFrameTs[key] && now - lastFrameTs[key] < 1000) return J(res, 200, { ok: true, throttled: true });  // KYC selfie bypasses the rate-limit
       lastFrameTs[key] = now;
       const jpeg = String(body.image_base64 || '').replace(/^data:[^;]+;base64,/, '');
-      if (jpeg) { examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][t.id] || { ring: [] }; cur.jpeg = jpeg; cur.audioLevel = Number(body.audioLevel) || 0; cur.ts = now; cur.ring = (cur.ring || []).concat([jpeg]).slice(-20); examFrames[examId][t.id] = cur; }
+      if (jpeg) { examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][t.id] || { ring: [], away: 0 }; cur.jpeg = jpeg; cur.audioLevel = Number(body.audioLevel) || 0; cur.ts = now; cur.ring = (cur.ring || []).concat([jpeg]).slice(-20); if (body.kyc) cur.kyc = jpeg; examFrames[examId][t.id] = cur; }
       const at = all('exam_attempts').find(a => !a.deleted && a.exam_id === examId && a.student_id === t.id);
       return J(res, 200, { ok: true, live_requested: !!(at && at.live_requested), room: 'exam-' + examId });
     }
+    // Student: report a proctoring EVENT (left the app / lost focus). Counted for the officer/AI.
+    if (p === '/api/exam/event' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
+      const body = await readBody(); const examId = String(body.exam_id || ''); if (!examId) return J(res, 400, { ok: false });
+      examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][t.id] || { ring: [], away: 0 };
+      if ((body.type || 'left_app') === 'left_app') cur.away = (cur.away || 0) + 1;
+      cur.lastEvent = { type: body.type || 'left_app', ts: Date.now() }; examFrames[examId][t.id] = cur;
+      return J(res, 200, { ok: true, away: cur.away || 0 });
+    }
     // Officer: monitor roster — who is online, audio level, last-seen, status.
     if (p === '/api/exam/monitor' && method === 'GET') {
-      const t = authOf(req, u); if (!t || t.k !== 'user') return J(res, 401, { ok: false });
+      const t = isExamOfficer(req, u); if (!t) return J(res, 401, { ok: false, error: 'Not authorised — connect the monitor with the sync token or an officer login.' });
       const examId = u.searchParams.get('exam_id') || ''; const now = Date.now(); const frames = examFrames[examId] || {};
       const rows = all('exam_attempts').filter(a => !a.deleted && a.exam_id === examId).map(a => {
         const st = one('students', a.student_id) || {}; const f = frames[a.student_id];
-        return { student_id: a.student_id, name: `${st.first_name || ''} ${st.last_name || ''}`.trim(), matric: st.matric_no || '', status: a.status, score: a.score, live_requested: !!a.live_requested, hasFrame: !!(f && f.jpeg), audioLevel: f ? f.audioLevel : 0, lastSeen: f ? f.ts : 0, online: !!(f && now - f.ts < 8000) };
+        return { student_id: a.student_id, name: `${st.first_name || ''} ${st.last_name || ''}`.trim(), matric: st.matric_no || '', status: a.status, score: a.score, live_requested: !!a.live_requested, hasFrame: !!(f && f.jpeg), hasKyc: !!(f && f.kyc), away: f ? (f.away || 0) : 0, audioLevel: f ? f.audioLevel : 0, lastSeen: f ? f.ts : 0, online: !!(f && now - f.ts < 8000) };
       });
       return J(res, 200, { ok: true, room: 'exam-' + examId, students: rows });
     }
     // Officer: latest frame JPEG for a student tile in the live grid.
     if (method === 'GET' && p === '/api/exam/frame') {
-      const t = authOf(req, u); if (!t || t.k !== 'user') return H(res, 401, '<p>Unauthorized.</p>');
+      const t = isExamOfficer(req, u); if (!t) return H(res, 401, '<p>Unauthorized.</p>');
       const examId = u.searchParams.get('exam_id') || ''; const sid = u.searchParams.get('student_id') || '';
       const f = (examFrames[examId] || {})[sid];
-      if (!f || !f.jpeg) return H(res, 404, '<p>No frame.</p>');
-      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' }); res.end(Buffer.from(f.jpeg, 'base64')); return true;
+      const pic = (u.searchParams.get('kyc') === '1') ? (f && f.kyc) : (f && f.jpeg);
+      if (!pic) return H(res, 404, '<p>No frame.</p>');
+      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' }); res.end(Buffer.from(pic, 'base64')); return true;
     }
     // Officer: request (or stop) a student's real-time camera+mic (they then join the exam Jitsi room).
     if (p === '/api/exam/request-live' && method === 'POST') {
-      const t = authOf(req, u); if (!t || t.k !== 'user') return J(res, 401, { ok: false });
+      const t = isExamOfficer(req, u); if (!t) return J(res, 401, { ok: false });
       const body = await readBody();
       const at = body.attempt_id ? one('exam_attempts', body.attempt_id) : all('exam_attempts').find(a => !a.deleted && a.exam_id === body.exam_id && a.student_id === body.student_id);
       if (!at) return J(res, 404, { ok: false });
