@@ -238,6 +238,8 @@ if (createPortal) {
   try {
     portal = createPortal({
       all: allEntity, one: oneEntity, getVersion: () => storeVersion, secret: SYNC_TOKEN || 'unibursar-portal',
+      // resolve offloaded book/document bytes from object storage (env creds) — see server/blobstore.js
+      blobFetch: (key) => require('./blobstore').getBuffer(key),
       // portal writes (e.g. password reset) update the store and bump updated_at so the
       // change syncs back to the desktop app on the next /sync/pull
       update: (entity, id, patch) => {

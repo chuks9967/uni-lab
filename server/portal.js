@@ -51,7 +51,14 @@ function numWords(num) { num = Math.floor(Number(num) || 0); if (num === 0) retu
 function amountWords(a, c) { const whole = Math.floor(Number(a) || 0); const k = Math.round((Number(a) - whole) * 100); let s = `${numWords(whole)} ${WORD_CCY[c] || c}`; if (k > 0) s += ` and ${numWords(k)}/100`; return s + ' only'; }
 
 module.exports = function createPortal(deps) {
-  const { all, one, getVersion, secret, institution, update, create, registerDevice, jitsiConfig, onLiveStart } = deps;
+  const { all, one, getVersion, secret, institution, update, create, registerDevice, jitsiConfig, onLiveStart, blobFetch } = deps;
+  // Resolve a row's binary: inline base64 (legacy) → Buffer, else fetch the offloaded object by key
+  // (services/blobstore.js / server/blobstore.js, injected as blobFetch). Returns a Buffer or null.
+  const resolveBlob = async (inlineB64, key) => {
+    if (inlineB64) return Buffer.from(inlineB64, 'base64');
+    if (key && typeof blobFetch === 'function') { try { return await blobFetch(key); } catch (_) { return null; } }
+    return null;
+  };
   // Live-class video config (8x8 JaaS app id/key, or a self-hosted Jitsi domain). On the hosted hub
   // this comes from server env; on the embedded desktop portal it comes from app settings.
   const jitsiCfg = () => { try { return (typeof jitsiConfig === 'function' ? jitsiConfig() : {}) || {}; } catch (_) { return {}; } };
@@ -348,7 +355,8 @@ module.exports = function createPortal(deps) {
   }
 
   // ---- Exam Surveillance: the student's own attendance + any malpractice flag + evidence ----
-  const MALPRACTICE_LABELS = { multiple_faces: 'Another person in your frame', absence: 'You left your seat', left_seat: 'You left your seat', looking_away: 'Looking away from your paper', talking: 'Talking during the exam', phone: 'Phone use', earbuds: 'Earbuds / earphones detected', neck_movement: 'Head/neck turning to a neighbour', notes: 'Unauthorised notes / material', unknown_face: 'Unrecognised face', impersonation: 'Possible impersonation', manual: 'Flagged by an exam officer' };
+  const MALPRACTICE_LABELS = { multiple_faces: 'Another person in your frame', absence: 'You left your seat', left_seat: 'You left your seat', looking_away: 'Looking away from your paper', talking: 'Talking during the exam', phone: 'Phone use', earbuds: 'Earbuds / earphones detected', neck_movement: 'Head/neck turning to a neighbour', notes: 'Unauthorised notes / material', unknown_face: 'Unrecognised face', impersonation: 'Possible impersonation', left_app: 'You left the exam app', manual: 'Flagged by an exam officer',
+    smartwatch: 'Smartwatch / smart band use', smart_glasses: 'Smart / camera glasses', calculator: 'Unauthorised calculator / electronics', second_device: 'Laptop / second screen detected', book: 'Textbook / notebook detected', body_writing: 'Writing on the body', desk_writing: 'Writing on the desk / objects', hidden_material: 'Concealed material', mirror: 'Mirror / reflective surface', copying: 'Copying a neighbour', signaling: 'Hand signals / coded gestures', passing_object: 'Passing notes / objects', script_swap: 'Swapping scripts / papers', suspicious_posture: 'Repeated under-desk / lap glances', face_hidden: 'Face covered / obscured', camera_obstruction: 'Camera covered / blocked' };
   function examTitleOf(examId) { const e = examId ? one('surveillance_sessions', examId) : null; return e ? (e.title || e.course_code || 'Exam') : 'Exam'; }
   function surveillanceForStudent(s) {
     const attendance = all('surveillance_attendance').filter(a => !a.deleted && a.student_id === s.id)
@@ -450,6 +458,193 @@ ${head}
   function render(re){ if(!pdf)return; if(re){makeCanvases();} }
   pdfjsLib.getDocument(FILE).promise.then(function(p){pdf=p;setZoom();makeCanvases();}).catch(function(){document.getElementById('msg').textContent='Could not open this book. Try downloading it instead.';});
 })();
+</script>
+</body></html>`;
+  }
+
+  /** Standalone, full-screen ONLINE-EXAM taking page (browser: laptop + phone). Self-contained — it
+   *  drives the camera/mic, KYC selfie, server-timed countdown, questions, autosave, integrity lockdown
+   *  (warn+log) and the proctor upload loop, all against the existing /api/exam/* endpoints. Served like
+   *  the pdf reader / class page so it owns the whole tab (no SPA contention). */
+  function examTakeHTML(e, token) {
+    const cfg = JSON.stringify({ id: e.id, title: e.title || e.course_code || 'Exam', instructions: e.instructions || '', requireCam: e.require_camera !== 0 });
+    const tk = JSON.stringify(token || '');
+    const title = esc(e.title || e.course_code || 'Exam');
+    return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>${title}</title>
+<style>
+:root{--bg:#0b1220;--card:#111c33;--line:#1e2b48;--accent:#2563eb;--ok:#16a34a;--warn:#f59e0b;--bad:#ef4444}
+*{box-sizing:border-box}html,body{margin:0;height:100%}body{background:var(--bg);color:#e7eefc;font-family:'Segoe UI',Arial,sans-serif}
+.scr{display:none;min-height:100vh}.scr.on{display:block}
+.wrap{max-width:860px;margin:0 auto;padding:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin:14px 0}
+h1{font-size:20px;margin:.2em 0}h2{font-size:16px}.muted{color:#9fb2d6;font-size:13px}
+button{font:inherit;border:0;border-radius:10px;padding:11px 16px;cursor:pointer;background:var(--accent);color:#fff;font-weight:700}
+button.sec{background:#22304f}button:disabled{opacity:.5;cursor:not-allowed}
+video#cam{width:220px;max-width:42vw;border-radius:10px;background:#000;transform:scaleX(-1)}
+.selfie{position:fixed;right:10px;bottom:10px;width:128px;border-radius:10px;border:2px solid var(--accent);background:#000;z-index:40;transform:scaleX(-1)}
+#bar{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:12px;padding:10px 14px;background:#0f1e3d;border-bottom:1px solid var(--line)}
+#bar .t{font-weight:800;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#clock{font-variant-numeric:tabular-nums;font-weight:800;font-size:18px;background:#0b1220;padding:6px 10px;border-radius:8px}
+#clock.low{color:var(--bad)}
+.live{background:#7f1d1d;color:#fecaca;font-size:11px;font-weight:800;padding:4px 8px;border-radius:6px}
+#banner{display:none;background:#7f1d1d;color:#fff;padding:10px 14px;font-size:13px;text-align:center}
+.q{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin:12px 0}
+.q .qt{font-weight:600;margin-bottom:8px}.q img{max-width:100%;border-radius:8px;margin:6px 0}
+.opt{display:block;padding:9px 12px;border:1px solid var(--line);border-radius:9px;margin:6px 0;cursor:pointer}
+.opt.sel{border-color:var(--accent);background:#16224a}
+textarea,input[type=text]{width:100%;background:#0b1220;color:#e7eefc;border:1px solid var(--line);border-radius:9px;padding:10px;font:inherit}
+.status{font-size:13px;margin:8px 0}.ok{color:#86efac}.bad{color:#fca5a5}
+.sp{display:inline-block;width:16px;height:16px;border:2px solid #fff5;border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite;vertical-align:-3px}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style></head><body>
+<div id="err" class="scr"><div class="wrap"><div class="card"><h1>⚠ Problem</h1><p id="errmsg" class="muted"></p><a href="/"><button class="sec">⤺ Back to portal</button></a></div></div></div>
+
+<div id="pre" class="scr on"><div class="wrap">
+  <div class="card"><h1>📝 ${title}</h1><div id="instr" class="muted"></div></div>
+  <div class="card"><h2>Identity & proctoring check</h2>
+    <p class="muted">This exam is monitored. We use your <b>camera and microphone</b> for live invigilation — please sit in good light, alone, and stay in view. Your activity is recorded for review.</p>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center"><video id="cam" autoplay muted playsinline></video>
+      <div style="flex:1;min-width:200px"><div id="camstat" class="status muted">Camera & microphone not started.</div>
+        <button id="cambtn" onclick="EX.startCam()">🎥 Enable camera & microphone</button>
+        <button id="kycbtn" class="sec" style="display:none" onclick="EX.captureKyc()">📸 Capture my photo</button>
+      </div></div>
+  </div>
+  <div class="wrap" style="padding:0"><button id="beginbtn" onclick="EX.begin()" disabled>▶ Begin exam</button>
+    <div id="prestat" class="status muted"></div></div>
+</div></div>
+
+<div id="wait" class="scr"><div class="wrap"><div class="card" style="text-align:center">
+  <h1>⏳ Waiting room</h1><p class="muted">The invigilator has not started this exam yet. <span class="sp"></span><br>It will begin automatically the moment they do — keep this page open.</p>
+</div></div></div>
+
+<div id="exam" class="scr">
+  <div id="bar"><span class="t">📝 ${title}</span><span id="livebadge" class="live" style="display:none">🔴 LIVE — invigilator watching</span><span id="clock">--:--</span></div>
+  <div id="banner"></div>
+  <div class="wrap"><div id="qs"></div>
+    <div class="card" style="text-align:center"><button id="submitbtn" onclick="EX.submit(false)">✅ Submit exam</button>
+      <div class="muted" style="margin-top:8px">Answers save automatically as you go.</div></div>
+  </div>
+  <video id="self" class="selfie" autoplay muted playsinline></video>
+</div>
+
+<div id="done" class="scr"><div class="wrap"><div class="card" style="text-align:center">
+  <h1>✅ Submitted</h1><p class="muted">Your answers were recorded. You may close this page.</p>
+  <a href="/"><button>⤺ Back to portal</button></a>
+</div></div></div>
+
+<canvas id="cv" style="display:none"></canvas>
+<script>
+var EXAM=${cfg}, TOKEN=${tk};
+var EX=(function(){
+  var stream=null, attemptId=null, endsAt=0, questions=[], answers={}, away=0, live=false;
+  var proctorT=null, clockT=null, saveT=null, audioCtx=null, analyser=null, pendingAudio=null, recBusy=false, started=false;
+  function qs(id){return document.getElementById(id);}
+  function show(id){['pre','wait','exam','done','err'].forEach(function(s){qs(s).classList.toggle('on',s===id);});}
+  function fail(m){qs('errmsg').textContent=m||'Something went wrong.';show('err');stopAll();}
+  function api(path,body){var o={method:body?'POST':'GET',headers:{'Content-Type':'application/json'}};if(TOKEN)o.headers.Authorization='Bearer '+TOKEN;if(body)o.body=JSON.stringify(body);return fetch(path,o).then(function(r){return r.json();});}
+  // ---- camera / mic ----
+  async function startCam(){
+    qs('camstat').textContent='Requesting camera & microphone…';
+    try{
+      stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:'user'},audio:true});
+      qs('cam').srcObject=stream;qs('self').srcObject=stream;
+      try{audioCtx=new (window.AudioContext||window.webkitAudioContext)();var src=audioCtx.createMediaStreamSource(stream);analyser=audioCtx.createAnalyser();analyser.fftSize=512;src.connect(analyser);}catch(_){}
+      qs('camstat').innerHTML='<span class="ok">✓ Camera & microphone ready.</span>';
+      qs('cambtn').style.display='none';qs('kycbtn').style.display='';qs('beginbtn').disabled=false;
+    }catch(e){
+      if(EXAM.requireCam){qs('camstat').innerHTML='<span class="bad">✗ This exam requires a working camera & microphone. Please allow access and reload.</span>';qs('beginbtn').disabled=true;}
+      else{qs('camstat').innerHTML='<span class="bad">Camera unavailable — you may continue, but this will be noted.</span>';qs('beginbtn').disabled=false;}
+    }
+  }
+  function frameJpeg(){try{var v=qs('cam');if(!v||!v.videoWidth)return '';var cv=qs('cv'),w=320,h=Math.round(320*(v.videoHeight/v.videoWidth||0.75));cv.width=w;cv.height=h;var c=cv.getContext('2d');c.drawImage(v,0,0,w,h);return cv.toDataURL('image/jpeg',0.5);}catch(_){return '';}}
+  function micLevel(){if(!analyser)return 0;var a=new Uint8Array(analyser.fftSize);analyser.getByteTimeDomainData(a);var s=0;for(var i=0;i<a.length;i++){var d=(a[i]-128)/128;s+=d*d;}return Math.min(100,Math.round(Math.sqrt(s/a.length)*300));}
+  async function captureKyc(){var img=frameJpeg();if(!img)return alert('Camera not ready yet.');qs('kycbtn').disabled=true;qs('kycbtn').textContent='Sending…';try{await api('/api/exam/frame',{exam_id:EXAM.id,kyc:true,image_base64:img});qs('kycbtn').textContent='✓ Photo captured';}catch(_){qs('kycbtn').disabled=false;qs('kycbtn').textContent='📸 Capture my photo';}}
+  function recordClip(){
+    if(recBusy||!stream)return;var at=stream.getAudioTracks?stream.getAudioTracks():[];if(!at.length)return;
+    try{
+      var mime=(window.MediaRecorder&&MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported('audio/webm;codecs=opus'))?'audio/webm;codecs=opus':'';
+      var mr=new MediaRecorder(new MediaStream(at),mime?{mimeType:mime}:undefined);var chunks=[];recBusy=true;
+      mr.ondataavailable=function(ev){if(ev.data&&ev.data.size)chunks.push(ev.data);};
+      mr.onstop=function(){recBusy=false;if(!chunks.length)return;var b=new Blob(chunks,{type:mr.mimeType||'audio/webm'});if(b.size>3500000)return;var rd=new FileReader();rd.onload=function(){pendingAudio={b64:String(rd.result).replace(/^data:[^;]+;base64,/,''),mime:mr.mimeType||'audio/webm'};};rd.readAsDataURL(b);};
+      mr.start();setTimeout(function(){try{if(mr.state!=='inactive')mr.stop();}catch(_){recBusy=false;}},3500);
+    }catch(_){recBusy=false;}
+  }
+  // ---- start / waiting room ----
+  async function begin(){
+    if(EXAM.requireCam&&!stream)return alert('Please enable your camera and microphone first.');
+    qs('beginbtn').disabled=true;qs('prestat').textContent='Starting…';
+    try{var r=await api('/api/exam/start',{exam_id:EXAM.id});
+      if(r.waiting){show('wait');setTimeout(begin,4000);return;}
+      if(!r.ok)return fail(r.error||'Could not start the exam.');
+      initExam(r);
+    }catch(e){qs('beginbtn').disabled=false;qs('prestat').textContent='';fail('Could not reach the server. Check your connection.');}
+  }
+  function initExam(r){
+    started=true;attemptId=r.attempt_id;endsAt=Date.parse(r.endsAt||'')||0;answers=r.answers||{};questions=r.questions||[];
+    renderQuestions();show('exam');enterFs();startClock();startProctor();bindIntegrity();
+  }
+  // ---- questions ----
+  function renderQuestions(){
+    var root=qs('qs');root.innerHTML='';
+    questions.forEach(function(q,i){
+      var box=document.createElement('div');box.className='q';
+      var html='<div class="qt">'+(i+1)+'. '+esc(q.text||'')+' <span class="muted">('+(q.marks||1)+' mark'+((q.marks||1)>1?'s':'')+')</span></div>';
+      if(q.image)html+='<img src="'+q.image+'">';
+      box.innerHTML=html;
+      if(q.type==='mcq'||q.type==='truefalse'){
+        var opts=q.type==='truefalse'?['True','False']:(q.options||[]);
+        opts.forEach(function(o){var el=document.createElement('label');el.className='opt';el.textContent=o;
+          if(answers[q.id]===o)el.classList.add('sel');
+          el.onclick=function(){answers[q.id]=o;Array.prototype.forEach.call(box.querySelectorAll('.opt'),function(x){x.classList.remove('sel');});el.classList.add('sel');scheduleSave();};
+          box.appendChild(el);});
+      }else if(q.type==='short'){
+        var inp=document.createElement('input');inp.type='text';inp.value=answers[q.id]||'';inp.oninput=function(){answers[q.id]=inp.value;scheduleSave();};box.appendChild(inp);
+      }else{
+        var ta=document.createElement('textarea');ta.rows=6;ta.value=answers[q.id]||'';ta.oninput=function(){answers[q.id]=ta.value;scheduleSave();};box.appendChild(ta);
+      }
+      root.appendChild(box);
+    });
+  }
+  function scheduleSave(){if(saveT)return;saveT=setTimeout(function(){saveT=null;saveAnswers();},2500);}
+  function saveAnswers(){if(!attemptId)return;api('/api/exam/answer',{attempt_id:attemptId,answers:answers}).catch(function(){});}
+  // ---- clock ----
+  function startClock(){tick();clockT=setInterval(tick,1000);}
+  function tick(){var ms=endsAt-Date.now();if(ms<=0){ms=0;qs('clock').textContent='00:00';return submit(true);}var s=Math.floor(ms/1000),m=Math.floor(s/60);qs('clock').textContent=(m<10?'0':'')+m+':'+((s%60)<10?'0':'')+(s%60);if(ms<60000)qs('clock').classList.add('low');}
+  // ---- proctor loop ----
+  function startProctor(){var since=0;
+    var loop=function(){
+      var body={exam_id:EXAM.id,image_base64:frameJpeg(),audioLevel:micLevel()};
+      if(pendingAudio){body.audio_base64=pendingAudio.b64;body.audio_mime=pendingAudio.mime;pendingAudio=null;}
+      api('/api/exam/frame',body).then(function(r){if(r&&typeof r.live==='boolean'&&r.live!==live){live=r.live;qs('livebadge').style.display=live?'':'none';}}).catch(function(){});
+      since++;var audioEvery=live?2:5;if(since%audioEvery===0)recordClip();
+      proctorT=setTimeout(loop,live?1200:3000);
+    };
+    recordClip();loop();
+  }
+  // ---- integrity (warn + log; never auto-kick) ----
+  function flash(m){var b=qs('banner');b.textContent=m;b.style.display='block';clearTimeout(b._t);b._t=setTimeout(function(){b.style.display='none';},6000);}
+  function reportEvent(type){away++;api('/api/exam/event',{exam_id:EXAM.id,type:type||'left_app'}).catch(function(){});flash('⚠ Leaving the exam screen is recorded and shown to the invigilator. Stay on this page. ('+away+')');}
+  function enterFs(){try{var el=document.documentElement;if(el.requestFullscreen)el.requestFullscreen().catch(function(){});}catch(_){}}
+  function bindIntegrity(){
+    document.addEventListener('visibilitychange',function(){if(document.hidden&&started)reportEvent('left_app');});
+    window.addEventListener('blur',function(){if(started)reportEvent('blur');});
+    document.addEventListener('fullscreenchange',function(){if(started&&!document.fullscreenElement){flash('⚠ Please stay in full screen.');var b=qs('banner');b.innerHTML='⚠ You left full screen. <button class="sec" style="padding:4px 10px" onclick="EX.refs()">Return to full screen</button>';b.style.display='block';}});
+    ['contextmenu','copy','cut','paste','dragstart'].forEach(function(ev){document.addEventListener(ev,function(e){e.preventDefault();});});
+    document.addEventListener('keydown',function(e){var k=(e.key||'').toLowerCase();if((e.ctrlKey||e.metaKey)&&['c','v','x','p','s','u'].indexOf(k)>=0){e.preventDefault();flash('⚠ That shortcut is disabled during the exam.');}if(k==='f12'||(e.ctrlKey&&e.shiftKey&&['i','j','c'].indexOf(k)>=0)){e.preventDefault();}});
+  }
+  // ---- submit / cleanup ----
+  function submit(auto){
+    if(!attemptId)return;if(!auto&&!confirm('Submit your exam now? You will not be able to change your answers.'))return;
+    started=false;var was=attemptId;attemptId=null;
+    api('/api/exam/submit',{attempt_id:was,answers:answers,auto:!!auto}).then(function(){}).catch(function(){});
+    stopAll();show('done');
+  }
+  function stopAll(){try{clearInterval(clockT);}catch(_){}try{clearTimeout(proctorT);}catch(_){}try{if(document.fullscreenElement)document.exitFullscreen();}catch(_){}try{if(stream)stream.getTracks().forEach(function(t){t.stop();});}catch(_){}}
+  window.addEventListener('beforeunload',function(e){if(started){e.preventDefault();e.returnValue='';}});
+  return {startCam:startCam,captureKyc:captureKyc,begin:begin,submit:submit,refs:enterFs};
+})();
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[m];});}
+document.getElementById('instr').textContent=EXAM.instructions||'Read each question carefully. Your answers save automatically. Click Submit when finished.';
 </script>
 </body></html>`;
   }
@@ -1268,13 +1463,22 @@ ${head}
       if (s && !libraryVisibleTo(book, s)) return H(res, 403, '<p>This book is not available to you.</p>');
       if (action === 'read') return H(res, 200, libraryReaderHTML(book, u.searchParams.get('t') || ''));
       if (action === 'file' || action === 'download') {
-        if (!book.file) return H(res, 404, '<p>This book has no file.</p>');
-        const buf = Buffer.from(book.file, 'base64');
+        const buf = await resolveBlob(book.file, book.file_key);
+        if (!buf) return H(res, 404, '<p>This book file is unavailable.</p>');
         const disp = action === 'download' ? 'attachment' : 'inline';
         res.writeHead(200, { 'Content-Type': book.mime || 'application/octet-stream', 'Content-Disposition': disp + '; filename="' + String(book.filename || 'book').replace(/[\\/:*?"<>|]+/g, '-') + '"', 'Cache-Control': 'private, max-age=3600' });
         res.end(buf); return true;
       }
       return H(res, 404, '<p>Not found.</p>');
+    }
+    // Online exam — full-screen, proctored taking page (browser: laptop + phone). Standalone page so
+    // it owns the camera/mic/timer/lockdown without fighting the SPA.
+    if (method === 'GET' && p.startsWith('/exam/take/')) {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return H(res, 401, '<p>Please sign in as a student to take this exam.</p>');
+      const id = p.split('/')[3]; const s = one('students', t.id);
+      const e = id ? one('online_exams', id) : null;
+      if (!e || e.deleted || !s || !examVisibleTo(e, s)) return H(res, 404, '<p>Exam not found or not available to you.</p>');
+      return H(res, 200, examTakeHTML(e, u.searchParams.get('t') || ''));
     }
     // Exam-conduct evidence: the flagged student downloads the video/audio/image clip that was
     // recorded — full transparency, so they can see exactly what was captured and appeal if wrong.
@@ -1643,10 +1847,19 @@ ${head}
       const now = Date.now(); const key = examId + ':' + t.id;
       if (!body.kyc && lastFrameTs[key] && now - lastFrameTs[key] < 1000) return J(res, 200, { ok: true, throttled: true });  // KYC selfie bypasses the rate-limit
       lastFrameTs[key] = now;
+      examFrames[examId] = examFrames[examId] || {};
+      const cur = examFrames[examId][t.id] || { ring: [], away: 0 };
       const jpeg = String(body.image_base64 || '').replace(/^data:[^;]+;base64,/, '');
-      if (jpeg) { examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][t.id] || { ring: [], away: 0 }; cur.jpeg = jpeg; cur.audioLevel = Number(body.audioLevel) || 0; cur.ts = now; cur.ring = (cur.ring || []).concat([jpeg]).slice(-20); if (body.kyc) cur.kyc = jpeg; examFrames[examId][t.id] = cur; }
+      if (jpeg) { cur.jpeg = jpeg; cur.ts = now; cur.ring = (cur.ring || []).concat([jpeg]).slice(-20); if (body.kyc) cur.kyc = jpeg; }
+      if (body.audioLevel != null) { cur.audioLevel = Number(body.audioLevel) || 0; cur.ts = now; }
+      // a short captured audio clip (webm/opus) so the officer can actually HEAR the student, not just see a level bar
+      const aud = String(body.audio_base64 || '').replace(/^data:[^;]+;base64,/, '');
+      if (aud && aud.length < 4 * 1024 * 1024) { cur.audio = aud; cur.audioMime = String(body.audio_mime || 'audio/webm'); cur.audioTs = now; }
+      examFrames[examId][t.id] = cur;
       const at = all('exam_attempts').find(a => !a.deleted && a.exam_id === examId && a.student_id === t.id);
-      return J(res, 200, { ok: true, live_requested: !!(at && at.live_requested), room: 'exam-' + examId });
+      // `live` tells the client to BOOST its capture cadence (≈1s frames + continuous audio) for true
+      // near-real-time monitoring — without a second camera consumer (avoids getUserMedia contention).
+      return J(res, 200, { ok: true, live_requested: !!(at && at.live_requested), live: !!(at && at.live_requested), room: 'exam-' + examId });
     }
     // Student: report a proctoring EVENT (left the app / lost focus). Counted for the officer/AI.
     if (p === '/api/exam/event' && method === 'POST') {
@@ -1673,7 +1886,8 @@ ${head}
         const st = one('students', sid) || {}; const a = attempts.find(x => x.student_id === sid) || {}; const f = frames[sid];
         return { student_id: sid, name: `${st.first_name || ''} ${st.last_name || ''}`.trim(), matric: st.matric_no || '', status: a.status || 'not_started', score: a.score,
           live_requested: !!a.live_requested, identity: a.identity_verified || (f && f.kyc ? 'pending' : 'none'),
-          hasFrame: !!(f && f.jpeg), hasKyc: !!(f && f.kyc), away: f ? (f.away || 0) : 0, audioLevel: f ? f.audioLevel : 0, lastSeen: f ? f.ts : 0, online: !!(f && now - f.ts < 8000) };
+          hasFrame: !!(f && f.jpeg), hasKyc: !!(f && f.kyc), away: f ? (f.away || 0) : 0, audioLevel: f ? f.audioLevel : 0,
+          hasAudio: !!(f && f.audio), audioTs: f ? (f.audioTs || 0) : 0, lastSeen: f ? f.ts : 0, online: !!(f && now - f.ts < 8000) };
       }).sort((x, y) => (y.online - x.online) || String(x.name).localeCompare(String(y.name)));
       const onlineN = rows.filter(r => r.online).length;
       return J(res, 200, { ok: true, room: 'exam-' + examId, status: e.status, students: rows, onlineCount: onlineN, frameCount: rows.filter(r => r.hasFrame).length });
@@ -1686,6 +1900,14 @@ ${head}
       const pic = (u.searchParams.get('kyc') === '1') ? (f && f.kyc) : (f && f.jpeg);
       if (!pic) return H(res, 404, '<p>No frame.</p>');
       res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' }); res.end(Buffer.from(pic, 'base64')); return true;
+    }
+    // Officer: latest captured audio clip for a student (so the monitor can HEAR them, not just a level bar).
+    if (method === 'GET' && p === '/api/exam/audio') {
+      const t = isExamOfficer(req, u); if (!t) return H(res, 401, '<p>Unauthorized.</p>');
+      const examId = u.searchParams.get('exam_id') || ''; const sid = u.searchParams.get('student_id') || '';
+      const f = (examFrames[examId] || {})[sid];
+      if (!f || !f.audio) return H(res, 404, '<p>No audio.</p>');
+      res.writeHead(200, { 'Content-Type': f.audioMime || 'audio/webm', 'Cache-Control': 'no-store' }); res.end(Buffer.from(f.audio, 'base64')); return true;
     }
     // Officer/desktop: record the KYC identity-match result (verified | rejected) for a student's attempt.
     if (p === '/api/exam/identity' && method === 'POST') {
@@ -1877,10 +2099,11 @@ ${head}
       }
       if (type === 'portal-document' || type === 'document') {
         const d = one('portal_documents', id);
-        if (!d || !d.file) return H(res, 404, '<p>Document not found.</p>');
+        if (!d) return H(res, 404, '<p>Document not found.</p>');
         // personalised docs (admission letter, certificate, transcript) are private to one student
         if (d.student_id && studentish && d.student_id !== t.id) return H(res, 403, '<p>Not authorised.</p>');
-        const buf = Buffer.from(d.file, 'base64');
+        const buf = await resolveBlob(d.file, d.file_key);
+        if (!buf) return H(res, 404, '<p>This document is unavailable.</p>');
         res.writeHead(200, { 'Content-Type': d.mime || 'application/octet-stream', 'Content-Disposition': 'attachment; filename="' + (d.filename || 'document') + '"' });
         res.end(buf); return true;
       }
@@ -2118,6 +2341,7 @@ function joinClass(room,subjEnc){var n=window.__lcName||encodeURIComponent('Gues
 function readBook(id){location.href='/library/read/'+id+'?t='+encodeURIComponent(TOKEN);}
 function downloadBook(id){window.open('/library/download/'+id+'?t='+encodeURIComponent(TOKEN),'_blank');}
 function goSeg(s){if(window.__goSeg)window.__goSeg(s);}
+function startExam(id){location.href='/exam/take/'+id+'?t='+encodeURIComponent(TOKEN);}
 async function appealFlag(id){
   var msg=prompt('Tell the exam officer why you believe this flag is a mistake (e.g. "the camera identified the wrong person" or "I was not talking"):','');
   if(msg===null)return;
@@ -2142,7 +2366,8 @@ function studentView(w,d){
   var lastSeen=localStorage.getItem(seenKey)||'';
   var unread=notifs.filter(function(n){return String(n.date||'')>lastSeen;}).length;
   window.__seenKey=seenKey; window.__notifMax=(notifs[0]&&notifs[0].date)||'';
-  var segs=[['overview','🏠','Overview',0],['notifications','🔔','Updates',unread],['fees','💳','Fees & Payments',owingCount],['receipts','🧾','Receipts',0],['timetable','🗓','Timetable',ttCount],['liveclasses','🎥','Live Classes',liveCount],['library','📚','Library',0],['results','📑','Results',0],['clearance','✅','Clearance',0],['documents','📂','Documents',0]];
+  var exNow=(d.exams||[]).filter(function(e){return e.window!=='closed' && e.status!=='ended' && (!e.attempt || e.attempt.status==='in_progress');}).length;
+  var segs=[['overview','🏠','Overview',0],['notifications','🔔','Updates',unread],['fees','💳','Fees & Payments',owingCount],['receipts','🧾','Receipts',0],['timetable','🗓','Timetable',ttCount],['liveclasses','🎥','Live Classes',liveCount],['exams','📝','Exams',exNow],['library','📚','Library',0],['results','📑','Results',0],['clearance','✅','Clearance',0],['documents','📂','Documents',0]];
   if(d.misconduct&&d.misconduct.length)segs.push(['discipline','⚖️','Discipline',d.misconduct.length]);
   if((sv.flags&&sv.flags.length)||(sv.attendance&&sv.attendance.length))segs.push(['surveillance','🛡','Exam Conduct',openFlags]);
   segs.push(['profile','👤','Profile',0]);
@@ -2260,6 +2485,33 @@ function studentView(w,d){
     +'<div class="muted" style="font-size:12.5px;margin-bottom:10px">Read e-books and study materials online in the built-in reader, or download them to read offline.</div>'
     +'<style>.lib-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px}.lib-card{display:flex;flex-direction:column;background:#fff;border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:0 3px 12px rgba(15,23,42,.05)}.lib-cover{width:100%;height:150px;object-fit:cover;background:#eef2f8}.lib-cover.noc{display:flex;align-items:center;justify-content:center;font-size:46px;color:#94a3b8}.lib-body{padding:11px 12px;display:flex;flex-direction:column;flex:1}.lib-title{font-weight:800;font-size:14px;line-height:1.25;margin-bottom:2px}</style>'
     +libHtml);
+  // ONLINE EXAMS — scheduled, timed, camera/mic-proctored exams sat on this device (laptop or phone)
+  var examsHtml=(d.exams||[]).length?((d.exams||[]).map(function(e){
+    var a=e.attempt; var st;
+    if(a&&(a.status==='submitted'||a.status==='auto_submitted'||a.status==='graded'))st='submitted';
+    else if(e.window==='closed'||e.status==='ended')st='closed';
+    else if(e.window==='upcoming')st='upcoming';
+    else st='open';
+    var badge=st==='submitted'?'<span class="badge" style="background:#dcfce7;color:#166534">Submitted</span>'
+      :st==='closed'?'<span class="badge" style="background:#e5e7eb;color:#374151">Closed</span>'
+      :st==='upcoming'?'<span class="badge" style="background:#fef3c7;color:#92400e">Upcoming</span>'
+      :(e.live?'<span class="badge" style="background:#dbeafe;color:#1e40af">Open now</span>':'<span class="badge" style="background:#fef3c7;color:#92400e">Waiting for invigilator</span>');
+    var btn='';
+    if(st==='open')btn='<button class="btn" onclick="startExam(\\''+e.id+'\\')">'+((a&&a.status==='in_progress')?'▶ Resume exam':'▶ Start exam')+'</button>';
+    else if(st==='submitted'&&a&&a.status==='graded'&&a.score!=null)btn='<span class="muted">Score: <b>'+a.score+'/'+(a.max_score||e.total_marks||'?')+'</b></span>';
+    else if(st==='submitted')btn='<span class="muted">Awaiting results</span>';
+    else if(st==='upcoming')btn='<span class="muted">Opens '+fmt(e.start_at)+'</span>';
+    return '<div class="panel"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">'
+      +'<div style="min-width:0"><div style="font-weight:800;font-size:15px">'+eh(e.title||e.course_code||'Exam')+'</div>'
+      +'<div class="muted" style="font-size:12px;margin-top:2px">'+badge+' · '+(e.question_count||0)+' question(s) · '+(e.total_marks||0)+' marks · '+(e.duration_min||60)+' min</div></div>'
+      +'<div>'+btn+'</div></div>'
+      +(e.require_camera?'<div class="muted" style="font-size:11.5px;margin-top:6px">🎥 Camera &amp; microphone required — you are monitored live.</div>':'')
+      +'</div>';
+  }).join('')):'<div class="empty">No exams scheduled for you yet. When your department publishes an online exam it will appear here to sit on this device.</div>';
+  html+=seg('exams',
+    '<h2 class="sectitle">📝 Online Exams</h2>'
+    +'<div class="muted" style="font-size:12.5px;margin-bottom:10px">Sit your scheduled exams right here — on a <b>laptop or a phone</b>, no app needed. Exams are timed and <b>proctored with your camera and microphone</b>: allow access when prompted, sit alone in good light, and stay on the page. Leaving the screen is recorded for the invigilator.</div>'
+    +examsHtml);
   // EXAM CONDUCT — the student's exam attendance + any AI malpractice flag, with the actual
   // recorded evidence to download and a one-tap Appeal (transparency: nobody is penalised unseen).
   function svSev(s){var c=s==='high'?'background:#fee2e2;color:#991b1b':s==='medium'?'background:#fef3c7;color:#92400e':'background:#e5e7eb;color:#374151';return '<span class="badge" style="'+c+'">'+cap(s||'low')+'</span>';}
