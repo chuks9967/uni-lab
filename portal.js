@@ -556,6 +556,7 @@ var EX=(function(){
     try{
       stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:'user'},audio:true});
       qs('cam').srcObject=stream;qs('self').srcObject=stream;
+      try{qs('cam').play();}catch(_){}try{qs('self').play();}catch(_){}
       try{audioCtx=new (window.AudioContext||window.webkitAudioContext)();var src=audioCtx.createMediaStreamSource(stream);analyser=audioCtx.createAnalyser();analyser.fftSize=512;src.connect(analyser);}catch(_){}
       qs('camstat').innerHTML='<span class="ok">✓ Camera & microphone ready.</span>';
       qs('cambtn').style.display='none';qs('kycbtn').style.display='';qs('beginbtn').disabled=false;
@@ -564,7 +565,14 @@ var EX=(function(){
       else{qs('camstat').innerHTML='<span class="bad">Camera unavailable — you may continue, but this will be noted.</span>';qs('beginbtn').disabled=false;}
     }
   }
-  function frameJpeg(){try{var v=qs('cam');if(!v||!v.videoWidth)return '';var cv=qs('cv'),w=320,h=Math.round(320*(v.videoHeight/v.videoWidth||0.75));cv.width=w;cv.height=h;var c=cv.getContext('2d');c.drawImage(v,0,0,w,h);return cv.toDataURL('image/jpeg',0.5);}catch(_){return '';}}
+  // a <video> inside a display:none screen stops yielding frames — so always grab from whichever
+  // video is CURRENTLY ON-SCREEN: the #cam preview during pre-flight, the #self PiP during the exam.
+  function vidReady(v){try{if(!v||!v.videoWidth)return false;var r=v.getBoundingClientRect();return r.width>1&&r.height>1;}catch(_){return false;}}
+  function frameJpeg(){try{
+    var v=vidReady(qs('self'))?qs('self'):(vidReady(qs('cam'))?qs('cam'):(qs('self')&&qs('self').videoWidth?qs('self'):qs('cam')));
+    if(!v||!v.videoWidth)return '';
+    var cv=qs('cv'),w=320,h=Math.round(320*(v.videoHeight/v.videoWidth||0.75));cv.width=w;cv.height=h;var c=cv.getContext('2d');c.drawImage(v,0,0,w,h);return cv.toDataURL('image/jpeg',0.5);
+  }catch(_){return '';}}
   function micLevel(){if(!analyser)return 0;var a=new Uint8Array(analyser.fftSize);analyser.getByteTimeDomainData(a);var s=0;for(var i=0;i<a.length;i++){var d=(a[i]-128)/128;s+=d*d;}return Math.min(100,Math.round(Math.sqrt(s/a.length)*300));}
   async function captureKyc(){var img=frameJpeg();if(!img)return alert('Camera not ready yet.');qs('kycbtn').disabled=true;qs('kycbtn').textContent='Sending…';try{await api('/api/exam/frame',{exam_id:EXAM.id,kyc:true,image_base64:img});qs('kycbtn').textContent='✓ Photo captured';}catch(_){qs('kycbtn').disabled=false;qs('kycbtn').textContent='📸 Capture my photo';}}
   function recordClip(){
