@@ -33,6 +33,11 @@ function hashPass(password) {
   const h = crypto.scryptSync(String(password), salt, 32);
   return `s2$${salt.toString('hex')}$${h.toString('hex')}`;
 }
+// minimal RFC 6238 TOTP verify (officer MFA) — mirrors electron/services/totp.js, zero-dep
+const TOTP_B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function totpDecode(s) { s = String(s || '').toUpperCase().replace(/=+$/, '').replace(/\s/g, ''); let bits = ''; for (const c of s) { const v = TOTP_B32.indexOf(c); if (v >= 0) bits += v.toString(2).padStart(5, '0'); } const b = []; for (let i = 0; i + 8 <= bits.length; i += 8) b.push(parseInt(bits.slice(i, i + 8), 2)); return Buffer.from(b); }
+function totpAt(secret, counter) { const buf = Buffer.alloc(8); let c = counter; for (let i = 7; i >= 0; i--) { buf[i] = c & 0xff; c = Math.floor(c / 256); } const h = crypto.createHmac('sha1', totpDecode(secret)).update(buf).digest(); const o = h[h.length - 1] & 0xf; const code = ((h[o] & 0x7f) << 24) | ((h[o + 1] & 0xff) << 16) | ((h[o + 2] & 0xff) << 8) | (h[o + 3] & 0xff); return String(code % 1000000).padStart(6, '0'); }
+function totpVerify(secret, code) { code = String(code || '').replace(/\D/g, ''); if (code.length !== 6 || !secret) return false; const step = Math.floor(Date.now() / 1000 / 30); for (let w = -1; w <= 1; w++) if (totpAt(secret, step + w) === code) return true; return false; }
 function verifyPass(password, stored) {
   try {
     const [tag, saltHex, hashHex] = String(stored || '').split('$');
@@ -493,6 +498,8 @@ video#cam{width:220px;max-width:42vw;border-radius:10px;background:#000;transfor
 .opt{display:block;padding:9px 12px;border:1px solid var(--line);border-radius:9px;margin:6px 0;cursor:pointer}
 .opt.sel{border-color:var(--accent);background:#16224a}
 textarea,input[type=text]{width:100%;background:#0b1220;color:#e7eefc;border:1px solid var(--line);border-radius:9px;padding:10px;font:inherit}
+textarea.code{font-family:'Consolas','Courier New',monospace;font-size:13px;line-height:1.45;tab-size:2;white-space:pre;min-height:220px}
+input[type=file]{color:#e7eefc;font-size:13px}
 .status{font-size:13px;margin:8px 0}.ok{color:#86efac}.bad{color:#fca5a5}
 .sp{display:inline-block;width:16px;height:16px;border:2px solid #fff5;border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite;vertical-align:-3px}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -533,6 +540,7 @@ textarea,input[type=text]{width:100%;background:#0b1220;color:#e7eefc;border:1px
 </div></div></div>
 
 <canvas id="cv" style="display:none"></canvas>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" id="MathJax-script" async></script>
 <script>
 var EXAM=${cfg}, TOKEN=${tk};
 var EX=(function(){
@@ -569,6 +577,19 @@ var EX=(function(){
       mr.start();setTimeout(function(){try{if(mr.state!=='inactive')mr.stop();}catch(_){recBusy=false;}},3500);
     }catch(_){recBusy=false;}
   }
+  // record a ~15s VIDEO evidence clip (uploaded when a proctoring violation fires) so the officer can
+  // attach it to the flag. A fresh recorder per event guarantees a valid standalone webm.
+  var clipBusy=false;
+  function recordEvidenceClip(){
+    if(clipBusy||!stream)return;var vt=stream.getVideoTracks?stream.getVideoTracks():[];if(!vt.length)return;
+    try{
+      var mime=(window.MediaRecorder&&MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus'))?'video/webm;codecs=vp8,opus':'video/webm';
+      var mr=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:400000});var chunks=[];clipBusy=true;
+      mr.ondataavailable=function(ev){if(ev.data&&ev.data.size)chunks.push(ev.data);};
+      mr.onstop=function(){clipBusy=false;if(!chunks.length)return;var b=new Blob(chunks,{type:mime});if(b.size>13000000)return;var rd=new FileReader();rd.onload=function(){api('/api/exam/clip',{exam_id:EXAM.id,video_base64:String(rd.result).replace(/^data:[^;]+;base64,/,''),video_mime:mime}).catch(function(){});};rd.readAsDataURL(b);};
+      mr.start();setTimeout(function(){try{if(mr.state!=='inactive')mr.stop();}catch(_){clipBusy=false;}},15000);
+    }catch(_){clipBusy=false;}
+  }
   // ---- start / waiting room ----
   async function begin(){
     if(EXAM.requireCam&&!stream)return alert('Please enable your camera and microphone first.');
@@ -597,13 +618,25 @@ var EX=(function(){
           if(answers[q.id]===o)el.classList.add('sel');
           el.onclick=function(){answers[q.id]=o;Array.prototype.forEach.call(box.querySelectorAll('.opt'),function(x){x.classList.remove('sel');});el.classList.add('sel');scheduleSave();};
           box.appendChild(el);});
-      }else if(q.type==='short'){
-        var inp=document.createElement('input');inp.type='text';inp.value=answers[q.id]||'';inp.oninput=function(){answers[q.id]=inp.value;scheduleSave();};box.appendChild(inp);
+      }else if(q.type==='short'||q.type==='math'){
+        var inp=document.createElement('input');inp.type='text';inp.value=answers[q.id]||'';if(q.type==='math')inp.placeholder='Your answer (a number or expression)';inp.oninput=function(){answers[q.id]=inp.value;scheduleSave();};box.appendChild(inp);
+      }else if(q.type==='coding'){
+        if(q.language){var lh=document.createElement('div');lh.className='muted';lh.style.fontSize='11px';lh.textContent='Language: '+q.language;box.appendChild(lh);}
+        var ce=document.createElement('textarea');ce.className='code';ce.spellcheck=false;ce.value=answers[q.id]||'';
+        ce.addEventListener('keydown',function(e){if(e.key==='Tab'){e.preventDefault();var s=ce.selectionStart,en=ce.selectionEnd;ce.value=ce.value.slice(0,s)+'  '+ce.value.slice(en);ce.selectionStart=ce.selectionEnd=s+2;answers[q.id]=ce.value;scheduleSave();}});
+        ce.oninput=function(){answers[q.id]=ce.value;scheduleSave();};box.appendChild(ce);
+      }else if(q.type==='diagram'){
+        var hint=document.createElement('div');hint.className='muted';hint.style.fontSize='11px';hint.textContent='Upload or photograph your diagram / working.';
+        var prev=document.createElement('img');prev.style.maxWidth='100%';prev.style.borderRadius='8px';prev.style.margin='6px 0';if(answers[q.id]){prev.src=answers[q.id];}else{prev.style.display='none';}
+        var fi=document.createElement('input');fi.type='file';fi.accept='image/*';fi.capture='environment';
+        fi.onchange=function(){var f=fi.files&&fi.files[0];if(!f)return;var rd=new FileReader();rd.onload=function(){answers[q.id]=String(rd.result);prev.src=answers[q.id];prev.style.display='';scheduleSave();};rd.readAsDataURL(f);};
+        box.appendChild(hint);box.appendChild(fi);box.appendChild(prev);
       }else{
         var ta=document.createElement('textarea');ta.rows=6;ta.value=answers[q.id]||'';ta.oninput=function(){answers[q.id]=ta.value;scheduleSave();};box.appendChild(ta);
       }
       root.appendChild(box);
     });
+    try{if(window.MathJax&&MathJax.typesetPromise)MathJax.typesetPromise([root]).catch(function(){});}catch(_){}  // render any LaTeX in math questions
   }
   function scheduleSave(){if(saveT)return;saveT=setTimeout(function(){saveT=null;saveAnswers();},2500);}
   function saveAnswers(){if(!attemptId)return;api('/api/exam/answer',{attempt_id:attemptId,answers:answers}).catch(function(){});}
@@ -623,7 +656,7 @@ var EX=(function(){
   }
   // ---- integrity (warn + log; never auto-kick) ----
   function flash(m){var b=qs('banner');b.textContent=m;b.style.display='block';clearTimeout(b._t);b._t=setTimeout(function(){b.style.display='none';},6000);}
-  function reportEvent(type){away++;api('/api/exam/event',{exam_id:EXAM.id,type:type||'left_app'}).catch(function(){});flash('⚠ Leaving the exam screen is recorded and shown to the invigilator. Stay on this page. ('+away+')');}
+  function reportEvent(type){away++;api('/api/exam/event',{exam_id:EXAM.id,type:type||'left_app'}).catch(function(){});recordEvidenceClip();flash('⚠ Leaving the exam screen is recorded and shown to the invigilator. Stay on this page. ('+away+')');}
   function enterFs(){try{var el=document.documentElement;if(el.requestFullscreen)el.requestFullscreen().catch(function(){});}catch(_){}}
   function bindIntegrity(){
     document.addEventListener('visibilitychange',function(){if(document.hidden&&started)reportEvent('left_app');});
@@ -1562,6 +1595,11 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const body = await readBody();
       const acc = findAccount(body.login);
       if (!acc || !verifyPass(body.password, passField(acc.kind, acc.row))) return J(res, 200, { ok: false, error: 'Invalid login or password. (Officers: sign in to the desktop app once to activate your portal access.)' });
+      // officer MFA: a 6-digit authenticator code is required after the password when enrolled
+      if (acc.kind === 'user' && acc.row.mfa_enabled) {
+        if (!body.code) return J(res, 200, { ok: false, mfaRequired: true, error: 'Enter the 6-digit code from your authenticator app.' });
+        if (!totpVerify(acc.row.mfa_secret, body.code)) return J(res, 200, { ok: false, mfaRequired: true, error: 'Incorrect authenticator code — try again.' });
+      }
       const token = sign({ k: acc.kind, id: acc.row.id, role: acc.role, exp: Date.now() + 1000 * 60 * 60 * 12 });
       const name = (acc.kind === 'student') ? `${acc.row.first_name || ''} ${acc.row.last_name || ''}`.trim()
         : (acc.kind === 'parent') ? (acc.row.parent_name || 'Parent/Guardian') : acc.row.full_name;
@@ -1818,7 +1856,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const winEnd = e.end_at ? Date.parse(e.end_at) : durEnd;
       const endsAt = new Date(Math.min(durEnd, winEnd)).toISOString();
       let qs = all('exam_questions').filter(q => !q.deleted && q.exam_id === e.id)
-        .map(q => ({ id: q.id, seq: q.seq, type: q.type, text: q.text, options: (function () { try { return JSON.parse(q.options || '[]'); } catch (_) { return []; } })(), marks: q.marks, image: q.image || null }));
+        .map(q => ({ id: q.id, seq: q.seq, type: q.type, text: q.text, options: (function () { try { return JSON.parse(q.options || '[]'); } catch (_) { return []; } })(), marks: q.marks, image: q.image || null, language: q.language || null }));
       if (e.shuffle !== 0) qs = seededShuffle(e.id + ':' + t.id, qs);
       let answers = {}; try { answers = JSON.parse(at.answers || '{}'); } catch (_) {}
       return J(res, 200, { ok: true, attempt_id: at.id, endsAt, duration_min: e.duration_min || 60, room: 'exam-' + e.id, exam: { id: e.id, title: e.title || e.course_code, instructions: e.instructions || '', require_camera: e.require_camera !== 0 }, answers, questions: qs });
@@ -1861,6 +1899,18 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       // near-real-time monitoring — without a second camera consumer (avoids getUserMedia contention).
       return J(res, 200, { ok: true, live_requested: !!(at && at.live_requested), live: !!(at && at.live_requested), room: 'exam-' + examId });
     }
+    // Student: upload a short (~15s) VIDEO evidence clip when a proctoring event fires — the officer
+    // monitor attaches it to the flag. Transient in-memory (never synced); the flag's evidence is.
+    if (p === '/api/exam/clip' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
+      const body = await readBody(); const examId = String(body.exam_id || ''); if (!examId) return J(res, 400, { ok: false });
+      const clip = String(body.video_base64 || '').replace(/^data:[^;]+;base64,/, '');
+      if (clip && clip.length < 14 * 1024 * 1024) {
+        examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][t.id] || { ring: [], away: 0 };
+        cur.clip = clip; cur.clipMime = String(body.video_mime || 'video/webm'); cur.clipTs = Date.now(); examFrames[examId][t.id] = cur;
+      }
+      return J(res, 200, { ok: true });
+    }
     // Student: report a proctoring EVENT (left the app / lost focus). Counted for the officer/AI.
     if (p === '/api/exam/event' && method === 'POST') {
       const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
@@ -1887,7 +1937,11 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
         return { student_id: sid, name: `${st.first_name || ''} ${st.last_name || ''}`.trim(), matric: st.matric_no || '', status: a.status || 'not_started', score: a.score,
           live_requested: !!a.live_requested, identity: a.identity_verified || (f && f.kyc ? 'pending' : 'none'),
           hasFrame: !!(f && f.jpeg), hasKyc: !!(f && f.kyc), away: f ? (f.away || 0) : 0, audioLevel: f ? f.audioLevel : 0,
-          hasAudio: !!(f && f.audio), audioTs: f ? (f.audioTs || 0) : 0, lastSeen: f ? f.ts : 0, online: !!(f && now - f.ts < 8000) };
+          hasAudio: !!(f && f.audio), audioTs: f ? (f.audioTs || 0) : 0,
+          hasClip: !!(f && f.clip), clipTs: f ? (f.clipTs || 0) : 0,
+          risk: (f && f.risk != null) ? f.risk : (a.risk_score != null ? a.risk_score : null),
+          riskLevel: (f && f.riskLevel) || a.risk_level || null,
+          lastSeen: f ? f.ts : 0, online: !!(f && now - f.ts < 8000) };
       }).sort((x, y) => (y.online - x.online) || String(x.name).localeCompare(String(y.name)));
       const onlineN = rows.filter(r => r.online).length;
       return J(res, 200, { ok: true, room: 'exam-' + examId, status: e.status, students: rows, onlineCount: onlineN, frameCount: rows.filter(r => r.hasFrame).length });
@@ -1908,6 +1962,26 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const f = (examFrames[examId] || {})[sid];
       if (!f || !f.audio) return H(res, 404, '<p>No audio.</p>');
       res.writeHead(200, { 'Content-Type': f.audioMime || 'audio/webm', 'Cache-Control': 'no-store' }); res.end(Buffer.from(f.audio, 'base64')); return true;
+    }
+    // Officer: the student's latest ~15s video evidence clip (to attach to a flag).
+    if (method === 'GET' && p === '/api/exam/clip') {
+      const t = isExamOfficer(req, u); if (!t) return H(res, 401, '<p>Unauthorized.</p>');
+      const examId = u.searchParams.get('exam_id') || ''; const sid = u.searchParams.get('student_id') || '';
+      const f = (examFrames[examId] || {})[sid];
+      if (!f || !f.clip) return H(res, 404, '<p>No clip.</p>');
+      res.writeHead(200, { 'Content-Type': f.clipMime || 'video/webm', 'Cache-Control': 'no-store' }); res.end(Buffer.from(f.clip, 'base64')); return true;
+    }
+    // Officer: push a live AI-proctoring RISK score (0–100) for a student → roster + synced attempt.
+    if (p === '/api/exam/risk' && method === 'POST') {
+      const t = isExamOfficer(req, u); if (!t) return J(res, 401, { ok: false });
+      const body = await readBody(); const examId = String(body.exam_id || ''); const sid = String(body.student_id || '');
+      const score = Math.max(0, Math.min(100, Math.round(Number(body.score) || 0)));
+      const level = body.level || (score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low');
+      examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][sid] || { ring: [], away: 0 };
+      cur.risk = score; cur.riskLevel = level; examFrames[examId][sid] = cur;
+      const at = all('exam_attempts').find(a => !a.deleted && a.exam_id === examId && a.student_id === sid);
+      if (at && typeof update === 'function') update('exam_attempts', at.id, { risk_score: score, risk_level: level });  // syncs back to the desktop
+      return J(res, 200, { ok: true });
     }
     // Officer/desktop: record the KYC identity-match result (verified | rejected) for a student's attempt.
     if (p === '/api/exam/identity' && method === 'POST') {
