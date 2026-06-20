@@ -28,7 +28,7 @@ catch (e) { console.error('[UniBursar] portal.js not loaded (' + e.message + ') 
 let fcm = null;
 try { fcm = require('./fcm'); } catch (_) { fcm = null; }
 
-const BUILD = 'portal-20'; // bump when server changes — visible at /health to confirm the live code
+const BUILD = 'portal-21'; // bump when server changes — visible at /health to confirm the live code
 const PORT = process.env.PORT || 4000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const SYNC_TOKEN = process.env.SYNC_TOKEN || ''; // optional shared secret

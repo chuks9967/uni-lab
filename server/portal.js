@@ -11,6 +11,8 @@
  * Pure Node — no dependencies. Mounted by server.js via createPortal().
  */
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 // pure-Node QR encoder (no npm deps — keeps the hub zero-dependency). Used to print a
 // SCANNABLE verification QR on portal receipts & payslips.
 let qrcode = null; try { qrcode = require('./qrcode'); } catch (_) { qrcode = null; }
@@ -71,6 +73,55 @@ module.exports = function createPortal(deps) {
   // examFrames[examId][studentId] = { jpeg(base64), audioLevel, ts, ring:[base64,…] }
   const examFrames = {};
   const lastFrameTs = {};                         // per-student rate-limit
+
+  // ---- Face Biometric (pure-maths 1:1 / identity-hold; mirrors electron/services/face.js) ----
+  // The 128-D descriptors are computed in the student's browser (face-api.js, served below from
+  // server/face/) and POSTed here; matching is Euclidean distance, so it runs with zero deps and
+  // works identically on the cloud hub, the LAN desktop-hosted portal, and the APK WebView.
+  const FACE = {
+    verifyThreshold: 0.50,   // 1:1 check-in — distance ≤ this ⇒ same person (strict, low false-accept)
+    examThreshold: 0.56,     // continuous identity-hold during the exam (a touch looser to avoid nuisance flags)
+    misses: 3,               // consecutive failed live checks before an impersonation flag is raised
+  };
+  function faceDist(a, b) { let s = 0; const n = Math.min(a.length, b.length); for (let i = 0; i < n; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
+  function faceConfidence(dist) { if (!isFinite(dist)) return 0; const c = 1 - (dist / 0.62); return Math.max(0, Math.min(1, Math.round(c * 100) / 100)); }
+  // The student's enrolled descriptor set (array of 128-float arrays), or [] if not enrolled.
+  function faceTemplateFor(studentId) {
+    const rows = all('face_templates').filter(r => !r.deleted && r.student_id === studentId);
+    rows.sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+    const r = rows[0]; if (!r) return { enrolled: false, descriptors: [], row: null };
+    let d = []; try { d = JSON.parse(r.descriptors || '[]'); } catch (_) { d = []; }
+    d = (Array.isArray(d) ? d : []).filter(v => Array.isArray(v) && v.length >= 64);
+    return { enrolled: d.length > 0, descriptors: d, row: r };
+  }
+  // Best (smallest) distance from any probe descriptor to any enrolled sample.
+  function faceBest(probes, descriptors) {
+    let best = Infinity;
+    for (const p of (probes || [])) { if (!Array.isArray(p)) continue; for (const d of descriptors) { const dist = faceDist(p, d); if (dist < best) best = dist; } }
+    return best;
+  }
+  // 1:N — rank the whole student body against a probe (used by the officer's "verify check-in" tool).
+  function faceRank(probes, opts = {}) {
+    const out = [];
+    for (const r of all('face_templates')) {
+      if (r.deleted) continue;
+      let d = []; try { d = JSON.parse(r.descriptors || '[]'); } catch (_) { d = []; }
+      d = (Array.isArray(d) ? d : []).filter(v => Array.isArray(v) && v.length >= 64);
+      if (!d.length) continue;
+      const dist = faceBest(probes, d);
+      if (!isFinite(dist)) continue;
+      out.push({ student_id: r.student_id, distance: Math.round(dist * 1000) / 1000, confidence: faceConfidence(dist) });
+    }
+    out.sort((a, b) => a.distance - b.distance);
+    return out.slice(0, opts.topK || 5);
+  }
+  const faceMiss = {};                            // examId:studentId → consecutive live-check miss count
+
+  // Serve the vendored face-api.js engine + ResNet model weights (offline; no CDN) so the
+  // student's browser can compute descriptors. Resolves from the bundled server/face/ dir,
+  // falling back to the repo's src/vendor + assets/models when running unpacked.
+  const faceRoots = [path.join(__dirname, 'face'), path.join(__dirname, '..', 'src', 'vendor', 'faceapi'), path.join(__dirname, '..', 'assets')];
+  function faceFile(rel) { for (const root of faceRoots) { const fp = path.join(root, rel); try { if (fs.existsSync(fp)) return fp; } catch (_) {} } return null; }
   function winState(now, start, end) { const n = now || Date.now(); const s = start ? Date.parse(start) : null, e = end ? Date.parse(end) : null; if (s && n < s) return 'upcoming'; if (e && n > e) return 'closed'; return 'open'; }
   function seededShuffle(seed, arr) { const a = (arr || []).slice(); let s = 0; const str = String(seed || ''); for (let i = 0; i < str.length; i++) s = (s * 31 + str.charCodeAt(i)) >>> 0; s = s || 1; const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
   // the public base URL of THIS request (https://host) — used to print absolute,
@@ -471,8 +522,9 @@ ${head}
    *  drives the camera/mic, KYC selfie, server-timed countdown, questions, autosave, integrity lockdown
    *  (warn+log) and the proctor upload loop, all against the existing /api/exam/* endpoints. Served like
    *  the pdf reader / class page so it owns the whole tab (no SPA contention). */
-  function examTakeHTML(e, token) {
-    const cfg = JSON.stringify({ id: e.id, title: e.title || e.course_code || 'Exam', instructions: e.instructions || '', requireCam: e.require_camera !== 0 });
+  function examTakeHTML(e, token, s) {
+    const faceEnrolled = s ? faceTemplateFor(s.id).enrolled : false;
+    const cfg = JSON.stringify({ id: e.id, title: e.title || e.course_code || 'Exam', instructions: e.instructions || '', requireCam: e.require_camera !== 0, faceEnrolled });
     const tk = JSON.stringify(token || '');
     const title = esc(e.title || e.course_code || 'Exam');
     return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>${title}</title>
@@ -503,6 +555,41 @@ input[type=file]{color:#e7eefc;font-size:13px}
 .status{font-size:13px;margin:8px 0}.ok{color:#86efac}.bad{color:#fca5a5}
 .sp{display:inline-block;width:16px;height:16px;border:2px solid #fff5;border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite;vertical-align:-3px}
 @keyframes spin{to{transform:rotate(360deg)}}
+/* ---- advanced CBT shell ---- */
+body{font-size:var(--fs,15px)}
+body.hc{--bg:#000;--card:#0a0a0a;--line:#555}body.hc{color:#fff}
+#bar{flex-wrap:wrap;gap:8px}
+.chip{font-size:12px;font-weight:700;background:#0b1220;border:1px solid var(--line);padding:5px 9px;border-radius:8px}
+.chip.ok{color:#86efac}.chip.warn{color:#fcd34d}
+.dot{width:12px;height:12px;border-radius:50%;background:#22c55e;display:inline-block}
+button.icon{padding:6px 9px;background:#22304f;font-size:13px;font-weight:700}
+#examwrap{display:flex;gap:14px;max-width:1180px;margin:0 auto;padding:14px;align-items:flex-start}
+#main{flex:1;min-width:0}#qcard{margin:0}
+.qhead{display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:10px}
+.qnum{font-weight:800;font-size:15px}.qmeta{color:#9fb2d6;font-size:12px}
+.qt{font-size:16px;line-height:1.55;margin-bottom:10px}
+.qfig{max-width:100%;max-height:340px;border-radius:8px;margin:6px 0;cursor:zoom-in;border:1px solid var(--line)}
+.opt:focus,button:focus,input:focus,textarea:focus,.pcell:focus{outline:2px solid #60a5fa;outline-offset:1px}
+#actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;position:sticky;bottom:0;background:var(--bg);padding:10px 0}
+button.warnbtn{background:#7c3aed;margin-left:auto}
+#palette{width:280px;flex-shrink:0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px;position:sticky;top:64px}
+.pcounts{font-size:12px;color:#9fb2d6;margin-bottom:8px;line-height:1.6}
+.pgrid{display:grid;grid-template-columns:repeat(6,1fr);gap:6px;max-height:46vh;overflow:auto}
+.pcell{aspect-ratio:1;min-height:34px;display:flex;align-items:center;justify-content:center;border-radius:8px;font-weight:800;font-size:13px;cursor:pointer;border:2px solid transparent;background:#475569;color:#fff;position:relative}
+.pcell.ans{background:#16a34a}.pcell.noans{background:#dc2626}.pcell.mark,.pcell.ansmark{background:#7c3aed}.pcell.ansmark:after{content:"✓";position:absolute;top:-5px;right:2px;font-size:10px;color:#bbf7d0}.pcell.cur{border-color:#fbbf24}
+.plegend{margin-top:10px;font-size:11px;color:#9fb2d6;display:grid;gap:3px}
+.plegend i{width:11px;height:11px;border-radius:3px;display:inline-block;margin-right:5px;vertical-align:-1px}
+.overlay{position:fixed;inset:0;background:rgba(2,6,23,.93);z-index:60;overflow:auto;padding:24px}
+.overlay .rcard{max-width:680px;margin:0 auto;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+.rrow{display:inline-block;min-width:40px;height:40px;line-height:40px;text-align:center;border-radius:8px;font-weight:800;margin:4px;cursor:pointer;color:#fff;padding:0 6px}
+#zoom{position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:70;display:none;align-items:center;justify-content:center;cursor:zoom-out}#zoom img{max-width:96vw;max-height:96vh;border-radius:8px}
+.calc{background:#0b1220;border:1px solid var(--line);border-radius:10px;padding:8px;margin-top:10px;max-width:300px}
+.calc .disp{width:100%;background:#000;color:#7CFC00;font-family:monospace;font-size:16px;text-align:right;padding:7px;border-radius:6px;border:1px solid var(--line);margin-bottom:6px;min-height:32px;overflow:auto}
+.calc .keys{display:grid;grid-template-columns:repeat(5,1fr);gap:4px}.calc button{padding:9px 0;font-size:13px;background:#22304f}
+.mprev{margin-top:6px;min-height:22px;color:#cbd5e1;font-size:15px}
+.CodeMirror{height:auto;min-height:240px;border:1px solid var(--line);border-radius:9px;font-size:13.5px}
+@media(max-width:820px){#palette{position:fixed;top:0;right:0;bottom:0;width:80%;max-width:320px;z-index:50;transform:translateX(106%);transition:transform .25s;border-radius:0;overflow:auto}#palette.open{transform:none;box-shadow:-8px 0 30px rgba(0,0,0,.55)}#examwrap{padding:10px}.pgrid{grid-template-columns:repeat(8,1fr);max-height:60vh}}
+@media(min-width:821px){#paltoggle{display:none}}
 </style></head><body>
 <div id="err" class="scr"><div class="wrap"><div class="card"><h1>⚠ Problem</h1><p id="errmsg" class="muted"></p><a href="/"><button class="sec">⤺ Back to portal</button></a></div></div></div>
 
@@ -525,12 +612,43 @@ input[type=file]{color:#e7eefc;font-size:13px}
 </div></div></div>
 
 <div id="exam" class="scr">
-  <div id="bar"><span class="t">📝 ${title}</span><span id="livebadge" class="live" style="display:none">🔴 LIVE — invigilator watching</span><span id="clock">--:--</span></div>
-  <div id="banner"></div>
-  <div class="wrap"><div id="qs"></div>
-    <div class="card" style="text-align:center"><button id="submitbtn" onclick="EX.submit(false)">✅ Submit exam</button>
-      <div class="muted" style="margin-top:8px">Answers save automatically as you go.</div></div>
+  <div id="bar">
+    <button id="paltoggle" class="icon" onclick="EX.togglePalette()" aria-label="Question navigator">☰ Questions</button>
+    <span class="t">📝 ${title}</span>
+    <span id="prog" class="chip" title="Answered">0/0</span>
+    <span id="conn" class="dot" title="Connection"></span>
+    <span id="saved" class="chip">—</span>
+    <button class="icon" onclick="EX.fs(-1)" aria-label="Smaller text">A−</button>
+    <button class="icon" onclick="EX.fs(1)" aria-label="Larger text">A+</button>
+    <button class="icon" onclick="EX.contrast()" aria-label="High contrast">◐</button>
+    <span id="livebadge" class="live" style="display:none">🔴 LIVE</span>
+    <span id="clock">--:--</span>
   </div>
+  <div id="banner"></div>
+  <div id="examwrap">
+    <div id="main">
+      <div id="qcard" class="card" aria-live="polite"></div>
+      <div id="actions">
+        <button class="sec" onclick="EX.prev()">‹ Previous</button>
+        <button class="sec" onclick="EX.clearResp()">Clear response</button>
+        <button class="sec" onclick="EX.markNext()">🚩 Mark for review &amp; Next</button>
+        <button onclick="EX.saveNext()">Save &amp; Next ›</button>
+        <button class="warnbtn" onclick="EX.openReview()">Review &amp; Submit</button>
+      </div>
+    </div>
+    <aside id="palette" aria-label="Question palette">
+      <div class="pcounts" id="pcounts"></div>
+      <div class="pgrid" id="pgrid"></div>
+      <div class="plegend">
+        <div><i style="background:#16a34a"></i>Answered</div>
+        <div><i style="background:#dc2626"></i>Not answered</div>
+        <div><i style="background:#7c3aed"></i>Marked for review</div>
+        <div><i style="background:#475569"></i>Not visited</div>
+      </div>
+    </aside>
+  </div>
+  <div id="review" class="overlay" style="display:none"></div>
+  <div id="zoom" onclick="this.style.display='none'"><img alt="figure"></div>
   <video id="self" class="selfie" autoplay muted playsinline></video>
 </div>
 
@@ -540,30 +658,79 @@ input[type=file]{color:#e7eefc;font-size:13px}
 </div></div></div>
 
 <canvas id="cv" style="display:none"></canvas>
+${faceEnrolled ? '<script defer src="/vendor/face-api.min.js"></script>' : ''}
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" id="MathJax-script" async></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/clike/clike.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/sql/sql.min.js"></script>
 <script>
 var EXAM=${cfg}, TOKEN=${tk};
 var EX=(function(){
   var stream=null, attemptId=null, endsAt=0, questions=[], answers={}, away=0, live=false;
   var proctorT=null, clockT=null, saveT=null, audioCtx=null, analyser=null, pendingAudio=null, recBusy=false, started=false;
+  var cur=0, marked={}, visited={}, editors={};   // CBT navigation state (current index, flagged, visited, code editors)
   function qs(id){return document.getElementById(id);}
-  function show(id){['pre','wait','exam','done','err'].forEach(function(s){qs(s).classList.toggle('on',s===id);});}
+  function show(id){['pre','wait','exam','done','err'].forEach(function(s){qs(s).classList.toggle('on',s===id);});var rv=qs('review');if(rv&&id!=='exam')rv.style.display='none';}
   function fail(m){qs('errmsg').textContent=m||'Something went wrong.';show('err');stopAll();}
   function api(path,body){var o={method:body?'POST':'GET',headers:{'Content-Type':'application/json'}};if(TOKEN)o.headers.Authorization='Bearer '+TOKEN;if(body)o.body=JSON.stringify(body);return fetch(path,o).then(function(r){return r.json();});}
+  // ---- face biometric (offline face-api.js → 128-D descriptor; matched 1:1 on the server) ----
+  var FACE={loaded:false,loading:null,ok:(typeof EXAM!=='undefined'&&EXAM.faceEnrolled)};
+  function faceLoad(){
+    if(FACE.loaded)return Promise.resolve(true);
+    if(FACE.loading)return FACE.loading;
+    if(typeof faceapi==='undefined')return Promise.resolve(false);
+    FACE.loading=(async function(){
+      try{
+        try{if(faceapi.tf&&faceapi.tf.setBackend){await faceapi.tf.setBackend('webgl');await faceapi.tf.ready();}}catch(_){}
+        await faceapi.nets.tinyFaceDetector.loadFromUri('/face-models');
+        await faceapi.nets.faceLandmark68Net.loadFromUri('/face-models');
+        await faceapi.nets.faceRecognitionNet.loadFromUri('/face-models');
+        FACE.loaded=true;return true;
+      }catch(e){FACE.loading=null;return false;}
+    })();
+    return FACE.loading;
+  }
+  // compute up to n descriptors from the live, on-screen video (a few frames → robustness to a bad frame)
+  async function faceDescriptors(n){
+    if(!await faceLoad())return [];
+    var v=vidReady(qs('self'))?qs('self'):(vidReady(qs('cam'))?qs('cam'):qs('cam'));
+    if(!v||!v.videoWidth)return [];
+    var opts=new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:0.4});var out=[];
+    for(var i=0;i<(n||1);i++){
+      try{var det=await faceapi.detectSingleFace(v,opts).withFaceLandmarks().withFaceDescriptor();
+        if(det&&det.descriptor)out.push(Array.from(det.descriptor));}catch(_){}
+      if(i<(n||1)-1)await new Promise(function(r){setTimeout(r,250);});
+    }
+    return out;
+  }
   // ---- camera / mic ----
+  // Play a <video> once its metadata is ready; muted-as-a-property (set in startCam) keeps autoplay from
+  // being blocked (the usual cause of a black preview). Never rejects.
+  function camPlay(v){return new Promise(function(res){if(!v){res();return;}var done=false;var go=function(){if(done)return;done=true;try{var p=v.play();if(p&&p.catch)p.catch(function(){});}catch(_){}res();};if(v.readyState>=1)go();else v.onloadedmetadata=go;setTimeout(go,1500);});}
+  function camErr(e){var n=(e&&(e.name||e.message))||'';if(/NotAllowed|Permission|Security/i.test(n))return 'Please allow camera access in your browser and reload.';if(/NotFound|not found/i.test(n))return 'No camera was found on this device.';if(/NotReadable|in use|TrackStart/i.test(n))return 'The camera is busy in another app — close it and reload.';return 'Please allow access and reload.';}
   async function startCam(){
     qs('camstat').textContent='Requesting camera & microphone…';
-    try{
-      stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:'user'},audio:true});
-      qs('cam').srcObject=stream;qs('self').srcObject=stream;
-      try{qs('cam').play();}catch(_){}try{qs('self').play();}catch(_){}
-      try{audioCtx=new (window.AudioContext||window.webkitAudioContext)();var src=audioCtx.createMediaStreamSource(stream);analyser=audioCtx.createAnalyser();analyser.fftSize=512;src.connect(analyser);}catch(_){}
-      qs('camstat').innerHTML='<span class="ok">✓ Camera & microphone ready.</span>';
-      qs('cambtn').style.display='none';qs('kycbtn').style.display='';qs('beginbtn').disabled=false;
-    }catch(e){
-      if(EXAM.requireCam){qs('camstat').innerHTML='<span class="bad">✗ This exam requires a working camera & microphone. Please allow access and reload.</span>';qs('beginbtn').disabled=true;}
-      else{qs('camstat').innerHTML='<span class="bad">Camera unavailable — you may continue, but this will be noted.</span>';qs('beginbtn').disabled=false;}
+    var c=qs('cam'),s=qs('self');
+    // muted/playsInline as PROPERTIES so the preview autoplays instead of showing a black frame
+    [c,s].forEach(function(el){if(el){el.muted=true;el.playsInline=true;el.setAttribute('muted','');el.setAttribute('playsinline','');}});
+    // soft front-camera hint (won't hard-fail a desktop webcam) + a video-only fallback if the mic is blocked
+    var tries=[{video:{facingMode:{ideal:'user'},width:{ideal:640},height:{ideal:480}},audio:true},{video:true,audio:true},{video:{facingMode:{ideal:'user'}},audio:false},{video:true,audio:false}];
+    var err=null,gotAudio=false;stream=null;
+    for(var i=0;i<tries.length;i++){try{stream=await navigator.mediaDevices.getUserMedia(tries[i]);gotAudio=(tries[i].audio===true)&&stream.getAudioTracks().length>0;break;}catch(e){err=e;}}
+    if(!stream){
+      if(EXAM.requireCam){qs('camstat').innerHTML='<span class="bad">✗ This exam requires a working camera & microphone. '+camErr(err)+'</span>';qs('beginbtn').disabled=true;}
+      else{qs('camstat').innerHTML='<span class="bad">Camera unavailable — you may continue, but this will be noted. ('+camErr(err)+')</span>';qs('beginbtn').disabled=false;}
+      return;
     }
+    if(c)c.srcObject=stream;if(s)s.srcObject=stream;
+    await camPlay(c);await camPlay(s);
+    if(gotAudio){try{audioCtx=new (window.AudioContext||window.webkitAudioContext)();var src=audioCtx.createMediaStreamSource(stream);analyser=audioCtx.createAnalyser();analyser.fftSize=512;src.connect(analyser);}catch(_){}}
+    qs('camstat').innerHTML='<span class="ok">✓ Camera'+(gotAudio?' & microphone':'')+' ready.</span>'+(gotAudio?'':' <span class="muted">(microphone unavailable — audio monitoring is off)</span>');
+    qs('cambtn').style.display='none';qs('kycbtn').style.display='';qs('beginbtn').disabled=false;
+    if(FACE.ok){faceLoad();qs('camstat').innerHTML+=' <span class="muted">Face verification is enabled for this exam.</span>';}
   }
   // a <video> inside a display:none screen stops yielding frames — so always grab from whichever
   // video is CURRENTLY ON-SCREEN: the #cam preview during pre-flight, the #self PiP during the exam.
@@ -574,7 +741,22 @@ var EX=(function(){
     var cv=qs('cv'),w=320,h=Math.round(320*(v.videoHeight/v.videoWidth||0.75));cv.width=w;cv.height=h;var c=cv.getContext('2d');c.drawImage(v,0,0,w,h);return cv.toDataURL('image/jpeg',0.5);
   }catch(_){return '';}}
   function micLevel(){if(!analyser)return 0;var a=new Uint8Array(analyser.fftSize);analyser.getByteTimeDomainData(a);var s=0;for(var i=0;i<a.length;i++){var d=(a[i]-128)/128;s+=d*d;}return Math.min(100,Math.round(Math.sqrt(s/a.length)*300));}
-  async function captureKyc(){var img=frameJpeg();if(!img)return alert('Camera not ready yet.');qs('kycbtn').disabled=true;qs('kycbtn').textContent='Sending…';try{await api('/api/exam/frame',{exam_id:EXAM.id,kyc:true,image_base64:img});qs('kycbtn').textContent='✓ Photo captured';}catch(_){qs('kycbtn').disabled=false;qs('kycbtn').textContent='📸 Capture my photo';}}
+  async function captureKyc(){
+    var img=frameJpeg();if(!img)return alert('Camera not ready yet.');
+    qs('kycbtn').disabled=true;qs('kycbtn').textContent='Sending…';
+    try{await api('/api/exam/frame',{exam_id:EXAM.id,kyc:true,image_base64:img});}catch(_){qs('kycbtn').disabled=false;qs('kycbtn').textContent='📸 Capture my photo';return;}
+    if(!FACE.ok){qs('kycbtn').textContent='✓ Photo captured';return;}
+    // face-enrolled: verify this is really them (1:1) before they may begin
+    qs('kycbtn').textContent='🔍 Verifying your face…';
+    try{
+      var descs=await faceDescriptors(3);
+      if(!descs.length){qs('camstat').innerHTML='<span class="bad">✗ We could not see your face clearly. Face the camera in good light and tap again.</span>';qs('kycbtn').disabled=false;qs('kycbtn').textContent='📸 Try again';return;}
+      var r=await api('/api/exam/face-verify',{exam_id:EXAM.id,descriptors:descs});
+      if(r&&r.enrolled===false){qs('kycbtn').textContent='✓ Photo captured';return;}
+      if(r&&r.match){FACE.verified=true;var pct=Math.round((r.confidence||0)*100);qs('camstat').innerHTML='<span class="ok">✓ Identity verified by face ('+pct+'% match). You may begin.</span>';qs('kycbtn').textContent='✓ Face verified';}
+      else{FACE.verified=false;qs('camstat').innerHTML='<span class="bad">✗ Your face does not match our records. You may continue, but the invigilator has been alerted to review you live.</span>';qs('kycbtn').disabled=false;qs('kycbtn').textContent='📸 Re-verify';}
+    }catch(_){qs('kycbtn').textContent='✓ Photo captured';}
+  }
   function recordClip(){
     if(recBusy||!stream)return;var at=stream.getAudioTracks?stream.getAudioTracks():[];if(!at.length)return;
     try{
@@ -609,45 +791,135 @@ var EX=(function(){
     }catch(e){qs('beginbtn').disabled=false;qs('prestat').textContent='';fail('Could not reach the server. Check your connection.');}
   }
   function initExam(r){
-    started=true;attemptId=r.attempt_id;endsAt=Date.parse(r.endsAt||'')||0;answers=r.answers||{};questions=r.questions||[];
-    renderQuestions();show('exam');enterFs();startClock();startProctor();bindIntegrity();
+    started=true;attemptId=r.attempt_id;endsAt=Date.parse(r.endsAt||'')||0;questions=r.questions||[];
+    var local=loadLocal();answers=Object.assign({},r.answers||{},(local&&local.a)||{});marked=(local&&local.m)||{};cur=0;   // prefer the device's latest (resilient to a dropped connection)
+    restoreA11y();setConn();renderQuestion();show('exam');enterFs();startClock();startProctor();bindIntegrity();saveAnswers();
+    window.addEventListener('online',function(){setConn();saveAnswers();});window.addEventListener('offline',setConn);
+    document.addEventListener('keydown',navKeys);
   }
-  // ---- questions ----
-  function renderQuestions(){
-    var root=qs('qs');root.innerHTML='';
-    questions.forEach(function(q,i){
-      var box=document.createElement('div');box.className='q';
-      var html='<div class="qt">'+(i+1)+'. '+esc(q.text||'')+' <span class="muted">('+(q.marks||1)+' mark'+((q.marks||1)>1?'s':'')+')</span></div>';
-      if(q.image)html+='<img src="'+q.image+'">';
-      box.innerHTML=html;
-      if(q.type==='mcq'||q.type==='truefalse'){
-        var opts=q.type==='truefalse'?['True','False']:(q.options||[]);
-        opts.forEach(function(o){var el=document.createElement('label');el.className='opt';el.textContent=o;
-          if(answers[q.id]===o)el.classList.add('sel');
-          el.onclick=function(){answers[q.id]=o;Array.prototype.forEach.call(box.querySelectorAll('.opt'),function(x){x.classList.remove('sel');});el.classList.add('sel');scheduleSave();};
-          box.appendChild(el);});
-      }else if(q.type==='short'||q.type==='math'){
-        var inp=document.createElement('input');inp.type='text';inp.value=answers[q.id]||'';if(q.type==='math')inp.placeholder='Your answer (a number or expression)';inp.oninput=function(){answers[q.id]=inp.value;scheduleSave();};box.appendChild(inp);
-      }else if(q.type==='coding'){
-        if(q.language){var lh=document.createElement('div');lh.className='muted';lh.style.fontSize='11px';lh.textContent='Language: '+q.language;box.appendChild(lh);}
-        var ce=document.createElement('textarea');ce.className='code';ce.spellcheck=false;ce.value=answers[q.id]||'';
-        ce.addEventListener('keydown',function(e){if(e.key==='Tab'){e.preventDefault();var s=ce.selectionStart,en=ce.selectionEnd;ce.value=ce.value.slice(0,s)+'  '+ce.value.slice(en);ce.selectionStart=ce.selectionEnd=s+2;answers[q.id]=ce.value;scheduleSave();}});
-        ce.oninput=function(){answers[q.id]=ce.value;scheduleSave();};box.appendChild(ce);
-      }else if(q.type==='diagram'){
-        var hint=document.createElement('div');hint.className='muted';hint.style.fontSize='11px';hint.textContent='Upload or photograph your diagram / working.';
-        var prev=document.createElement('img');prev.style.maxWidth='100%';prev.style.borderRadius='8px';prev.style.margin='6px 0';if(answers[q.id]){prev.src=answers[q.id];}else{prev.style.display='none';}
-        var fi=document.createElement('input');fi.type='file';fi.accept='image/*';fi.capture='environment';
-        fi.onchange=function(){var f=fi.files&&fi.files[0];if(!f)return;var rd=new FileReader();rd.onload=function(){answers[q.id]=String(rd.result);prev.src=answers[q.id];prev.style.display='';scheduleSave();};rd.readAsDataURL(f);};
-        box.appendChild(hint);box.appendChild(fi);box.appendChild(prev);
-      }else{
-        var ta=document.createElement('textarea');ta.rows=6;ta.value=answers[q.id]||'';ta.oninput=function(){answers[q.id]=ta.value;scheduleSave();};box.appendChild(ta);
-      }
-      root.appendChild(box);
-    });
-    try{if(window.MathJax&&MathJax.typesetPromise)MathJax.typesetPromise([root]).catch(function(){});}catch(_){}  // render any LaTeX in math questions
+  function navKeys(e){
+    if(!started||qs('review').style.display==='block')return;
+    var t=(e.target&&e.target.tagName||'').toLowerCase();var typing=t==='input'||t==='textarea'||(e.target&&e.target.isContentEditable);
+    if(typing)return;
+    if(e.key==='ArrowRight'){if(cur<questions.length-1)goTo(cur+1);}
+    else if(e.key==='ArrowLeft'){if(cur>0)goTo(cur-1);}
+    else if((e.key||'').toLowerCase()==='f'){markNext();}
+    else if(/^[1-9]$/.test(e.key)){var q=questions[cur];if(q&&(q.type==='mcq'||q.type==='truefalse')){var opts=q.type==='truefalse'?['True','False']:(q.options||[]);var o=opts[parseInt(e.key,10)-1];if(o!=null){answers[q.id]=o;renderQuestion();onAns();}}}
   }
-  function scheduleSave(){if(saveT)return;saveT=setTimeout(function(){saveT=null;saveAnswers();},2500);}
-  function saveAnswers(){if(!attemptId)return;api('/api/exam/answer',{attempt_id:attemptId,answers:answers}).catch(function(){});}
+  // ---- CBT engine: one question per page + palette + review ----
+  function typeLabel(t){return {mcq:'Multiple choice',truefalse:'True / False',short:'Short answer',essay:'Essay',coding:'Coding',math:'Mathematics',diagram:'Diagram'}[t]||'Question';}
+  function isAnswered(q){var a=answers[q.id];return a!=null&&String(a).trim()!=='';}
+  function onAns(){scheduleSave();renderPalette();updateProgress();}
+  function zoom(src){var z=qs('zoom');z.querySelector('img').src=src;z.style.display='flex';}
+  function updateProgress(){var n=questions.filter(isAnswered).length;var p=qs('prog');if(p)p.textContent=n+'/'+questions.length+' answered';}
+  function renderQuestion(){
+    var q=questions[cur];if(!q)return;visited[q.id]=1;
+    var card=qs('qcard');card.innerHTML='';
+    var head=document.createElement('div');head.className='qhead';
+    head.innerHTML='<span class="qnum">Question '+(cur+1)+' of '+questions.length+'</span><span class="qmeta">'+typeLabel(q.type)+' · '+(q.marks||1)+' mark'+((q.marks||1)>1?'s':'')+(marked[q.id]?' · 🚩 marked':'')+'</span>';
+    card.appendChild(head);
+    var qt=document.createElement('div');qt.className='qt';qt.innerHTML=esc(q.text||'');card.appendChild(qt);
+    if(q.image){var im=document.createElement('img');im.className='qfig';im.src=q.image;im.alt='Question figure';im.title='Click to zoom';im.onclick=function(){zoom(q.image);};card.appendChild(im);}
+    var box=document.createElement('div');card.appendChild(box);buildInput(q,box);
+    try{if(window.MathJax&&MathJax.typesetPromise)MathJax.typesetPromise([card]).catch(function(){});}catch(_){}
+    renderPalette();updateProgress();try{card.scrollIntoView({block:'start'});}catch(_){}
+  }
+  function buildInput(q,box){
+    if(q.type==='mcq'||q.type==='truefalse'){
+      var opts=q.type==='truefalse'?['True','False']:(q.options||[]);
+      opts.forEach(function(o,oi){var el=document.createElement('label');el.className='opt';el.setAttribute('role','radio');el.tabIndex=0;el.textContent=String.fromCharCode(65+oi)+'. '+o;
+        if(answers[q.id]===o){el.classList.add('sel');el.setAttribute('aria-checked','true');}
+        var pick=function(){answers[q.id]=o;Array.prototype.forEach.call(box.querySelectorAll('.opt'),function(x){x.classList.remove('sel');x.setAttribute('aria-checked','false');});el.classList.add('sel');el.setAttribute('aria-checked','true');onAns();};
+        el.onclick=pick;el.onkeydown=function(e){if(e.key===' '||e.key==='Enter'){e.preventDefault();pick();}};box.appendChild(el);});
+    }else if(q.type==='math'){
+      var inp=document.createElement('input');inp.type='text';inp.value=answers[q.id]||'';inp.setAttribute('aria-label','Your answer');inp.placeholder='Your answer (number, expression or LaTeX)';
+      var prev=document.createElement('div');prev.className='mprev';
+      var renderPrev=function(){var v=(inp.value||'').trim();prev.innerHTML=v?('Preview: \\('+v.replace(/</g,'&lt;')+'\\)'):'';try{if(window.MathJax&&MathJax.typesetPromise)MathJax.typesetPromise([prev]).catch(function(){});}catch(_){}};
+      inp.oninput=function(){answers[q.id]=inp.value;onAns();renderPrev();};
+      box.appendChild(inp);box.appendChild(prev);renderPrev();
+      box.appendChild(buildCalc(function(val){inp.value=(inp.value||'')+val;answers[q.id]=inp.value;onAns();renderPrev();}));
+    }else if(q.type==='short'){
+      var s=document.createElement('input');s.type='text';s.value=answers[q.id]||'';s.setAttribute('aria-label','Your answer');s.oninput=function(){answers[q.id]=s.value;onAns();};box.appendChild(s);
+    }else if(q.type==='coding'){
+      if(q.language){var lh=document.createElement('div');lh.className='muted';lh.style.fontSize='11px';lh.textContent='Language: '+q.language;box.appendChild(lh);}
+      var ta=document.createElement('textarea');ta.className='code';ta.spellcheck=false;ta.value=answers[q.id]||'';box.appendChild(ta);
+      ta.addEventListener('keydown',function(e){if(e.key==='Tab'){e.preventDefault();var st=ta.selectionStart,en=ta.selectionEnd;ta.value=ta.value.slice(0,st)+'  '+ta.value.slice(en);ta.selectionStart=ta.selectionEnd=st+2;answers[q.id]=ta.value;onAns();}});
+      ta.oninput=function(){answers[q.id]=ta.value;onAns();};
+      if(window.CodeMirror){try{var cm=CodeMirror.fromTextArea(ta,{lineNumbers:true,mode:cmMode(q.language),matchBrackets:true,indentUnit:2,tabSize:2});cm.setSize('100%','auto');cm.on('change',function(){answers[q.id]=cm.getValue();onAns();});editors[q.id]=cm;}catch(_){}}
+    }else if(q.type==='diagram'){
+      var hint=document.createElement('div');hint.className='muted';hint.style.fontSize='11px';hint.textContent='Upload or photograph your diagram / working.';
+      var pv=document.createElement('img');pv.style.maxWidth='100%';pv.style.borderRadius='8px';pv.style.margin='6px 0';
+      var showPv=function(){if(answers[q.id]){pv.src=answers[q.id];pv.style.display='';pv.style.cursor='zoom-in';pv.onclick=function(){zoom(answers[q.id]);};}else pv.style.display='none';};showPv();
+      var fi=document.createElement('input');fi.type='file';fi.accept='image/*';fi.capture='environment';
+      fi.onchange=function(){var f=fi.files&&fi.files[0];if(!f)return;var rd=new FileReader();rd.onload=function(){answers[q.id]=String(rd.result);showPv();onAns();};rd.readAsDataURL(f);};
+      box.appendChild(hint);box.appendChild(fi);box.appendChild(pv);
+    }else{
+      var es=document.createElement('textarea');es.rows=8;es.value=answers[q.id]||'';es.setAttribute('aria-label','Your answer');es.oninput=function(){answers[q.id]=es.value;onAns();};box.appendChild(es);
+    }
+  }
+  function cmMode(lang){var l=String(lang||'').toLowerCase();if(l.indexOf('py')>=0)return 'python';if(l.indexOf('sql')>=0)return 'sql';if(l.indexOf('js')>=0||l.indexOf('javascript')>=0||l.indexOf('type')>=0||l.indexOf('node')>=0)return 'javascript';if(l.indexOf('c')>=0||l.indexOf('java')>=0||l.indexOf('kotlin')>=0)return 'text/x-c++src';return 'python';}
+  // safe scientific calculator (recursive-descent, NO eval): + - * / ^ ( ) and sin/cos/tan/sqrt/ln/log/etc
+  function calcEval(expr){var s=String(expr).replace(/\\s+/g,'').replace(/×/g,'*').replace(/÷/g,'/').replace(/π/g,'PI');var i=0;
+    function num(){var st=i;while(i<s.length&&/[0-9.]/.test(s[i]))i++;return parseFloat(s.slice(st,i));}
+    function ident(){var st=i;while(i<s.length&&/[a-zA-Z]/.test(s[i]))i++;return s.slice(st,i);}
+    function fnc(f,a){f=f.toLowerCase();var m={sin:Math.sin,cos:Math.cos,tan:Math.tan,asin:Math.asin,acos:Math.acos,atan:Math.atan,sqrt:Math.sqrt,ln:Math.log,log:function(x){return Math.log(x)/Math.LN10;},abs:Math.abs,exp:Math.exp};return m[f]?m[f](a):NaN;}
+    function factor(){if(s[i]==='('){i++;var v=add();if(s[i]===')')i++;return v;}if(s[i]==='-'){i++;return -factor();}if(s[i]==='+'){i++;return factor();}if(/[a-zA-Z]/.test(s[i])){var id=ident();if(id==='PI')return Math.PI;if(id==='E'||id==='e')return Math.E;if(s[i]==='('){i++;var a=add();if(s[i]===')')i++;return fnc(id,a);}return NaN;}return num();}
+    function powf(){var b=factor();if(s[i]==='^'){i++;return Math.pow(b,powf());}return b;}
+    function mul(){var v=powf();while(s[i]==='*'||s[i]==='/'){var op=s[i++];var r=powf();v=op==='*'?v*r:v/r;}return v;}
+    function add(){var v=mul();while(s[i]==='+'||s[i]==='-'){var op=s[i++];var r=mul();v=op==='+'?v+r:v-r;}return v;}
+    try{var res=add();return isFinite(res)?res:NaN;}catch(_){return NaN;}}
+  function buildCalc(insert){
+    var wrap=document.createElement('div');wrap.className='calc';
+    var disp=document.createElement('input');disp.className='disp';disp.readOnly=true;disp.value='';wrap.appendChild(disp);
+    var keys=document.createElement('div');keys.className='keys';
+    ['7','8','9','/','sqrt(','4','5','6','*','^','1','2','3','-','(','0','.','π',')','+','sin(','cos(','tan(','ln(','log(','C','⌫','=','→ ans',''].forEach(function(k){
+      if(k===''){keys.appendChild(document.createElement('span'));return;}
+      var b=document.createElement('button');b.type='button';b.textContent=k;b.onclick=function(){
+        if(k==='C')disp.value='';
+        else if(k==='⌫')disp.value=disp.value.slice(0,-1);
+        else if(k==='='){var r=calcEval(disp.value);disp.value=isNaN(r)?'Error':String(Math.round(r*1e10)/1e10);}
+        else if(k==='→ ans'){var r2=calcEval(disp.value);if(!isNaN(r2)&&insert)insert(String(Math.round(r2*1e10)/1e10));}
+        else disp.value+=k;
+      };keys.appendChild(b);});
+    wrap.appendChild(keys);return wrap;
+  }
+  function renderPalette(){
+    var grid=qs('pgrid'),counts=qs('pcounts');if(!grid)return;grid.innerHTML='';var ans=0,flg=0;
+    questions.forEach(function(q,i){var a=isAnswered(q),m=!!marked[q.id];if(a)ans++;if(m)flg++;
+      var cell=document.createElement('div');cell.className='pcell'+(i===cur?' cur':'')+(m&&a?' ansmark':m?' mark':a?' ans':(visited[q.id]?' noans':''));
+      cell.textContent=(i+1);cell.tabIndex=0;cell.setAttribute('aria-label','Question '+(i+1)+(a?' answered':' not answered')+(m?' marked':''));
+      cell.onclick=function(){goTo(i);};cell.onkeydown=function(e){if(e.key==='Enter')goTo(i);};grid.appendChild(cell);});
+    if(counts)counts.innerHTML='✅ '+ans+' answered · 🚩 '+flg+' marked · ⬜ '+(questions.length-ans)+' left';
+  }
+  function goTo(i){if(i<0||i>=questions.length)return;cur=i;renderQuestion();if(window.innerWidth<=820)qs('palette').classList.remove('open');}
+  function prev(){if(cur>0)goTo(cur-1);}
+  function clearResp(){var q=questions[cur];if(!q)return;delete answers[q.id];renderQuestion();onAns();}
+  function markNext(){var q=questions[cur];if(q)marked[q.id]=!marked[q.id];scheduleSave();if(cur<questions.length-1)goTo(cur+1);else renderQuestion();}
+  function saveNext(){saveAnswers();if(cur<questions.length-1)goTo(cur+1);else openReview();}
+  function togglePalette(){qs('palette').classList.toggle('open');}
+  function openReview(){
+    var ans=questions.filter(isAnswered).length,flg=questions.filter(function(q){return marked[q.id];}).length,un=questions.length-ans;
+    var html='<div class="rcard"><h1>Review &amp; Submit</h1><p class="muted">'+ans+' answered · '+un+' unanswered · '+flg+' marked for review. Tap a number to go back, or submit your exam.</p>';
+    var chips=function(label,filt,col){var list=questions.map(function(q,i){return {q:q,i:i};}).filter(filt);if(!list.length)return '';return '<h2>'+label+'</h2><div>'+list.map(function(o){return '<span class="rrow" style="background:'+col+'" onclick="EX.jump('+o.i+')">'+(o.i+1)+'</span>';}).join('')+'</div>';};
+    html+=chips('Unanswered',function(o){return !isAnswered(o.q);},'#dc2626');
+    html+=chips('Marked for review',function(o){return marked[o.q.id];},'#7c3aed');
+    html+='<div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap"><button class="sec" onclick="EX.closeReview()">‹ Back to exam</button><button class="warnbtn" style="margin-left:auto" onclick="EX.submit(false)">✅ Submit exam</button></div></div>';
+    var ov=qs('review');ov.innerHTML=html;ov.style.display='block';
+  }
+  function closeReview(){qs('review').style.display='none';}
+  function jump(i){closeReview();goTo(i);}
+  // ---- accessibility ----
+  function fs(d){var v=Math.max(13,Math.min(22,(parseInt((window.localStorage&&localStorage.getItem('ubu_fs'))||'15',10))+d));try{localStorage.setItem('ubu_fs',v);}catch(_){}document.body.style.setProperty('--fs',v+'px');}
+  function contrast(){document.body.classList.toggle('hc');try{localStorage.setItem('ubu_hc',document.body.classList.contains('hc')?'1':'0');}catch(_){}}
+  function restoreA11y(){try{var v=parseInt(localStorage.getItem('ubu_fs')||'15',10);document.body.style.setProperty('--fs',v+'px');if(localStorage.getItem('ubu_hc')==='1')document.body.classList.add('hc');}catch(_){}}
+  // ---- connection + resilient autosave ----
+  function setConn(){var d=qs('conn');if(!d)return;var on=navigator.onLine;d.style.background=on?'#22c55e':'#ef4444';d.title=on?'Online':'Offline — answers are saved on this device and sync when you reconnect';}
+  function markSaved(t,c){var s=qs('saved');if(s){s.textContent=t;s.className='chip'+(c?' '+c:'');}}
+  function lsKey(){return 'ubuexam_'+EXAM.id;}
+  function persistLocal(){try{localStorage.setItem(lsKey(),JSON.stringify({a:answers,m:marked,t:Date.now()}));}catch(_){}}
+  function loadLocal(){try{var raw=localStorage.getItem(lsKey());return raw?JSON.parse(raw):null;}catch(_){return null;}}
+  function scheduleSave(){persistLocal();markSaved('Saving…');if(saveT)return;saveT=setTimeout(function(){saveT=null;saveAnswers();},1500);}
+  function saveAnswers(){persistLocal();if(!attemptId)return;markSaved('Saving…');api('/api/exam/answer',{attempt_id:attemptId,answers:answers}).then(function(r){markSaved(r&&r.ok?'Saved ✓':'Saved on device','ok');}).catch(function(){markSaved('Offline — saved on device','warn');setConn();});}
   // ---- clock ----
   function startClock(){tick();clockT=setInterval(tick,1000);}
   function tick(){var ms=endsAt-Date.now();if(ms<=0){ms=0;qs('clock').textContent='00:00';return submit(true);}var s=Math.floor(ms/1000),m=Math.floor(s/60);qs('clock').textContent=(m<10?'0':'')+m+':'+((s%60)<10?'0':'')+(s%60);if(ms<60000)qs('clock').classList.add('low');}
@@ -658,9 +930,21 @@ var EX=(function(){
       if(pendingAudio){body.audio_base64=pendingAudio.b64;body.audio_mime=pendingAudio.mime;pendingAudio=null;}
       api('/api/exam/frame',body).then(function(r){if(r&&typeof r.live==='boolean'&&r.live!==live){live=r.live;qs('livebadge').style.display=live?'':'none';}}).catch(function(){});
       since++;var audioEvery=live?2:5;if(since%audioEvery===0)recordClip();
+      var faceEvery=live?6:6;if(FACE.ok&&since%faceEvery===0)faceCheck();   // continuous identity-hold ≈ every 18-36s
       proctorT=setTimeout(loop,live?1200:3000);
     };
     recordClip();loop();
+  }
+  // continuous identity-hold: confirm the SAME person is still sitting. A run of misses raises an
+  // impersonation flag server-side; here we just warn the candidate (never auto-kick).
+  var faceBusy=false;
+  async function faceCheck(){
+    if(faceBusy||!started)return;faceBusy=true;
+    try{var descs=await faceDescriptors(1);if(!descs.length){faceBusy=false;return;}
+      var r=await api('/api/exam/face-check',{exam_id:EXAM.id,descriptors:descs});
+      if(r&&r.enrolled&&r.match===false)flash('⚠ The face on camera does not match the enrolled candidate. Keep your full face in view, alone and well-lit — the invigilator is reviewing this.');
+    }catch(_){}
+    faceBusy=false;
   }
   // ---- integrity (warn + log; never auto-kick) ----
   function flash(m){var b=qs('banner');b.textContent=m;b.style.display='block';clearTimeout(b._t);b._t=setTimeout(function(){b.style.display='none';},6000);}
@@ -682,7 +966,9 @@ var EX=(function(){
   }
   function stopAll(){try{clearInterval(clockT);}catch(_){}try{clearTimeout(proctorT);}catch(_){}try{if(document.fullscreenElement)document.exitFullscreen();}catch(_){}try{if(stream)stream.getTracks().forEach(function(t){t.stop();});}catch(_){}}
   window.addEventListener('beforeunload',function(e){if(started){e.preventDefault();e.returnValue='';}});
-  return {startCam:startCam,captureKyc:captureKyc,begin:begin,submit:submit,refs:enterFs};
+  return {startCam:startCam,captureKyc:captureKyc,begin:begin,submit:submit,refs:enterFs,
+    prev:prev,clearResp:clearResp,markNext:markNext,saveNext:saveNext,openReview:openReview,closeReview:closeReview,jump:jump,
+    togglePalette:togglePalette,fs:fs,contrast:contrast};
 })();
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[m];});}
 document.getElementById('instr').textContent=EXAM.instructions||'Read each question carefully. Your answers save automatically. Click Submit when finished.';
@@ -702,7 +988,9 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
   // published per-course scores grouped by session+semester, with semester GPA + overall CGPA
   function scoresFor(sid) {
     const codeK = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const raw = all('student_scores').filter(r => r.student_id === sid && !r.deleted)
+    // Results-release gate: a withheld score is flagged released=0 and stays hidden from the student
+    // until an examination-board release publishes it. Legacy rows have no `released` field → visible.
+    const raw = all('student_scores').filter(r => r.student_id === sid && !r.deleted && Number(r.released) !== 0)
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
     // collapse duplicate course rows (same course in the same session+semester) — most recent wins
     const ddMap = {};
@@ -731,6 +1019,17 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       faculty: nameOf('faculties', s.faculty_id), department: nameOf('departments', s.department_id), level: nameOf('levels', s.level_id),
       status: s.status,
     };
+  }
+
+  // OPEN evaluation surveys for a student's cohort (faculty/department/level; NULL = any) that the
+  // student has not already answered. The questions are sent so the portal can render the form.
+  function openSurveysForStudent(s) {
+    return all('eval_surveys').filter(sv => !sv.deleted && sv.status === 'open'
+        && (!sv.faculty_id || sv.faculty_id === s.faculty_id)
+        && (!sv.department_id || sv.department_id === s.department_id)
+        && (!sv.level_id || sv.level_id === s.level_id))
+      .filter(sv => !all('eval_responses').some(r => !r.deleted && r.survey_id === sv.id && r.student_id === s.id))
+      .map(sv => { let qs = []; try { qs = JSON.parse(sv.questions || '[]'); } catch (_) {} return { id: sv.id, title: sv.title, description: sv.description, course: sv.course_code, lecturer: sv.lecturer_name, questions: Array.isArray(qs) ? qs : [] }; });
   }
 
   function studentData(s) {
@@ -808,6 +1107,16 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       exams: examsForStudent(s),
       documents: all('portal_documents').filter(d => (!d.student_id || d.student_id === s.id) && (!d.faculty_id || d.faculty_id === s.faculty_id) && (!d.department_id || d.department_id === s.department_id) && (!d.level_id || d.level_id === s.level_id))
         .map(d => ({ id: d.id, title: d.title, category: d.category, office: d.office, by: userName(d.uploaded_by), mime: d.mime, date: d.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
+      transcriptRequests: all('transcript_requests').filter(r => r.student_id === s.id && !r.deleted)
+        .map(r => ({ id: r.id, kind: r.kind, purpose: r.purpose, status: r.status, note: r.note, date: r.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
+      // OPEN evaluation surveys for this student's cohort that they have NOT yet answered
+      surveys: openSurveysForStudent(s),
+      // any score withheld by the examinations board (released=0) → the results tab shows a notice.
+      // Auto-transcript DRAFTS are also released=0 but must stay completely silent (they are not a
+      // "withhold" — the officer simply hasn't published yet), so they are excluded here.
+      resultsWithheld: all('student_scores').some(r => r.student_id === s.id && !r.deleted && Number(r.released) === 0 && r.batch_id !== 'autogen'),
+      // fee invoices issued to this student (download the PDF from the Documents tab)
+      invoices: all('invoices').filter(iv => iv.student_id === s.id && !iv.deleted).map(iv => ({ invoice_no: iv.invoice_no, amount: iv.amount, currency: iv.currency, due_date: iv.due_date, status: iv.status, date: iv.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       misconduct: all('misconducts').filter(m => m.student_id === s.id && !m.deleted).map(m => ({ offense: m.offense, severity: m.severity, action: m.action, fine: m.penalty_amount || 0, currency: m.currency, status: m.status, date: m.occurred_at || m.created_at, note: m.resolution_note || m.description || '' })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       charges: charges.map(c => ({ id: c.id, category: c.category, description: c.description, currency: c.currency, amount: c.amount, date: c.created_at, by: userName(c.created_by), rollover: !!c.is_rolled_over, rolled_from: nameOf('academic_sessions', c.rolled_from_session) })),
       payments: pays.map(p => ({ id: p.id, receipt_no: p.receipt_no, category: p.category, currency: p.currency, amount: p.amount, method: p.method, date: p.decided_at || p.created_at, office: officeOf(p.raised_role, s.department_id), collector: userName(p.decided_by || p.raised_by) })),
@@ -883,7 +1192,18 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const run = one('payroll_runs', p.run_id) || {};
       return { id: p.id, period: run.period, status: run.status, run_type: run.run_type, gross: p.gross, allowances: p.allowances, bonus: p.bonus, deductions: p.deductions, loan_deduction: p.loan_deduction, net: p.net, currency: p.currency };
     }).sort((a, b) => String(b.period).localeCompare(String(a.period)));
-    return { profile: staffProfile(s), payslips: slips, liveClasses: s.staff_type === 'lecturer' ? liveClassesForLecturer(s) : [] };
+    // invigilation duties assigned to this staff member on PUBLISHED exam schedules
+    const invigilations = [];
+    for (const sg of all('exam_seatings')) {
+      if (sg.deleted) continue;
+      let inv = []; try { inv = JSON.parse(sg.invigilators || '[]'); } catch (_) {}
+      if (!inv.some(x => x && x.id === s.id)) continue;
+      const t = one('timetables', sg.timetable_id);
+      if (!t || t.status !== 'published') continue;
+      invigilations.push({ date: sg.date, start: sg.start_time, end: sg.end_time, room: sg.room_name, course: sg.course_code, department: nameOf('departments', sg.department_id), level: nameOf('levels', sg.level_id) });
+    }
+    invigilations.sort((a, b) => String((a.date || '') + (a.start || '')).localeCompare(String((b.date || '') + (b.start || ''))));
+    return { profile: staffProfile(s), payslips: slips, invigilations, liveClasses: s.staff_type === 'lecturer' ? liveClassesForLecturer(s) : [] };
   }
 
   // Build a period filter from query params: basis = day|week|month|semester|session|all
@@ -1119,9 +1439,15 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     let gpa = sc.cgpa, cgpa = sc.cgpa, units = sc.totalUnits, courses = sc.courses.length, sesName = '', semName = '';
     if (ses || sem) { const g = (sc.semesters || []).find(x => (!ses || x.session_id === ses) && (!sem || x.semester_id === sem)); if (g) { gpa = g.gpa; cgpa = g.cgpa; units = g.units; courses = g.courses.length; sesName = g.session || ''; semName = g.semester || ''; } }
     const stand = (x) => { x = Number(x) || 0; return x >= 4.5 ? 'First Class' : x >= 3.5 ? 'Second Class (Upper)' : x >= 2.4 ? 'Second Class (Lower)' : x >= 1.5 ? 'Third Class' : x >= 1 ? 'Pass' : '—'; };
+    // graduation authenticity — an alumni record makes this an authentic CERTIFICATE/graduate check,
+    // carrying the official class of degree + graduation session from the released finalist batch.
+    const al = all('alumni').find(a => a.student_id === s.id && !a.deleted);
     return {
       valid: true, kind: 'result', ref: String(s.id).replace(/-/g, '').slice(0, 8).toUpperCase(),
       session: sesName, semester: semName, gpa: gpa, cgpa: cgpa, totalUnits: units, courses: courses, standing: stand(cgpa),
+      graduated: !!al || String(s.status || '').toLowerCase() === 'alumni',
+      classification: (al && al.classification) || (al ? stand(cgpa) : ''),
+      graduationSession: al ? (nameOf('academic_sessions', al.graduation_session) || '') : '',
       student: { name: `${s.first_name || ''} ${s.last_name || ''}`.trim() || 'Unknown', matric: s.matric_no || '—', photo: s.photo || '', faculty: nameOf('faculties', s.faculty_id) || '—', department: nameOf('departments', s.department_id) || '—', level: nameOf('levels', s.level_id) || '—', gender: s.gender || '—', status: s.status || 'active' },
     };
   }
@@ -1519,7 +1845,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const id = p.split('/')[3]; const s = one('students', t.id);
       const e = id ? one('online_exams', id) : null;
       if (!e || e.deleted || !s || !examVisibleTo(e, s)) return H(res, 404, '<p>Exam not found or not available to you.</p>');
-      return H(res, 200, examTakeHTML(e, u.searchParams.get('t') || ''));
+      return H(res, 200, examTakeHTML(e, u.searchParams.get('t') || '', s));
     }
     // Exam-conduct evidence: the flagged student downloads the video/audio/image clip that was
     // recorded — full transparency, so they can see exactly what was captured and appeal if wrong.
@@ -1536,6 +1862,23 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       res.end(Buffer.from(ev.data, 'base64')); return true;
     }
     if (p === '/api/version' && method === 'GET') { J(res, 200, { version: getVersion() }); return true; }
+    // Serve the offline face-recognition engine to the student's browser (no CDN — works on LAN / APK).
+    if (method === 'GET' && p === '/vendor/face-api.min.js') {
+      const fp = faceFile('face-api.min.js');
+      if (!fp) return J(res, 404, { ok: false, error: 'face engine not bundled' });
+      res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'public, max-age=604800' });
+      res.end(fs.readFileSync(fp)); return true;
+    }
+    // Serve a model weight/manifest file. Tries server/face/models first, then assets/models.
+    if (method === 'GET' && p.startsWith('/face-models/')) {
+      const name = path.basename(p.slice('/face-models/'.length));   // basename = no path traversal
+      if (!/^[\w.\-]+$/.test(name)) return J(res, 400, { ok: false });
+      const fp = faceFile(path.join('models', name));
+      if (!fp) return J(res, 404, { ok: false, error: 'model not bundled' });
+      const mime = name.endsWith('.json') ? 'application/json' : 'application/octet-stream';
+      res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=604800' });
+      res.end(fs.readFileSync(fp)); return true;
+    }
     // Is a live class still running? The (already-open) student class page polls this and auto-leaves the
     // moment the host ends it — otherwise the class kept running on the APK after the lecturer ended it.
     // `ended` is true only once a session for this room existed and is no longer active, so a scheduled
@@ -1806,6 +2149,24 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       return J(res, 200, { ok: !!done, error: done ? null : 'Could not save the new password.' });
     }
 
+    // A graduate/student requests an official transcript or certificate. Creates a synced
+    // transcript_requests row (reverse-syncs to the desktop Registry desk) + notifies the registrar.
+    if (p === '/api/transcript-request' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student to request a document.' });
+      const s = accountById('student', t.id); if (!s) return J(res, 401, { ok: false });
+      if (typeof create !== 'function') return J(res, 200, { ok: false, error: 'Document requests are not available on this server.' });
+      const body = await readBody();
+      const kind = (String(body.kind || 'transcript') === 'certificate') ? 'certificate' : 'transcript';
+      // one open request per kind at a time
+      const open = all('transcript_requests').find(r => r.student_id === s.id && r.kind === kind && !r.deleted && (r.status === 'pending' || r.status === 'approved'));
+      if (open) return J(res, 200, { ok: false, error: `You already have a ${kind} request in progress.` });
+      const id = crypto.randomUUID(); const now = new Date().toISOString();
+      create('transcript_requests', { id, student_id: s.id, kind, purpose: String(body.purpose || '').slice(0, 200), delivery: 'email', recipient_email: String(body.recipient_email || s.email || '').slice(0, 120), status: 'pending', requested_by: 'portal', created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+      const nm = `${s.first_name || ''} ${s.last_name || ''}`.trim();
+      for (const role of ['registrar', 'admin', 'ict']) create('notifications', { id: crypto.randomUUID(), target_user: null, target_role: role, title: 'New transcript request 📜', body: `${nm} requested an official ${kind}.`, type: 'system', payload: JSON.stringify({ request_id: id }), is_read: 0, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+      return J(res, 200, { ok: true, request: { id, kind, status: 'pending', date: now } });
+    }
+
     // A student appeals a malpractice flag ("the AI got the wrong person / it wasn't me"). Creates an
     // appeal row + marks the flag 'appealed' + notifies the exam officers — all of which sync to the
     // desktop so the officer reviews it. Ensures a wrongly-flagged student is never penalised silently.
@@ -1830,6 +2191,33 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
           title: '📨 Exam-conduct appeal filed', body: nm + ' is appealing a malpractice flag (' + examTitleOf(flag.exam_id) + ')', type: 'system',
           payload: JSON.stringify({ appeal_flag: flag.id }), is_read: 0, created_at: now, updated_at: now, deleted: 0 });
       } catch (_) {}
+      return J(res, 200, { ok: true });
+    }
+
+    // A student submits an evaluation survey. Writes an eval_responses row (reverse-syncs to the
+    // desktop for anonymous aggregation). One response per student per survey; survey must be open
+    // and for the student's cohort. The student_id is stored ONLY to dedupe — never shown in results.
+    if (p === '/api/survey/submit' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student to submit an evaluation.' });
+      if (typeof create !== 'function') return J(res, 200, { ok: false, error: 'Evaluations are not available on this server.' });
+      const s = one('students', t.id); if (!s) return J(res, 401, { ok: false });
+      const body = await readBody();
+      const sv = body.survey_id ? one('eval_surveys', body.survey_id) : null;
+      if (!sv || sv.deleted || sv.status !== 'open') return J(res, 404, { ok: false, error: 'Survey not found or closed.' });
+      if ((sv.faculty_id && sv.faculty_id !== s.faculty_id) || (sv.department_id && sv.department_id !== s.department_id) || (sv.level_id && sv.level_id !== s.level_id))
+        return J(res, 403, { ok: false, error: 'This survey is not for your cohort.' });
+      if (all('eval_responses').some(r => !r.deleted && r.survey_id === sv.id && r.student_id === s.id)) return J(res, 200, { ok: true, already: true });
+      // sanitize answers against the survey's own questions: ratings clamped to 1–5, text capped
+      let questions = []; try { questions = JSON.parse(sv.questions || '[]'); } catch (_) {}
+      const byId = {}; for (const q of (Array.isArray(questions) ? questions : [])) byId[q.id] = q;
+      const raw = (body && body.answers) || {}; const answers = {};
+      for (const qid of Object.keys(raw)) {
+        const q = byId[qid]; if (!q) continue;
+        if (q.type === 'text') { const v = String(raw[qid] || '').slice(0, 1500); if (v.trim()) answers[qid] = v; }
+        else { const n = Math.round(Number(raw[qid])); if (n >= 1 && n <= 5) answers[qid] = n; }
+      }
+      const now = new Date().toISOString(); const id = crypto.randomUUID();
+      create('eval_responses', { id, survey_id: sv.id, student_id: s.id, answers: JSON.stringify(answers), comment: String((body && body.comment) || '').slice(0, 1500), created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
       return J(res, 200, { ok: true });
     }
 
@@ -1858,14 +2246,20 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       let at = all('exam_attempts').find(a => !a.deleted && a.exam_id === e.id && a.student_id === t.id);
       const now = new Date().toISOString();
       if (at && (at.status === 'submitted' || at.status === 'auto_submitted' || at.status === 'graded')) return J(res, 200, { ok: false, error: 'You have already submitted this exam.' });
+      var st = {}; try { st = JSON.parse(e.settings || '{}'); } catch (_) {}
+      // late-entry grace: a NEW attempt can't begin more than `late_grace_min` after start_at
+      if (!at && st.late_grace_min && e.start_at && Date.now() > Date.parse(e.start_at) + st.late_grace_min * 60000)
+        return J(res, 200, { ok: false, error: 'The entry window for this exam has closed (late-entry grace passed).' });
       if (!at) { const id = 'att-' + Math.random().toString(16).slice(2) + Date.now().toString(16); at = { id, exam_id: e.id, student_id: t.id, status: 'in_progress', started_at: now, answers: '{}', live_requested: 0, created_at: now, updated_at: now, deleted: 0 }; create('exam_attempts', at); }
       const startedMs = Date.parse(at.started_at || now);
-      const durEnd = startedMs + (Number(e.duration_min) || 60) * 60000;
-      const winEnd = e.end_at ? Date.parse(e.end_at) : durEnd;
+      const extraMin = (st.extensions && Number(st.extensions[t.id])) || 0;   // per-student accommodation
+      const durEnd = startedMs + ((Number(e.duration_min) || 60) + extraMin) * 60000;
+      const winEnd = e.end_at ? Date.parse(e.end_at) + extraMin * 60000 : durEnd;
       const endsAt = new Date(Math.min(durEnd, winEnd)).toISOString();
       let qs = all('exam_questions').filter(q => !q.deleted && q.exam_id === e.id)
         .map(q => ({ id: q.id, seq: q.seq, type: q.type, text: q.text, options: (function () { try { return JSON.parse(q.options || '[]'); } catch (_) { return []; } })(), marks: q.marks, image: q.image || null, language: q.language || null }));
-      if (e.shuffle !== 0) qs = seededShuffle(e.id + ':' + t.id, qs);
+      if (st.pick && st.pick > 0 && st.pick < qs.length) qs = seededShuffle(e.id + ':pick:' + t.id, qs).slice(0, st.pick);   // each student gets a random N-of-total subset
+      if (e.shuffle !== 0) qs = seededShuffle(e.id + ':' + t.id, qs); else qs.sort((a, b) => (a.seq || 0) - (b.seq || 0));
       let answers = {}; try { answers = JSON.parse(at.answers || '{}'); } catch (_) {}
       return J(res, 200, { ok: true, attempt_id: at.id, endsAt, duration_min: e.duration_min || 60, room: 'exam-' + e.id, exam: { id: e.id, title: e.title || e.course_code, instructions: e.instructions || '', require_camera: e.require_camera !== 0 }, answers, questions: qs });
     }
@@ -1999,6 +2393,78 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       if (!at) return J(res, 404, { ok: false });
       if (typeof update === 'function') update('exam_attempts', at.id, { identity_verified: body.result === 'verified' ? 'verified' : 'rejected' });
       return J(res, 200, { ok: true });
+    }
+    // Student: FACE check-in (1:1). The browser computed descriptor(s) from the live camera; we match
+    // them against the student's enrolled face template. On a match we mark the attempt identity_verified;
+    // on a mismatch we record 'rejected' so the officer sees it live. Not enrolled ⇒ fall through to the
+    // officer's manual photo review (never hard-locks a legitimate student out of an exam).
+    if (p === '/api/exam/face-verify' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
+      const body = await readBody(); const examId = String(body.exam_id || '');
+      const probes = Array.isArray(body.descriptors) ? body.descriptors : (Array.isArray(body.descriptor) ? [body.descriptor] : []);
+      const tpl = faceTemplateFor(t.id);
+      if (!tpl.enrolled) return J(res, 200, { ok: true, enrolled: false, match: null });
+      if (!probes.length) return J(res, 400, { ok: false, error: 'No face captured. Look straight at the camera in good light.' });
+      const dist = faceBest(probes, tpl.descriptors);
+      const match = isFinite(dist) && dist <= FACE.verifyThreshold;
+      const confidence = faceConfidence(dist);
+      const at = all('exam_attempts').find(a => !a.deleted && a.exam_id === examId && a.student_id === t.id);
+      if (at && typeof update === 'function') update('exam_attempts', at.id, { identity_verified: match ? 'verified' : 'rejected' });
+      examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][t.id] || { ring: [], away: 0 };
+      cur.faceConfidence = confidence; cur.faceVerified = match; cur.ts = Date.now(); examFrames[examId][t.id] = cur;
+      return J(res, 200, { ok: true, enrolled: true, match, confidence, distance: Math.round((isFinite(dist) ? dist : 9) * 1000) / 1000 });
+    }
+    // Student: continuous identity-HOLD during the exam. Called every ~15-20s with a fresh descriptor.
+    // A run of consecutive misses (someone swapped in) raises an `impersonation` malpractice flag through
+    // the same surveillance pipeline the officer monitor reads — and resets the attempt to 'rejected'.
+    if (p === '/api/exam/face-check' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
+      const body = await readBody(); const examId = String(body.exam_id || '');
+      const probes = Array.isArray(body.descriptors) ? body.descriptors : (Array.isArray(body.descriptor) ? [body.descriptor] : []);
+      const tpl = faceTemplateFor(t.id);
+      if (!tpl.enrolled || !probes.length) return J(res, 200, { ok: true, enrolled: tpl.enrolled, match: null });
+      const dist = faceBest(probes, tpl.descriptors);
+      const match = isFinite(dist) && dist <= FACE.examThreshold;
+      const confidence = faceConfidence(dist);
+      const key = examId + ':' + t.id;
+      examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][t.id] || { ring: [], away: 0 };
+      cur.faceConfidence = confidence; cur.faceVerified = match; cur.ts = Date.now();
+      let flagged = false;
+      if (match) { faceMiss[key] = 0; }
+      else {
+        faceMiss[key] = (faceMiss[key] || 0) + 1;
+        if (faceMiss[key] >= FACE.misses && !cur.faceFlagged && typeof create === 'function') {
+          // raise an impersonation flag on the exam's surveillance session (synced → desktop + officer monitor)
+          const e = one('online_exams', examId) || {}; const svId = e.surveillance_id || examId;
+          const now = new Date().toISOString(); const fid = 'flg-' + crypto.randomBytes(6).toString('hex');
+          create('malpractice_flags', { id: fid, exam_id: svId, student_id: t.id, camera_id: null, type: 'impersonation',
+            severity: 'high', confidence: Math.round((1 - confidence) * 100) / 100, detail: 'Face no longer matches the enrolled student (continuous identity-hold failed ' + faceMiss[key] + '× in a row).',
+            auto: 1, status: 'open', flagged_by: 'face_biometric', occurred_at: now, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+          // attach the current frame as evidence, if we have one
+          if (cur.jpeg && cur.jpeg.length < 3 * 1024 * 1024) {
+            const eid = 'evd-' + crypto.randomBytes(6).toString('hex');
+            create('malpractice_evidence', { id: eid, flag_id: fid, exam_id: svId, student_id: t.id, kind: 'image', mime: 'image/jpeg', filename: 'identity-hold.jpg', data: cur.jpeg, bytes: Math.round(cur.jpeg.length * 0.75), camera_id: null, captured_at: now, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+          }
+          const at = all('exam_attempts').find(a => !a.deleted && a.exam_id === examId && a.student_id === t.id);
+          if (at && typeof update === 'function') update('exam_attempts', at.id, { identity_verified: 'rejected' });
+          cur.faceFlagged = true; flagged = true;
+        }
+      }
+      examFrames[examId][t.id] = cur;
+      return J(res, 200, { ok: true, enrolled: true, match, confidence, flagged });
+    }
+    // Officer: 1:N face SEARCH at check-in — capture a face on the monitor and find which student it is.
+    if (p === '/api/exam/face-search' && method === 'POST') {
+      const t = isExamOfficer(req, u); if (!t) return J(res, 401, { ok: false });
+      const body = await readBody();
+      const probes = Array.isArray(body.descriptors) ? body.descriptors : (Array.isArray(body.descriptor) ? [body.descriptor] : []);
+      if (!probes.length) return J(res, 400, { ok: false, error: 'No face captured.' });
+      const ranked = faceRank(probes, { topK: 5 }).map(r => {
+        const s = one('students', r.student_id) || {};
+        return { student_id: r.student_id, name: `${s.first_name || ''} ${s.last_name || ''}`.trim(), matric: s.matric_no || '', confidence: r.confidence, distance: r.distance };
+      });
+      const top = ranked[0];
+      return J(res, 200, { ok: true, match: top && top.distance <= FACE.verifyThreshold ? top : null, candidates: ranked });
     }
     // Officer: request (or stop) a student's real-time camera+mic (they then join the exam Jitsi room).
     if (p === '/api/exam/request-live' && method === 'POST') {
@@ -2400,6 +2866,13 @@ async function renderApp(){
 }
 function tbl(cols,rows,empty){if(!rows||!rows.length)return '<div class="empty">'+(empty||'Nothing to show.')+'</div>';return '<div class="tscroll"><table><thead><tr>'+cols.map(c=>'<th class="'+(c.r?'r':'')+'">'+c.t+'</th>').join('')+'</tr></thead><tbody>'+rows.map(row=>'<tr>'+cols.map(c=>'<td class="'+(c.r?'r':'')+'">'+c.f(row)+'</td>').join('')+'</tr>').join('')+'</tbody></table></div>';}
 function doc(path){window.open(path+(path.includes('?')?'&':'?')+'t='+encodeURIComponent(TOKEN),'_blank');}
+async function reqTranscript(kind){
+  var purpose=prompt('Purpose of the official '+kind+' (e.g. further studies, employment):','');
+  if(purpose===null)return;
+  try{var r=await api('/api/transcript-request',{method:'POST',body:JSON.stringify({kind:kind,purpose:purpose})});
+    if(r&&r.ok){alert('Request submitted. The Registry will process it, email you a signed copy and place it here for download.');renderApp();}
+    else{alert((r&&r.error)||'Could not submit the request.');}}catch(e){alert('Could not submit the request right now.');}
+}
 let CHAT_MOUNTED=false;
 function mountChat(){
   if(CHAT_MOUNTED)return;CHAT_MOUNTED=true;
@@ -2431,6 +2904,19 @@ async function appealFlag(id){
   if(r&&r.ok){alert(r.already?'You already have a pending appeal for this flag.':'Appeal submitted. An exam officer will review it and you will be notified of the outcome.');if(window.renderApp)renderApp();}
   else alert((r&&r.error)||'Could not submit the appeal. Please try again.');
 }
+async function submitSurvey(id){
+  var box=document.getElementById('survey-'+id);if(!box)return;
+  var answers={};
+  Array.prototype.forEach.call(box.querySelectorAll('input[type=radio]:checked'),function(r){answers[r.getAttribute('data-qid')]=Number(r.value);});
+  Array.prototype.forEach.call(box.querySelectorAll('textarea[data-qid]'),function(t){if(t.value.trim())answers[t.getAttribute('data-qid')]=t.value.trim();});
+  var cEl=box.querySelector('.svcomment');var comment=cEl?cEl.value.trim():'';
+  var need=Number(box.getAttribute('data-ratings')||0);var got=box.querySelectorAll('input[type=radio]:checked').length;
+  if(need>0&&got<need){alert('Please rate every statement before submitting.');return;}
+  var btn=box.querySelector('.svsubmit');if(btn){btn.disabled=true;btn.textContent='Submitting…';}
+  var r=await api('/api/survey/submit',{method:'POST',body:JSON.stringify({survey_id:id,answers:answers,comment:comment})});
+  if(r&&r.ok){alert(r.already?'You have already submitted this evaluation. Thank you!':'Thank you! Your anonymous evaluation has been submitted.');if(window.renderApp)renderApp();}
+  else{alert((r&&r.error)||'Could not submit. Please try again.');if(btn){btn.disabled=false;btn.textContent='Submit Evaluation';}}
+}
 
 function studentView(w,d){
   var p=d.profile;
@@ -2452,6 +2938,7 @@ function studentView(w,d){
   var segs=[['overview','🏠','Overview',0],['notifications','🔔','Updates',unread],['fees','💳','Fees & Payments',owingCount],['receipts','🧾','Receipts',0],['timetable','🗓','Timetable',ttCount],['liveclasses','🎥','Live Classes',liveCount],['exams','📝','Exams',exNow],['library','📚','Library',0],['results','📑','Results',0],['clearance','✅','Clearance',0],['documents','📂','Documents',0]];
   if(d.misconduct&&d.misconduct.length)segs.push(['discipline','⚖️','Discipline',d.misconduct.length]);
   if((sv.flags&&sv.flags.length)||(sv.attendance&&sv.attendance.length))segs.push(['surveillance','🛡','Exam Conduct',openFlags]);
+  if(d.surveys&&d.surveys.length)segs.push(['evaluation','⭐','Evaluation',d.surveys.length]);
   segs.push(['profile','👤','Profile',0]);
   var navHtml=segs.map(function(s){return '<a data-seg="'+s[0]+'"><span class="ic">'+s[1]+'</span><span class="lbl">'+s[2]+'</span>'+(s[3]?'<span class="pill">'+s[3]+'</span>':'')+'</a>';}).join('');
   // --- profile + photo pinned at the TOP (full width) ---
@@ -2497,7 +2984,8 @@ function studentView(w,d){
   html+=seg('fees',
     '<h2 class="sectitle">💳 Fees &amp; Payments</h2>'
     +'<div class="panel"><h3>Outstanding Fees</h3>'+tbl([{t:'Fee Category',f:function(r){return cap(r.category);}},{t:'Currency',f:function(r){return r.currency;}},{t:'Billed',r:1,f:function(r){return money(r.billed,r.currency);}},{t:'Paid',r:1,f:function(r){return money(r.paid,r.currency);}},{t:'Outstanding',r:1,f:function(r){return '<span class=neg>'+money(r.outstanding,r.currency)+'</span>';}}],d.outstanding,'You owe nothing. 🎉')+'</div>'
-    +'<div class="panel"><h3>All Fees &amp; Charges</h3>'+tbl([{t:'Date',f:function(r){return fmt(r.date);}},{t:'Description',f:function(r){return (eh(r.description)||cap(r.category))+' '+(r.rollover?'<span class="badge" style="background:#fef3c7;color:#92400e">Rollover'+(r.rolled_from?' · '+eh(r.rolled_from):'')+'</span>':'<span class="badge" style="background:#dbeafe;color:#1e40af">Current</span>');}},{t:'Category',f:function(r){return cap(r.category);}},{t:'Set By',f:function(r){return eh(r.by||'—');}},{t:'Amount',r:1,f:function(r){return money(r.amount,r.currency);}}],d.charges,'No charges yet.')+'</div>');
+    +'<div class="panel"><h3>All Fees &amp; Charges</h3>'+tbl([{t:'Date',f:function(r){return fmt(r.date);}},{t:'Description',f:function(r){return (eh(r.description)||cap(r.category))+' '+(r.rollover?'<span class="badge" style="background:#fef3c7;color:#92400e">Rollover'+(r.rolled_from?' · '+eh(r.rolled_from):'')+'</span>':'<span class="badge" style="background:#dbeafe;color:#1e40af">Current</span>');}},{t:'Category',f:function(r){return cap(r.category);}},{t:'Set By',f:function(r){return eh(r.by||'—');}},{t:'Amount',r:1,f:function(r){return money(r.amount,r.currency);}}],d.charges,'No charges yet.')+'</div>'
+    +((d.invoices&&d.invoices.length)?('<div class="panel"><h3>Fee Invoices</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Download the invoice PDF from your <b>Documents</b> tab.</div>'+tbl([{t:'Invoice',f:function(r){return eh(r.invoice_no);}},{t:'Amount',r:1,f:function(r){return money(r.amount,r.currency);}},{t:'Due',f:function(r){return eh(r.due_date||'—');}},{t:'Status',f:function(r){return '<span class="badge">'+cap(r.status)+'</span>';}}],d.invoices,'No invoices.')+'</div>'):''));
   // RECEIPTS
   html+=seg('receipts',
     '<h2 class="sectitle">🧾 Payment History &amp; Receipts</h2>'
@@ -2629,7 +3117,9 @@ function studentView(w,d){
     ],sc.semesters,'No results published yet.')
     +'<div style="margin-top:10px"><button class="btn sm ghost" onclick="doc(\\'/doc/result-slip\\')">⬇️ Download full statement (all semesters)</button></div>'
     +'</div>'
-  ):'<div class="empty">No results published yet. They will appear here once your results are released.</div>';
+  ):(d.resultsWithheld
+    ?'<div class="exbar warn">⚠ Some or all of your results for this period are currently <b>withheld</b> by the Examinations Board (e.g. pending board approval or an outstanding obligation). Please contact the Registry. They will appear here once released.</div>'
+    :'<div class="empty">No results published yet. They will appear here once your results are released.</div>');
   html+=seg('results',
     '<h2 class="sectitle">📑 My Results</h2>'
     +resultsHtml
@@ -2641,14 +3131,43 @@ function studentView(w,d){
     +(((clr.certs&&clr.certs.length))?('<div class="qa">'+clr.certs.map(function(ct){return '<button class="btn sm" onclick="doc(\\'/doc/clearance/'+ct.id+'\\')">📄 Download my '+eh(ct.typeName)+' clearance certificate</button>';}).join('')+'</div>'):'')
     +'<div class="panel"><h3>Exam Validation History</h3>'+tbl([{t:'Date',f:function(r){return fmt(r.date);}},{t:'Type',f:function(r){return cap(r.exam_type||'exam');}},{t:'Session',f:function(r){return eh(r.session||'—')+(r.semester?(' · '+eh(r.semester)):'');}},{t:'Result',f:function(r){return '<span class="'+(r.status==='valid'?'pos':'neg')+'" style="font-weight:800">'+(r.status==='valid'?'CLEARED':'DENIED')+'</span>';}},{t:'Reason',f:function(r){return eh(r.reason||'—');}}],d.validations,'No exam validations yet.')+'</div>');
   // DOCUMENTS
+  var trqRows=(d.transcriptRequests||[]);
+  var trqBadge=function(s){var c=s==='dispatched'?'pos':(s==='rejected'?'neg':'');return '<span class="'+c+'" style="font-weight:800">'+cap(s||'pending')+'</span>';};
   html+=seg('documents',
     '<h2 class="sectitle">📂 University Documents</h2>'
-    +'<div class="panel">'+tbl([{t:'Title',f:function(r){return eh(r.title||'Document');}},{t:'Type',f:function(r){return '<span class="badge">'+eh(r.category||'Document')+'</span>';}},{t:'From Office',f:function(r){return eh(r.office||'—')+(r.by?'<br><span class="muted" style="font-size:11px">'+eh(r.by)+'</span>':'');}},{t:'Date',f:function(r){return fmt(r.date);}},{t:'',r:1,f:function(r){return '<button class="btn sm" onclick="doc(\\'/doc/portal-document/'+r.id+'\\')">Download</button>';}}],d.documents,'No documents published yet.')+'</div>');
+    +'<div class="panel">'+tbl([{t:'Title',f:function(r){return eh(r.title||'Document');}},{t:'Type',f:function(r){return '<span class="badge">'+eh(r.category||'Document')+'</span>';}},{t:'From Office',f:function(r){return eh(r.office||'—')+(r.by?'<br><span class="muted" style="font-size:11px">'+eh(r.by)+'</span>':'');}},{t:'Date',f:function(r){return fmt(r.date);}},{t:'',r:1,f:function(r){return '<button class="btn sm" onclick="doc(\\'/doc/portal-document/'+r.id+'\\')">Download</button>';}}],d.documents,'No documents published yet.')+'</div>'
+    +'<div class="panel"><h3>Request an Official Document</h3>'
+    +'<div class="muted" style="font-size:12.5px;margin-bottom:8px">Request a signed official transcript or degree certificate. The Registry processes it, emails you a copy and places it in your Documents above.</div>'
+    +'<div class="qa"><button class="btn sm" onclick="reqTranscript(\\'transcript\\')">📜 Request Transcript</button><button class="btn sm" onclick="reqTranscript(\\'certificate\\')">🎓 Request Certificate</button></div>'
+    +tbl([{t:'Type',f:function(r){return cap(r.kind||'transcript');}},{t:'Purpose',f:function(r){return eh(r.purpose||'—');}},{t:'Requested',f:function(r){return fmt(r.date);}},{t:'Status',f:function(r){return trqBadge(r.status)+(r.status==='rejected'&&r.note?(' <span class="muted">('+eh(r.note)+')</span>'):'');}}],trqRows,'No requests yet.')+'</div>');
   // DISCIPLINE
   if(d.misconduct&&d.misconduct.length){
     html+=seg('discipline',
       '<h2 class="sectitle">⚖️ Disciplinary Records</h2>'
       +'<div class="panel">'+tbl([{t:'Date',f:function(r){return fmt(r.date);}},{t:'Offense',f:function(r){return eh(r.offense||'—');}},{t:'Severity',f:function(r){return sevBadge(r.severity);}},{t:'Action',f:function(r){return cap(r.action||'—');}},{t:'Fine',r:1,f:function(r){return r.fine>0?money(r.fine,r.currency):'—';}},{t:'Status',f:function(r){return stBadge(r.status);}},{t:'Note',f:function(r){return eh(r.note||'—');}}],d.misconduct,'No misconduct on record.')+'</div>');
+  }
+  // EVALUATION — open anonymous course/lecturer evaluation surveys for this student's cohort
+  if(d.surveys&&d.surveys.length){
+    var evHtml=d.surveys.map(function(sv){
+      var nr=(sv.questions||[]).filter(function(q){return q.type!=='text';}).length;
+      var qs=(sv.questions||[]).map(function(q){
+        if(q.type==='text')return '<div style="margin-bottom:12px"><div style="font-weight:600;font-size:13.5px;margin-bottom:4px">'+eh(q.text)+'</div><textarea data-qid="'+eh(q.id)+'" rows="2" style="width:100%"></textarea></div>';
+        var st='';for(var n=1;n<=5;n++)st+='<label style="display:inline-flex;align-items:center;gap:4px;margin-right:12px;font-size:13px"><input type="radio" name="q_'+sv.id+'_'+q.id+'" data-qid="'+eh(q.id)+'" value="'+n+'" style="width:auto"> '+n+'</label>';
+        return '<div style="margin-bottom:12px"><div style="font-weight:600;font-size:13.5px;margin-bottom:4px">'+eh(q.text)+'</div><div>'+st+'<span class="muted" style="font-size:11px">(1 = poor · 5 = excellent)</span></div></div>';
+      }).join('');
+      return '<div class="panel" id="survey-'+sv.id+'" data-ratings="'+nr+'" style="padding:16px">'
+        +'<div style="font-weight:800;font-size:15px">'+eh(sv.title)+'</div>'
+        +((sv.course||sv.lecturer)?('<div class="muted" style="font-size:12px;margin-top:2px">'+eh([sv.course,sv.lecturer].filter(Boolean).join(' · '))+'</div>'):'')
+        +(sv.description?('<div class="muted" style="font-size:12.5px;margin:6px 0">'+eh(sv.description)+'</div>'):'')
+        +'<div style="margin-top:10px">'+qs+'</div>'
+        +'<div style="margin-bottom:12px"><div style="font-weight:600;font-size:13.5px;margin-bottom:4px">Additional comments (optional)</div><textarea class="svcomment" rows="2" style="width:100%"></textarea></div>'
+        +'<button class="btn sm svsubmit" onclick="submitSurvey(\\''+sv.id+'\\')">Submit Evaluation</button>'
+        +'</div>';
+    }).join('');
+    html+=seg('evaluation',
+      '<h2 class="sectitle">⭐ Course &amp; Lecturer Evaluation</h2>'
+      +'<div class="muted" style="font-size:12.5px;margin-bottom:10px">Your feedback is <b>anonymous</b> and helps improve teaching. Please rate each statement from 1 (poor) to 5 (excellent).</div>'
+      +evHtml);
   }
   // PROFILE
   html+=seg('profile',
@@ -2684,6 +3203,10 @@ function staffView(w,d){
   w.appendChild($('<div class="panel"><div class="prof">'+(p.photo?'<img src="'+p.photo+'">':'<div class="ph">👤</div>')+'<div><div class="nm">'+p.full_name+' <span class="badge">'+p.type+'</span></div><div class="meta">'+(p.staff_no||'—')+' · '+(p.position||p.title||'—')+'</div><div class="meta">'+(p.department||p.faculty||'')+' · '+(p.email||'')+'</div></div></div></div>'));
   w.appendChild($('<div class="kpis"><div class="kpi"><div class="l">Base / Default Pay</div><div class="v">'+money(p.base_salary,p.currency)+'</div></div><div class="kpi"><div class="l">Payslips</div><div class="v">'+d.payslips.length+'</div></div><div class="kpi"><div class="l">Bank</div><div class="v" style="font-size:15px">'+(p.bank_name||'—')+'</div></div></div>'));
   w.appendChild($('<div class="panel"><h3>My Payslips</h3>'+tbl([{t:'Period',f:r=>r.period||'—'},{t:'Type',f:r=>cap(r.run_type||'staff')},{t:'Status',f:r=>'<span class="badge">'+cap(r.status||'draft')+'</span>'},{t:'Net Pay',r:1,f:r=>money(r.net,r.currency)},{t:'',r:1,f:r=>'<button class="btn sm" onclick="doc(\\'/doc/payslip/'+r.id+'\\')">Payslip</button>'}],d.payslips,'No payslips yet.')+'</div>'));
+  // INVIGILATION — exam duties assigned to this staff member
+  if(d.invigilations&&d.invigilations.length){
+    w.appendChild($('<div class="panel"><h3>🧑‍🏫 My Invigilation Duties</h3><div class="muted" style="font-size:12.5px;margin-bottom:6px">Examinations you have been assigned to invigilate. Please report to the room ahead of the start time.</div>'+tbl([{t:'Date',f:r=>fmt(r.date)},{t:'Time',f:r=>eh((r.start||'')+'–'+(r.end||''))},{t:'Room',f:r=>eh(r.room||'—')},{t:'Course',f:r=>eh(r.course||'—')},{t:'Cohort',f:r=>eh([r.department,r.level].filter(Boolean).join(' · ')||'—')}],d.invigilations,'No invigilation duties assigned.')+'</div>'));
+  }
   // LIVE CLASSES — a lecturer HOSTS the live video class for each course they teach
   if(d.liveClasses&&d.liveClasses.length){
     window.__lcName=encodeURIComponent((p.full_name||'Lecturer')+' (Lecturer)'); window.__lcHost=true;
@@ -3047,7 +3570,7 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(m){return
 function office(o){return ({registrar:'Registrar',dean:'Dean / Faculty Head',student_affairs:'Student Affairs'})[o]||o;}
 function row(k,v){return '<tr><td>'+k+'</td><td>'+esc(v||'—')+'</td></tr>';}
 function extractId(raw){raw=String(raw||'').trim();var m=/[?&]c=([^&\\s]+)/.exec(raw);if(m)return decodeURIComponent(m[1]);return raw.replace(/^UBU-CLR:/i,'').trim();}
-function extractCode(raw){raw=String(raw||'').trim();var m=/[?&]r=([^&\\s]+)/.exec(raw);if(m)return{type:'r',id:decodeURIComponent(m[1])};if(/^UBU-RCT:/i.test(raw))return{type:'r',id:raw.replace(/^UBU-RCT:/i,'').trim()};m=/[?&]c=([^&\\s]+)/.exec(raw);if(m)return{type:'c',id:decodeURIComponent(m[1])};return{type:'c',id:raw.replace(/^UBU-CLR:/i,'').trim()};}
+function extractCode(raw){raw=String(raw||'').trim();var m=/[?&]res=([^&\\s]+)/.exec(raw);if(m)return{type:'res',id:decodeURIComponent(m[1])};if(/^UBU-TRX:/i.test(raw))return{type:'res',id:raw.replace(/^UBU-TRX:/i,'').trim()};m=/[?&]r=([^&\\s]+)/.exec(raw);if(m)return{type:'r',id:decodeURIComponent(m[1])};if(/^UBU-RCT:/i.test(raw))return{type:'r',id:raw.replace(/^UBU-RCT:/i,'').trim()};m=/[?&]p=([^&\\s]+)/.exec(raw);if(m)return{type:'p',id:decodeURIComponent(m[1])};m=/[?&]c=([^&\\s]+)/.exec(raw);if(m)return{type:'c',id:decodeURIComponent(m[1])};return{type:'c',id:raw.replace(/^UBU-CLR:/i,'').trim()};}
 function renderResult(el,d){
   if(!d||!d.valid){el.innerHTML='<div class="rcard invalid"><div class="big">✗ INVALID</div><p>This code does not match any record on file. The document may be forged, altered, or not yet issued.</p><button class="btn" onclick="resetView&&resetView()">Check another</button></div>';return;}
   if(d.kind==='receipt'){var rs=d.student;
@@ -3071,11 +3594,13 @@ function renderResult(el,d){
      '<table>'+row('Faculty',su.faculty)+row('Department',su.department)+row('Level',su.level)+row('Student status',su.status)+(d.session?row('Session',d.session):'')+row('Verification ref',d.ref)+'</table>'+
      '<button class="btn" onclick="resetView&&resetView()">Check another</button></div>';
     return;}
-  if(d.kind==='result'){var rs=d.student;
+  if(d.kind==='result'){var rs=d.student;var grad=!!d.graduated;
     el.innerHTML='<div class="rcard valid">'+
-     '<div class="big">✓ GENUINE RESULT</div>'+
+     '<div class="big">'+(grad?'🎓 GENUINE GRADUATE':'✓ GENUINE RESULT')+'</div>'+
      '<div class="who">'+(rs.photo?'<img src="'+rs.photo+'" alt="photo">':'<div class="ph">🎓</div>')+'<div><div class="nm">'+esc(rs.name)+'</div><div class="mt">'+esc(rs.matric)+'</div></div></div>'+
-     '<table>'+row('Faculty',rs.faculty)+row('Department',rs.department)+row('Level',rs.level)+(d.session?row('Session',d.session):'')+(d.semester?row('Semester',d.semester):'')+row('Courses',String(d.courses))+row('GPA',String(d.gpa))+row('CGPA',String(d.cgpa))+row('Class standing',d.standing)+row('Verification ref',d.ref)+'</table>'+
+     '<table>'+row('Faculty',rs.faculty)+row('Department',rs.department)+row('Level',rs.level)+(d.session?row('Session',d.session):'')+(d.semester?row('Semester',d.semester):'')+row('Courses',String(d.courses))+row('GPA',String(d.gpa))+row('CGPA',String(d.cgpa))+row('Class standing',d.standing)+
+       (grad?(row('Graduation status','Graduated')+(d.classification?row('Class of degree',d.classification):'')+(d.graduationSession?row('Graduation session',d.graduationSession):'')):'')+
+       row('Verification ref',d.ref)+'</table>'+
      '<button class="btn" onclick="resetView&&resetView()">Check another</button></div>';
     return;}
   var s=d.student;var ok=d.completed;var tn=d.typeName||'Examination';var mid=d.clearanceType==='midterm';
@@ -3168,15 +3693,16 @@ const VERIFY_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 ${RESULT_CSS}
 </style></head><body>
 <div class="bar">🛡 Document Verification</div>
-<div class="lookup"><input id="code" placeholder="Clearance or receipt code / link"><button class="b" id="lk">Verify</button></div>
+<div class="lookup"><input id="code" placeholder="Paste a certificate / transcript / receipt / clearance code or link"><button class="b" id="lk">Verify</button></div>
 <div id="result"></div>
 <script>
 ${RESULT_JS}
 function resetView(){location.href='/scan';}
 var el=document.getElementById('result');
-var q=new URLSearchParams(location.search);var rr=q.get('r');var pp=q.get('p');var st=q.get('student');var c=q.get('c')||q.get('ref');
+var q=new URLSearchParams(location.search);var rr=q.get('r');var pp=q.get('p');var st=q.get('student');var rsq=q.get('res');var c=q.get('c')||q.get('ref');
 document.getElementById('lk').onclick=function(){doVerify(el,extractCode(document.getElementById('code').value));};
-if(st){document.getElementById('code').value=st;doVerify(el,{type:'student',id:st});}
+if(rsq){document.getElementById('code').value=rsq;doVerify(el,{type:'res',id:rsq});}
+else if(st){document.getElementById('code').value=st;doVerify(el,{type:'student',id:st});}
 else if(pp){document.getElementById('code').value=pp;doVerify(el,{type:'p',id:pp});}
 else if(rr){document.getElementById('code').value=rr;doVerify(el,{type:'r',id:rr});}
 else if(c){document.getElementById('code').value=c;doVerify(el,extractCode(c));}
