@@ -273,6 +273,9 @@ if (createPortal) {
       // desktop-started class does via the sync ingest. portal.js calls this ONLY for a genuinely new
       // session (it skips a re-host), so there is no duplicate notification. Best-effort + async.
       onLiveStart: (row) => { try { pushLiveSession(row).catch(() => {}); } catch (_) {} },
+      // Send an applicant email (application confirmation + status updates) directly via the hub's SMTP
+      // relay. Best-effort + async — it NEVER blocks or fails the apply flow; a missing relay just no-ops.
+      sendMail: (msg) => { try { if (!relayConfigured()) return Promise.resolve({ ok: false, error: 'relay not configured' }); return relaySend(msg).then(r => r || { ok: true }).catch(e => ({ ok: false, error: e && e.message })); } catch (e) { return Promise.resolve({ ok: false, error: e && e.message }); } },
       // native app registers its FCM token here so we can push it when a document is posted
       registerDevice: (token, account) => {
         if (!token) return false;
@@ -415,7 +418,14 @@ function readBody(req) {
   });
 }
 
+// Resilience: never let a stray async rejection or uncaught exception take the whole hub down — log it
+// and keep serving (per-request errors are already contained by the handler's try/catch below). Without
+// these, one unhandled rejection would crash the process and knock the portal offline for everyone.
+process.on('unhandledRejection', (reason) => { try { console.error('[hub] unhandledRejection:', (reason && reason.stack) || reason); } catch (_) {} });
+process.on('uncaughtException', (err) => { try { console.error('[hub] uncaughtException:', (err && err.stack) || err); } catch (_) {} });
+
 const server = http.createServer(async (req, res) => {
+ try { // top-level guard: a single bad request must never crash the hub (it serves every online user)
   let u; try { u = new URL(req.url, 'http://local'); } catch (_) { return send(res, 400, { ok: false }); }
   const p = u.pathname.replace(/\/+$/, '') || '/';
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' }); return res.end(); }
@@ -496,6 +506,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   send(res, 404, { ok: false, error: 'not found' });
+ } catch (e) {
+  try { console.error('[hub] request error:', req.method, req.url, '—', e && e.message); } catch (_) {}
+  try { if (!res.headersSent) send(res, 500, { ok: false, error: 'server error' }); else res.end(); } catch (_) {}
+ }
 });
 
 server.on('error', (e) => {
