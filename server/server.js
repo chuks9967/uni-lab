@@ -28,7 +28,7 @@ catch (e) { console.error('[UniBursar] portal.js not loaded (' + e.message + ') 
 let fcm = null;
 try { fcm = require('./fcm'); } catch (_) { fcm = null; }
 
-const BUILD = 'portal-21'; // bump when server changes — visible at /health to confirm the live code
+const BUILD = 'portal-26'; // bump when server changes — visible at /health to confirm the live code
 const PORT = process.env.PORT || 4000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const SYNC_TOKEN = process.env.SYNC_TOKEN || ''; // optional shared secret
@@ -280,9 +280,11 @@ if (createPortal) {
         save(); persistDeviceTokens(); // survive Cloud Run cold starts
         return true;
       },
-      institution: () => (store.branding && store.branding.name)
-        ? store.branding
-        : { name: process.env.INSTITUTION_NAME || 'UniBursar University', short: process.env.INSTITUTION_SHORT || 'UBU', logo: process.env.INSTITUTION_LOGO || '', motto: process.env.INSTITUTION_MOTTO || '' },
+      institution: () => Object.assign(
+        { language: process.env.PORTAL_LANGUAGE || '', i18n_custom: '' }, // multi-language default (overridden by synced branding if it carries one)
+        (store.branding && store.branding.name)
+          ? store.branding
+          : { name: process.env.INSTITUTION_NAME || 'UniBursar University', short: process.env.INSTITUTION_SHORT || 'UBU', logo: process.env.INSTITUTION_LOGO || '', motto: process.env.INSTITUTION_MOTTO || '' }),
       // Live-class video config (8x8 JaaS / self-hosted Jitsi). Set these env vars on the host to remove
       // the meet.jit.si Google-login wall: JITSI_MODE=jaas, JAAS_APP_ID, JAAS_KID, JAAS_PRIVATE_KEY
       // (the RSA private key PEM — newlines may be written as \n). Leave unset for plain meet.jit.si.

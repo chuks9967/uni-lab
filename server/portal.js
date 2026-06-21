@@ -74,6 +74,33 @@ module.exports = function createPortal(deps) {
   const examFrames = {};
   const lastFrameTs = {};                         // per-student rate-limit
 
+  // ---- login brute-force throttle (in-memory; keyed per login+IP) ----
+  // The portal is network-facing and its HMAC tokens are stateless (no server session store to lean on),
+  // so this small limiter is the main thing between the login and an online password-guessing attack.
+  // After LOGIN_MAX failures inside LOGIN_WINDOW a login+IP is locked for LOGIN_BLOCK; a success clears it.
+  // Keying on login+IP (not IP alone) means one student fat-fingering their password can never lock out
+  // the rest of a shared campus connection.
+  const LOGIN_MAX = 8, LOGIN_WINDOW = 15 * 60 * 1000, LOGIN_BLOCK = 15 * 60 * 1000;
+  const loginFails = new Map();                    // key -> { n, first, until }
+  function clientIp(req) { return String((req.headers['x-forwarded-for'] || '').split(',')[0].trim() || (req.socket && req.socket.remoteAddress) || ''); }
+  function loginKey(req, login) { return String(login || '').trim().toLowerCase() + '|' + clientIp(req); }
+  /** Seconds remaining on a lock, or 0 if not blocked (clears an elapsed lock as a side effect). */
+  function loginBlocked(key) {
+    const e = loginFails.get(key); if (!e || !e.until) return 0;
+    if (Date.now() < e.until) return Math.ceil((e.until - Date.now()) / 1000);
+    loginFails.delete(key); return 0;              // cooldown elapsed → reset
+  }
+  function loginFailed(key) {
+    const now = Date.now();
+    let e = loginFails.get(key);
+    if (!e || (now - e.first) > LOGIN_WINDOW) e = { n: 0, first: now, until: 0 };
+    e.n++; if (e.n >= LOGIN_MAX) e.until = now + LOGIN_BLOCK;
+    loginFails.set(key, e);
+    if (loginFails.size > 5000) for (const [k, v] of loginFails) if ((!v.until || now >= v.until) && (now - v.first) > LOGIN_WINDOW) loginFails.delete(k);
+    return e;
+  }
+  function loginOk(key) { loginFails.delete(key); }
+
   // ---- Face Biometric (pure-maths 1:1 / identity-hold; mirrors electron/services/face.js) ----
   // The 128-D descriptors are computed in the student's browser (face-api.js, served below from
   // server/face/) and POSTed here; matching is Euclidean distance, so it runs with zero deps and
@@ -1017,6 +1044,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       id: s.id, full_name: `${s.first_name || ''} ${s.last_name || ''}`.trim(), matric_no: s.matric_no,
       email: s.email, phone: s.phone, gender: s.gender, photo: s.photo, nationality: s.nationality,
       faculty: nameOf('faculties', s.faculty_id), department: nameOf('departments', s.department_id), level: nameOf('levels', s.level_id),
+      campus: nameOf('campuses', s.campus_id),
       status: s.status,
     };
   }
@@ -1234,22 +1262,34 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       // session / semester
       return (!period.session || (r.session_id || '') === period.session) && (!period.semester || (r.semester_id || '') === period.semester);
     };
-    const completed = all('payments').filter(p => p.status === 'completed' && inP(p));
+    // a campus-pinned officer (e.g. a campus accountant) only sees their campus; the super admin (no
+    // campus_id) sees every campus. This mirrors campus.scopeFor on the desktop.
+    const oc = u.campus_id || null;
+    const inC = (r) => !oc || r.campus_id === oc;
+    const completed = all('payments').filter(p => p.status === 'completed' && inP(p) && inC(p));
     const out = {
       profile: { id: u.id, full_name: u.full_name, role, email: u.email, photo: u.photo || '' },
       periods: { sessions: all('academic_sessions').map(s => ({ id: s.id, name: s.name })), semesters: all('semesters').map(s => ({ id: s.id, name: s.name, session_id: s.session_id })) },
       period: period || {},
     };
-    if (role === 'accountant' || role === 'admin') {
+    if (role === 'accountant' || role === 'admin' || role === 'campus_admin') {
       const collected = {}; const billed = {}; const expenses = {};
       for (const p of completed) collected[p.currency] = (collected[p.currency] || 0) + p.amount;
-      for (const c of all('charges').filter(inP)) billed[c.currency] = (billed[c.currency] || 0) + c.amount;
-      for (const e of all('expenses').filter(inP)) expenses[e.currency] = (expenses[e.currency] || 0) + e.amount;
-      const students = all('students').filter(s => s.status !== 'alumni');
+      for (const c of all('charges').filter(c => inP(c) && inC(c))) billed[c.currency] = (billed[c.currency] || 0) + c.amount;
+      for (const e of all('expenses').filter(e => inP(e) && inC(e))) expenses[e.currency] = (expenses[e.currency] || 0) + e.amount;
+      const students = all('students').filter(s => s.status !== 'alumni' && inC(s));
       let debtors = 0; for (const s of students) if (Object.values(balancesFor(s.id)).some(v => v > 0.001)) debtors++;
       out.kind = 'finance';
       out.canPickOffice = true;
       out.cards = { collected, billed, expenses, students: students.length, debtors };
+      // per-campus student headcount — only meaningful for the super admin (a campus officer sees one)
+      const camps = all('campuses');
+      if (camps.length > 1 && !oc) {
+        const rows = camps.map(c => ({ name: c.name, students: students.filter(s => s.campus_id === c.id).length }));
+        const unassigned = students.filter(s => !s.campus_id).length;
+        if (unassigned) rows.push({ name: 'Unassigned', students: unassigned });
+        out.campuses = rows;
+      }
       const OFFICE_LABEL = { accountant: 'Bursary / Accountant', registrar: 'Registrar', dean: 'Faculty Head (Dean)', student_affairs: 'Student Affairs', admin: 'Administration' };
       const userName = (id) => { const x = id ? one('users', id) : null; return x ? x.full_name : '—'; };
       // collections grouped by the office that collected them
@@ -1279,7 +1319,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       out.kind = 'dean'; out.collected = {}; out.expenses = {};
       for (const p of completed) if (p.raised_by === u.id || p.decided_by === u.id) out.collected[p.currency] = (out.collected[p.currency] || 0) + p.amount;
       for (const e of all('expenses').filter(e => e.recorded_by === u.id && inP(e))) out.expenses[e.currency] = (out.expenses[e.currency] || 0) + e.amount;
-      const inFac = all('students').filter(s => s.faculty_id === u.faculty_id && s.status !== 'alumni');
+      const inFac = all('students').filter(s => s.faculty_id === u.faculty_id && s.status !== 'alumni' && (!u.campus_id || s.campus_id === u.campus_id));
       out.debtors = [];
       for (const s of inFac) {
         const bal = {};
@@ -1293,7 +1333,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       out.kind = 'dean'; out.collected = {}; out.expenses = {}; out.scopeLabel = 'Department: ' + (nameOf('departments', u.department_id) || '—');
       for (const p of completed) if (p.raised_by === u.id || p.decided_by === u.id) out.collected[p.currency] = (out.collected[p.currency] || 0) + p.amount;
       for (const e of all('expenses').filter(e => e.recorded_by === u.id && inP(e))) out.expenses[e.currency] = (out.expenses[e.currency] || 0) + e.amount;
-      const inDept = all('students').filter(s => s.department_id === u.department_id && s.status !== 'alumni');
+      const inDept = all('students').filter(s => s.department_id === u.department_id && s.status !== 'alumni' && (!u.campus_id || s.campus_id === u.campus_id));
       out.debtors = [];
       for (const s of inDept) {
         const bal = {};
@@ -1774,8 +1814,12 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
   // the FEE AMOUNT itself rides on the synced application (set by the registrar's Offer).
   function genAppNo() {
     const short = String(inst().short || 'WAUU').replace(/[^A-Za-z0-9]/g, '').toUpperCase() || 'WAUU';
-    const seq = all('admission_applications').length + 1;
-    return `${short}/APP/${new Date().getFullYear()}/${String(seq).padStart(5, '0')}`;
+    // Monotonic over the HIGHEST existing number, not the COUNT: `all` excludes deleted rows, so a
+    // count+1 would reuse a number after any application is deleted — and app_no is the applicant's
+    // login key (apply/login finds by it), so a reused number locks the newer applicant out.
+    let max = 0;
+    for (const a of all('admission_applications')) { const m = /(\d+)\s*$/.exec(String(a.app_no || '')); if (m) max = Math.max(max, Number(m[1])); }
+    return `${short}/APP/${new Date().getFullYear()}/${String(max + 1).padStart(5, '0')}`;
   }
   const genPasscode = () => crypto.randomBytes(5).toString('hex').toUpperCase().slice(0, 8);
   const applicantToken = (id) => sign({ k: 'applicant', id, exp: Date.now() + 1000 * 60 * 60 * 24 * 30 }); // 30-day temp pass
@@ -1784,16 +1828,19 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     if (!a) return null;
     const docs = all('admission_documents').filter(d => d.application_id === a.id && !d.deleted).map(d => ({ id: d.id, kind: d.kind, filename: d.filename, uploaded_at: d.uploaded_at }));
     const { passcode_hash, ...rest } = a; // never expose the passcode hash to the client
-    return Object.assign(rest, { department_name: nameOf('departments', a.department_id), faculty_name: nameOf('faculties', a.faculty_id), level_name: nameOf('levels', a.level_id), documents: docs });
+    return Object.assign(rest, { department_name: nameOf('departments', a.department_id), faculty_name: nameOf('faculties', a.faculty_id), campus_name: nameOf('campuses', a.campus_id), level_name: nameOf('levels', a.level_id), documents: docs });
   }
   function programmesPayload() {
     const faculties = all('faculties').filter(f => !f.deleted);
     const departments = all('departments').filter(d => !d.deleted);
     const levels = all('levels').filter(l => !l.deleted).sort((a, b) => (a.rank || 0) - (b.rank || 0)).map(l => ({ id: l.id, name: l.name }));
-    const grouped = faculties.map(f => ({ id: f.id, name: f.name, departments: departments.filter(d => d.faculty_id === f.id).map(d => ({ id: d.id, name: d.name })) })).filter(f => f.departments.length);
+    // Multi-campus: applicants pick the campus they're applying to. Each faculty carries its campus_id so
+    // the form can show only that campus's programmes. (A single-campus institution sends an empty list.)
+    const campuses = all('campuses').filter(c => !c.deleted).sort((a, b) => (b.is_main ? 1 : 0) - (a.is_main ? 1 : 0)).map(c => ({ id: c.id, name: c.name }));
+    const grouped = faculties.map(f => ({ id: f.id, name: f.name, campus_id: f.campus_id || null, departments: departments.filter(d => d.faculty_id === f.id).map(d => ({ id: d.id, name: d.name })) })).filter(f => f.departments.length);
     const orphans = departments.filter(d => !faculties.some(f => f.id === d.faculty_id));
-    if (orphans.length) grouped.push({ id: '_other', name: 'Other Programmes', departments: orphans.map(d => ({ id: d.id, name: d.name })) });
-    return { faculties: grouped, levels, open: (String(process.env.ADMISSIONS_OPEN || '1') !== '0') };
+    if (orphans.length) grouped.push({ id: '_other', name: 'Other Programmes', campus_id: null, departments: orphans.map(d => ({ id: d.id, name: d.name })) });
+    return { faculties: grouped, levels, campuses, open: (String(process.env.ADMISSIONS_OPEN || '1') !== '0') };
   }
   // minimal Paystack client (optional — only used when PAYSTACK_SECRET is set in the server env)
   function paystackReq(pathName, method, payload) {
@@ -1893,7 +1940,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const ended = !live && rows.length > 0;
       return J(res, 200, { ok: true, live, ended });
     }
-    if (p === '/api/branding' && method === 'GET') { const i = inst(); return J(res, 200, { ok: true, name: i.name, short: i.short, logo: i.logo, motto: i.motto }); }
+    if (p === '/api/branding' && method === 'GET') { const i = inst(); return J(res, 200, { ok: true, name: i.name, short: i.short, logo: i.logo, motto: i.motto, language: i.language || '', i18n_custom: i.i18n_custom || '' }); }
 
     // ---- installable app assets + public clearance verification (no login) ----
     if (method === 'GET' && p === '/manifest.webmanifest') return S(res, 200, MANIFEST_PORTAL, 'application/manifest+json');
@@ -1944,13 +1991,17 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
 
     if (p === '/api/login' && method === 'POST') {
       const body = await readBody();
+      const key = loginKey(req, body.login);
+      const wait = loginBlocked(key);
+      if (wait) return J(res, 200, { ok: false, error: `Too many failed attempts. Please wait about ${Math.ceil(wait / 60)} minute(s) and try again.` });
       const acc = findAccount(body.login);
-      if (!acc || !verifyPass(body.password, passField(acc.kind, acc.row))) return J(res, 200, { ok: false, error: 'Invalid login or password. (Officers: sign in to the desktop app once to activate your portal access.)' });
+      if (!acc || !verifyPass(body.password, passField(acc.kind, acc.row))) { loginFailed(key); return J(res, 200, { ok: false, error: 'Invalid login or password. (Officers: sign in to the desktop app once to activate your portal access.)' }); }
       // officer MFA: a 6-digit authenticator code is required after the password when enrolled
       if (acc.kind === 'user' && acc.row.mfa_enabled) {
         if (!body.code) return J(res, 200, { ok: false, mfaRequired: true, error: 'Enter the 6-digit code from your authenticator app.' });
-        if (!totpVerify(acc.row.mfa_secret, body.code)) return J(res, 200, { ok: false, mfaRequired: true, error: 'Incorrect authenticator code — try again.' });
+        if (!totpVerify(acc.row.mfa_secret, body.code)) { loginFailed(key); return J(res, 200, { ok: false, mfaRequired: true, error: 'Incorrect authenticator code — try again.' }); }
       }
+      loginOk(key);
       const token = sign({ k: acc.kind, id: acc.row.id, role: acc.role, exp: Date.now() + 1000 * 60 * 60 * 12 });
       const name = (acc.kind === 'student') ? `${acc.row.first_name || ''} ${acc.row.last_name || ''}`.trim()
         : (acc.kind === 'parent') ? (acc.row.parent_name || 'Parent/Guardian') : acc.row.full_name;
@@ -1969,11 +2020,14 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return J(res, 200, { ok: false, error: 'Enter a valid email address.' });
       if (typeof create !== 'function') return J(res, 200, { ok: false, error: 'Applications are not available on this server.' });
       const dept = body.department_id ? one('departments', body.department_id) : null;
+      const fac = dept ? one('faculties', dept.faculty_id) : null;
+      // the applicant's chosen campus; fall back to the campus of the programme's faculty when not picked
+      const campusId = body.campus_id || (fac ? (fac.campus_id || null) : null);
       const id = crypto.randomUUID(); const passcode = genPasscode(); const now = new Date().toISOString();
       create('admission_applications', {
         id, app_no: genAppNo(), passcode_hash: hashPass(passcode),
         first_name: first, last_name: last, email, phone: String(body.phone || '').trim(),
-        faculty_id: dept ? dept.faculty_id : null, department_id: dept ? dept.id : (body.department_id || null), level_id: body.level_id || null, session_id: null,
+        campus_id: campusId, faculty_id: dept ? dept.faculty_id : null, department_id: dept ? dept.id : (body.department_id || null), level_id: body.level_id || null, session_id: null,
         status: 'draft', stage: 1, admission_fee_paid: 0, deleted: 0, created_at: now, updated_at: now, origin_node: 'portal',
       });
       return J(res, 200, { ok: true, app_no: one('admission_applications', id).app_no, passcode, token: applicantToken(id), application: appPublic(one('admission_applications', id)) });
@@ -1982,8 +2036,12 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     if (p === '/api/apply/login' && method === 'POST') {
       const body = await readBody();
       const appNo = String(body.app_no || '').trim().toUpperCase();
+      const key = loginKey(req, 'apply:' + appNo);
+      const wait = loginBlocked(key);
+      if (wait) return J(res, 200, { ok: false, error: `Too many failed attempts. Please wait about ${Math.ceil(wait / 60)} minute(s) and try again.` });
       const a = all('admission_applications').find(x => !x.deleted && String(x.app_no || '').toUpperCase() === appNo);
-      if (!a || !verifyPass(body.passcode, a.passcode_hash)) return J(res, 200, { ok: false, error: 'Invalid application number or passcode.' });
+      if (!a || !verifyPass(body.passcode, a.passcode_hash)) { loginFailed(key); return J(res, 200, { ok: false, error: 'Invalid application number or passcode.' }); }
+      loginOk(key);
       return J(res, 200, { ok: true, token: applicantToken(a.id), application: appPublic(a) });
     }
 
@@ -1993,9 +2051,9 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const a = applicantFrom(req, u); if (!a) return J(res, 401, { ok: false });
       if (a.status !== 'draft' && a.status !== 'submitted') return J(res, 200, { ok: false, error: 'This application can no longer be edited.' });
       const body = await readBody();
-      const allowed = ['first_name', 'last_name', 'middle_name', 'email', 'phone', 'gender', 'date_of_birth', 'address', 'nationality', 'state_of_origin', 'department_id', 'level_id', 'jamb_no', 'jamb_score', 'olevel', 'prev_school', 'qualifications', 'guardian_name', 'guardian_email', 'guardian_phone', 'guardian_relation', 'stage'];
+      const allowed = ['first_name', 'last_name', 'middle_name', 'email', 'phone', 'gender', 'date_of_birth', 'address', 'nationality', 'state_of_origin', 'campus_id', 'department_id', 'level_id', 'jamb_no', 'jamb_score', 'olevel', 'prev_school', 'qualifications', 'guardian_name', 'guardian_email', 'guardian_phone', 'guardian_relation', 'stage'];
       const patch = {}; for (const k of allowed) if (k in body) patch[k] = body[k];
-      if (patch.department_id) { const d = one('departments', patch.department_id); if (d) patch.faculty_id = d.faculty_id; }
+      if (patch.department_id) { const d = one('departments', patch.department_id); if (d) { patch.faculty_id = d.faculty_id; const f = one('faculties', d.faculty_id); if (f && !patch.campus_id) patch.campus_id = f.campus_id || null; } }
       if (patch.olevel && typeof patch.olevel !== 'string') patch.olevel = JSON.stringify(patch.olevel);
       if (patch.qualifications && typeof patch.qualifications !== 'string') patch.qualifications = JSON.stringify(patch.qualifications);
       if (typeof update === 'function') update('admission_applications', a.id, patch);
@@ -2761,6 +2819,13 @@ select{padding:9px 10px;border:1px solid var(--line);border-radius:9px;font-size
   .prof img,.prof .ph{width:96px;height:112px}
 }
 @media(max-width:560px){.top .rl{display:none}.lbox{padding:22px}}
+/* Right-to-left (Arabic) — PI18N sets <html dir=rtl>, which auto-mirrors flexbox/text flow; these
+   override the few PHYSICAL properties the layout uses so the UI reads correctly right-to-left. */
+html[dir=rtl] body,html[dir=rtl] .wrap,html[dir=rtl] .card,html[dir=rtl] .seg,html[dir=rtl] .phead,html[dir=rtl] .lbox{text-align:right}
+html[dir=rtl] input,html[dir=rtl] textarea,html[dir=rtl] select{text-align:right}
+html[dir=rtl] .bal{margin-left:0;margin-right:8px}
+html[dir=rtl] .tscroll th,html[dir=rtl] .tscroll td{text-align:right}
+html[dir=rtl] .tscroll th.r,html[dir=rtl] .tscroll td.r{text-align:left}
 </style></head>
 <body>
 <div id="app"></div>
@@ -2784,6 +2849,54 @@ async function changePassword(){
 }
 
 function eh(s){return String(s==null?'':s).replace(/[&<>"]/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[m];});}
+
+/* ---- Multi-language (i18n) for the portal / APK ----
+ * Dictionary keyed by the English source string, applied by walking the DOM after each render.
+ * EXACT-MATCH (the whole trimmed text must equal a key) so names/matric/amounts/codes are never
+ * touched; a leading emoji/symbol prefix is tolerated ("🔔 Updates" → emoji + translated "Updates").
+ * English is the base; missing phrases fall back to English. Arabic flips the page to RTL. */
+var PI18N=(function(){
+  var KEY='ubu_lang';
+  var LANGS={en:{n:'English',dir:'ltr'},fr:{n:'Français',dir:'ltr'},es:{n:'Español',dir:'ltr'},ar:{n:'العربية',dir:'rtl'},ha:{n:'Hausa',dir:'ltr'}};
+  var D={
+    fr:{'Overview':'Aperçu','Updates':'Mises à jour','Fees & Payments':'Frais et paiements','Receipts':'Reçus','Timetable':'Emploi du temps','Live Classes':'Cours en direct','Exams':'Examens','Library':'Bibliothèque','Results':'Résultats','Clearance':'Quitus','Documents':'Documents','Discipline':'Discipline','Exam Conduct':'Conduite d’examen','Evaluation':'Évaluation','Profile':'Profil',
+      'Sign In':'Se connecter','Sign Up':'S’inscrire','Sign out':'Se déconnecter','Password':'Mot de passe','Balance':'Solde','Outstanding Balance':'Solde impayé','Download':'Télécharger','Status':'Statut','Campus':'Campus','Department':'Département','Faculty':'Faculté','Level':'Niveau','Welcome':'Bienvenue','Apply for Admission':'Demander l’admission','Date':'Date','Amount':'Montant','Category':'Catégorie','Receipt':'Reçu','Session':'Session','Semester':'Semestre','Course':'Cours','Courses':'Cours','Paid':'Payé','Outstanding':'Impayé','Email':'Courriel','Phone':'Téléphone','Gender':'Genre','Name':'Nom','Language':'Langue','Notifications':'Notifications','Logout':'Déconnexion','Pay Now':'Payer maintenant','My Results':'Mes résultats'},
+    es:{'Overview':'Resumen','Updates':'Novedades','Fees & Payments':'Tasas y pagos','Receipts':'Recibos','Timetable':'Horario','Live Classes':'Clases en vivo','Exams':'Exámenes','Library':'Biblioteca','Results':'Resultados','Clearance':'Habilitación','Documents':'Documentos','Discipline':'Disciplina','Exam Conduct':'Conducta de examen','Evaluation':'Evaluación','Profile':'Perfil',
+      'Sign In':'Iniciar sesión','Sign Up':'Registrarse','Sign out':'Cerrar sesión','Password':'Contraseña','Balance':'Saldo','Outstanding Balance':'Saldo pendiente','Download':'Descargar','Status':'Estado','Campus':'Campus','Department':'Departamento','Faculty':'Facultad','Level':'Nivel','Welcome':'Bienvenido','Apply for Admission':'Solicitar admisión','Date':'Fecha','Amount':'Importe','Category':'Categoría','Receipt':'Recibo','Session':'Sesión','Semester':'Semestre','Course':'Curso','Courses':'Cursos','Paid':'Pagado','Outstanding':'Pendiente','Email':'Correo','Phone':'Teléfono','Gender':'Género','Name':'Nombre','Language':'Idioma','Notifications':'Notificaciones','Logout':'Cerrar sesión','Pay Now':'Pagar ahora','My Results':'Mis resultados'},
+    ar:{'Overview':'نظرة عامة','Updates':'التحديثات','Fees & Payments':'الرسوم والمدفوعات','Receipts':'الإيصالات','Timetable':'الجدول','Live Classes':'حصص مباشرة','Exams':'الامتحانات','Library':'المكتبة','Results':'النتائج','Clearance':'إخلاء الطرف','Documents':'المستندات','Discipline':'الانضباط','Exam Conduct':'سلوك الامتحان','Evaluation':'التقييم','Profile':'الملف الشخصي',
+      'Sign In':'تسجيل الدخول','Sign Up':'إنشاء حساب','Sign out':'تسجيل الخروج','Password':'كلمة المرور','Balance':'الرصيد','Outstanding Balance':'الرصيد المستحق','Download':'تنزيل','Status':'الحالة','Campus':'الحرم الجامعي','Department':'القسم','Faculty':'الكلية','Level':'المستوى','Welcome':'مرحبًا','Apply for Admission':'تقديم طلب التحاق','Date':'التاريخ','Amount':'المبلغ','Category':'الفئة','Receipt':'إيصال','Session':'العام الدراسي','Semester':'الفصل الدراسي','Course':'مقرر','Courses':'المقررات','Paid':'مدفوع','Outstanding':'مستحق','Email':'البريد الإلكتروني','Phone':'الهاتف','Gender':'الجنس','Name':'الاسم','Language':'اللغة','Notifications':'الإشعارات','Logout':'تسجيل الخروج','Pay Now':'ادفع الآن','My Results':'نتائجي'},
+    ha:{'Overview':'Bayani','Updates':'Sabuntawa','Fees & Payments':'Kuɗi da biya','Receipts':'Rasidi','Timetable':'Jadawali','Live Classes':'Azuzuwa kai tsaye','Exams':'Jarrabawa','Library':'Ɗakin karatu','Results':'Sakamako','Clearance':'Tabbatarwa','Documents':'Takardu','Discipline':'Ladabtarwa','Profile':'Bayanin sirri',
+      'Sign In':'Shiga','Sign out':'Fita','Password':'Kalmar sirri','Balance':'Saura','Outstanding Balance':'Saurar bashi','Download':'Sauke','Status':'Matsayi','Campus':'Cibiya','Department':'Sashe','Faculty':'Faculty','Level':'Matakin','Welcome':'Barka da zuwa','Apply for Admission':'Nemi shiga','Date':'Kwanan wata','Amount':'Adadi','Receipt':'Rasidi','Course':'Darasi','Paid':'An biya','Email':'Imel','Phone':'Waya','Gender':'Jinsi','Name':'Suna','Language':'Harshe','Notifications':'Sanarwa','Logout':'Fita'},
+  };
+  var lang=(function(){try{return localStorage.getItem(KEY)||'';}catch(e){return '';}})(); if(!LANGS[lang])lang='en';
+  function t(s){if(lang==='en')return s;var d=D[lang];if(!d)return s;var v=d[s];return v==null?s:v;}
+  function tx(s){
+    if(lang==='en'||!D[lang])return s;var d=D[lang];var key=s.trim();if(!key)return s;
+    if(d[key]!=null)return s.replace(key,d[key]);
+    try{var m=/^([^\p{L}\p{N}]+)(.+)$/u.exec(key);if(m){var rest=m[2].trim();if(d[rest]!=null)return s.replace(rest,d[rest]);}}catch(e){}
+    return s;
+  }
+  var SKIP={SCRIPT:1,STYLE:1,CODE:1,INPUT:1,TEXTAREA:1,SELECT:1,OPTION:1};
+  function translate(root){
+    if(lang==='en'||!D[lang]||!root)return;
+    try{
+      var w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,null);var nodes=[],n;
+      while((n=w.nextNode())){var p=n.parentNode;if(!p||SKIP[p.nodeName])continue;if(p.closest&&p.closest('[data-noi18n]'))continue;if(!n.nodeValue||!n.nodeValue.trim())continue;nodes.push(n);}
+      for(var i=0;i<nodes.length;i++){var o=tx(nodes[i].nodeValue);if(o!==nodes[i].nodeValue)nodes[i].nodeValue=o;}
+      var ph=root.querySelectorAll?root.querySelectorAll('input[placeholder]'):[];
+      for(var j=0;j<ph.length;j++){var pv=tx(ph[j].getAttribute('placeholder')||'');if(pv!==ph[j].getAttribute('placeholder'))ph[j].setAttribute('placeholder',pv);}
+    }catch(e){}
+  }
+  function applyDir(){try{document.documentElement.setAttribute('dir',(LANGS[lang]||{}).dir||'ltr');document.documentElement.setAttribute('lang',lang);}catch(e){}}
+  function use(l){if(!LANGS[l])return;lang=l;try{localStorage.setItem(KEY,l);}catch(e){}applyDir();}
+  function setLang(l){if(!LANGS[l])l='en';use(l);try{if(typeof TOKEN!=='undefined'&&TOKEN)renderApp();else renderLogin();}catch(e){}}
+  function hasPref(){try{return !!localStorage.getItem(KEY);}catch(e){return false;}}
+  function options(){return Object.keys(LANGS).map(function(c){return '<option value="'+c+'"'+(c===lang?' selected':'')+'>'+LANGS[c].n+'</option>';}).join('');}
+  function picker(extraStyle){return '<select data-noi18n onchange="PI18N.setLang(this.value)" title="Language" style="border:1px solid rgba(148,163,184,.5);background:rgba(255,255,255,.12);color:inherit;border-radius:8px;padding:4px 6px;font-size:12px;cursor:pointer;'+(extraStyle||'')+'">'+options()+'</select>';}
+  applyDir();
+  return {t:t,tx:tx,translate:translate,setLang:setLang,use:use,hasPref:hasPref,applyDir:applyDir,options:options,picker:picker,merge:function(c){if(!c)return;for(var l in c){D[l]=Object.assign(D[l]||{},c[l]);if(!LANGS[l])LANGS[l]={n:l,dir:'ltr'};}},get lang(){return lang;}};
+})();
+
 async function renderLogin(msg){
   let b={};try{b=await(await fetch('/api/branding')).json();}catch(_){}
   const uname=eh(b.name||'University Portal');
@@ -2799,8 +2912,10 @@ async function renderLogin(msg){
     +'<div class="hintbar">Your login is emailed to you after registration. Forgot it? Ask the bursary or registrar to resend your portal login.</div>'
     +'<div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(148,163,184,.3);text-align:center"><div class="sub" style="margin-bottom:8px">New here? Not yet a student?</div><a href="/apply" style="display:inline-block;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:9px;text-decoration:none;font-weight:700">🎓 Apply for Admission</a></div>'
     +'<div class="sub" style="margin-top:10px;text-align:center"><a href="/scan">🛡 Staff: open the Clearance Scanner →</a></div>'
+    +'<div style="margin-top:12px;text-align:center">🌐 '+PI18N.picker('color:#1e293b')+'</div>'
     +'</div></div>');
   document.getElementById('app').appendChild(box);
+  try{PI18N.translate(box);}catch(_){}
   if(msg){const e=box.querySelector('.err');e.textContent=msg;e.style.display='block';}
   const go=async()=>{const login=box.querySelector('#lg').value.trim();const password=box.querySelector('#pw').value;if(!login||!password)return;const btn=box.querySelector('#go');btn.disabled=true;btn.textContent='Signing in…';const r=await api('/api/login',{method:'POST',body:JSON.stringify({login,password})});btn.disabled=false;btn.textContent='Sign In';if(!r.ok){const e=box.querySelector('.err');e.textContent=r.error||'Login failed.';e.style.display='block';return;}TOKEN=r.token;localStorage.setItem('ubu_token',TOKEN);renderApp();};
   box.querySelector('#go').onclick=go;
@@ -2854,11 +2969,12 @@ async function renderApp(){
   if(!r.ok){return logout();}
   const d=r.data;
   const app=document.getElementById('app');app.innerHTML='';
-  app.appendChild($('<div class="top"><div class="nm">'+(d.institution||'UniBursar')+'</div><div class="rl">'+(d.profile&&d.profile.full_name?d.profile.full_name+' · ':'')+d.role+' <span class="live">● live</span></div><button class="btn sm ghost" style="margin-left:14px" onclick="changePassword()">🔑 Password</button><button class="btn sm ghost" style="margin-left:8px" onclick="logout()">Sign out</button></div>'));
+  app.appendChild($('<div class="top"><div class="nm">'+(d.institution||'UniBursar')+'</div><div class="rl">'+(d.profile&&d.profile.full_name?d.profile.full_name+' · ':'')+d.role+' <span class="live">● live</span></div>'+PI18N.picker('margin-left:14px')+'<button class="btn sm ghost" style="margin-left:10px" onclick="changePassword()">🔑 Password</button><button class="btn sm ghost" style="margin-left:8px" onclick="logout()">Sign out</button></div>'));
   const w=$('<div class="wrap"></div>');app.appendChild(w);
   if(d.kind==='student')studentView(w,d);
   else if(d.kind==='staff')staffView(w,d);
   else officerView(w,d);
+  try{PI18N.translate(app);}catch(_){}
   if(d.kind==='student'){mountChat();try{nativeNotify(d.notifications,(d.profile&&(d.profile.matric_no||d.profile.full_name))||'me');}catch(_){}}
   VER=(await api('/api/version')).version||0;
   if(TIMER)clearInterval(TIMER);
@@ -2944,7 +3060,7 @@ function studentView(w,d){
   // --- profile + photo pinned at the TOP (full width) ---
   var head=$('<div class="phead">'+photo
     +'<div style="flex:1;min-width:0"><div class="nm">'+eh(p.full_name)+'</div>'
-    +'<div class="mt">'+eh(p.matric_no||'Matric pending')+' · '+eh(p.department||'—')+' · '+eh(p.level||'—')+(p.faculty?(' · '+eh(p.faculty)):'')+'</div>'
+    +'<div class="mt">'+eh(p.matric_no||'Matric pending')+' · '+eh(p.department||'—')+' · '+eh(p.level||'—')+(p.faculty?(' · '+eh(p.faculty)):'')+(p.campus?(' · 🏫 '+eh(p.campus)):'')+'</div>'
     +'<div style="margin-top:9px">'+chip+'<span class="bal">Balance: <b>'+mapMoney(d.balances)+'</b></span></div></div></div>');
   // --- horizontal section tabs ---
   var navEl=$('<div class="nav">'+navHtml+'</div>');
@@ -3285,6 +3401,9 @@ function officerView(w,d){
   officerControls(w,d);
   if(d.kind==='finance'){
     w.appendChild($('<div class="kpis">'+kpi('Collected',mapMoney(d.cards.collected))+kpi('Billed',mapMoney(d.cards.billed))+kpi('Expenses',mapMoney(d.cards.expenses))+kpi('Students',d.cards.students)+kpi('Debtors',d.cards.debtors)+'</div>'));
+    if(d.campuses&&d.campuses.length){
+      w.appendChild($('<div class="panel"><h3>🏫 Students by Campus</h3>'+tbl([{t:'Campus',f:r=>eh(r.name)},{t:'Students',r:1,f:r=>r.students}],d.campuses,'No campuses.')+'</div>'));
+    }
     // collections grouped by office (who collected)
     if(d.byOffice&&d.byOffice.length){
       w.appendChild($('<div class="panel"><h3>💰 Collections by Office</h3>'+tbl([{t:'Office',f:r=>eh(r.office)},{t:'Collected',r:1,f:r=>mapMoney(r.amounts)}],d.byOffice,'No collections.')+'</div>'));
@@ -3309,11 +3428,24 @@ function officerView(w,d){
     w.appendChild($('<div class="panel"><div class="prof"><div class="ph">👤</div><div><div class="nm">'+((d.profile&&d.profile.full_name)||'Welcome')+'</div><div class="meta" style="text-transform:capitalize">'+(d.role||'staff')+' account</div></div></div></div>'));
     w.appendChild($('<div class="panel"><h3>Dashboard</h3><div class="empty">You are signed in. Your reports and tools are available in the desktop app.</div></div>'));
   }
+  try{PI18N.translate(w);}catch(_){}
 }
 function kpi(l,v){return '<div class="kpi"><div class="l">'+l+'</div><div class="v">'+v+'</div></div>';}
 function cap(s){s=String(s||'');return s.charAt(0).toUpperCase()+s.slice(1).replace(/_/g,' ');}
 if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(()=>{});}
-if(TOKEN){renderApp().catch(()=>renderLogin());}else{renderLogin();}
+(function(){
+  function boot(){ if(TOKEN){renderApp().catch(()=>renderLogin());}else{renderLogin();} }
+  // apply the institution default language (only when this device hasn't chosen one) + any custom
+  // translation overrides, BEFORE the first render — then boot. Per-device choice always wins.
+  try{
+    if(!PI18N.hasPref()){
+      fetch('/api/branding').then(function(r){return r.json();}).then(function(b){
+        try{ if(b&&b.i18n_custom){try{PI18N.merge(JSON.parse(b.i18n_custom));}catch(_){}} if(b&&b.language)PI18N.use(b.language); }catch(_){}
+        boot();
+      }).catch(boot);
+    } else boot();
+  }catch(_){ boot(); }
+})();
 </script></body></html>`;
 
 // ----------------------- installable app assets -----------------------
@@ -3380,6 +3512,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--blue);bo
       <div class="err" id="startErr"></div>
       <div class="row"><div><label>First name</label><input id="f_first"></div><div><label>Last name</label><input id="f_last"></div></div>
       <div class="row"><div><label>Email</label><input id="f_email" type="email"></div><div><label>Phone</label><input id="f_phone"></div></div>
+      <div id="f_campus_w" style="display:none"><label>🏫 Campus</label><select id="f_campus" onchange="onCampusChange()"></select></div>
       <label>Programme (department)</label><select id="f_dept"></select>
       <label>Entry level</label><select id="f_level"></select>
       <div class="btnrow"><button class="btn gho" onclick="show('s-landing')">Back</button><button class="btn" id="startBtn" onclick="startApp()">Create Application</button></div>
@@ -3436,19 +3569,35 @@ function renderProgs(){
   });
   w.innerHTML=h||'<div class="muted">No programmes published yet.</div>';
 }
-function fillSelects(){
+function hasCampuses(){return PROG.campuses&&PROG.campuses.length;}
+function deptOptions(campusId,selId){
   var ds='<option value="">Select a department…</option>';
-  (PROG.faculties||[]).forEach(function(f){f.departments.forEach(function(d){ds+='<option value="'+d.id+'">'+esc(d.name)+' ('+esc(f.name)+')</option>';});});
-  el('f_dept').innerHTML=ds;
+  (PROG.faculties||[]).forEach(function(f){
+    if(campusId&&(f.campus_id||'')!==campusId)return; // only show the chosen campus's programmes
+    f.departments.forEach(function(d){ds+='<option value="'+d.id+'"'+(selId===d.id?' selected':'')+'>'+esc(d.name)+' ('+esc(f.name)+')</option>';});
+  });
+  return ds;
+}
+function campusOf(deptId){var c=null;(PROG.faculties||[]).forEach(function(f){f.departments.forEach(function(d){if(d.id===deptId)c=f.campus_id||'';});});return c;}
+function fillSelects(){
+  if(el('f_campus_w'))el('f_campus_w').style.display=hasCampuses()?'':'none';
+  if(hasCampuses()){var cs='';PROG.campuses.forEach(function(c,i){cs+='<option value="'+c.id+'"'+(i===0?' selected':'')+'>'+esc(c.name)+'</option>';});el('f_campus').innerHTML=cs;}
+  el('f_dept').innerHTML=deptOptions(hasCampuses()?el('f_campus').value:'');
   var ls='<option value="">Select…</option>';(PROG.levels||[]).forEach(function(l){ls+='<option value="'+l.id+'">'+esc(l.name)+'</option>';});
   el('f_level').innerHTML=ls;if(PROG.levels&&PROG.levels[0])el('f_level').value=PROG.levels[0].id;
 }
-function pickDept(id){show('s-start');el('f_dept').value=id;}
+function onCampusChange(){el('f_dept').innerHTML=deptOptions(el('f_campus').value);}
+function onWizCampusChange(){el('w_dept').innerHTML=deptOptions(el('w_campus').value);}
+function pickDept(id){
+  show('s-start');
+  if(hasCampuses()&&el('f_campus')){var c=campusOf(id);if(c!=null){el('f_campus').value=c;el('f_dept').innerHTML=deptOptions(c);}}
+  el('f_dept').value=id;
+}
 function goContinue(){show('s-continue');}
 
 async function startApp(){
   err('startErr','');
-  var body={first_name:el('f_first').value.trim(),last_name:el('f_last').value.trim(),email:el('f_email').value.trim(),phone:el('f_phone').value.trim(),department_id:el('f_dept').value,level_id:el('f_level').value};
+  var body={first_name:el('f_first').value.trim(),last_name:el('f_last').value.trim(),email:el('f_email').value.trim(),phone:el('f_phone').value.trim(),campus_id:(el('f_campus')?el('f_campus').value:''),department_id:el('f_dept').value,level_id:el('f_level').value};
   if(!body.first_name||!body.last_name){err('startErr','Enter your first and last name.');return;}
   el('startBtn').disabled=true;
   var r=await api('/api/apply/start',{method:'POST',body:JSON.stringify(body)});
@@ -3482,9 +3631,12 @@ function renderWizard(){
       '<div class="row"><div><label>Guardian phone</label><input id="w_gphone" value="'+esc(val('guardian_phone'))+'"></div><div><label>Guardian email</label><input id="w_gemail" value="'+esc(val('guardian_email'))+'"></div></div>'+
       navBtns();
   }else if(STEP===2){
-    var ds='<option value="">Select a department…</option>';(PROG.faculties||[]).forEach(function(f){f.departments.forEach(function(d){ds+='<option value="'+d.id+'"'+(val('department_id')===d.id?' selected':'')+'>'+esc(d.name)+' ('+esc(f.name)+')</option>';});});
+    var curC=hasCampuses()?(val('campus_id')||PROG.campuses[0].id):'';
+    var ds=deptOptions(curC,val('department_id'));
     var ls='<option value="">Select…</option>';(PROG.levels||[]).forEach(function(l){ls+='<option value="'+l.id+'"'+(val('level_id')===l.id?' selected':'')+'>'+esc(l.name)+'</option>';});
-    b.innerHTML='<h2>Programme</h2><label>Department / Programme</label><select id="w_dept">'+ds+'</select><label>Entry level</label><select id="w_level">'+ls+'</select><label>Email</label><input id="w_email" type="email" value="'+esc(val('email'))+'">'+navBtns();
+    var cw='';
+    if(hasCampuses()){var cs='';PROG.campuses.forEach(function(c){cs+='<option value="'+c.id+'"'+(curC===c.id?' selected':'')+'>'+esc(c.name)+'</option>';});cw='<label>🏫 Campus</label><select id="w_campus" onchange="onWizCampusChange()">'+cs+'</select>';}
+    b.innerHTML='<h2>Programme</h2>'+cw+'<label>Department / Programme</label><select id="w_dept">'+ds+'</select><label>Entry level</label><select id="w_level">'+ls+'</select><label>Email</label><input id="w_email" type="email" value="'+esc(val('email'))+'">'+navBtns();
   }else if(STEP===3){
     b.innerHTML='<h2>Academic background</h2><div class="row"><div><label>JAMB reg. no</label><input id="w_jamb" value="'+esc(val('jamb_no'))+'"></div><div><label>JAMB score</label><input id="w_jscore" type="number" value="'+esc(val('jamb_score'))+'"></div></div>'+
       '<label>Previous school attended</label><input id="w_school" value="'+esc(val('prev_school'))+'">'+
@@ -3499,7 +3651,7 @@ function renderWizard(){
   }else{
     var d=APP||{};
     b.innerHTML='<h2>Review &amp; submit</h2><div class="muted">Confirm your details, then submit your application for review.</div>'+
-      kv('Name',esc((d.first_name||'')+' '+(d.last_name||'')))+kv('Email',esc(d.email))+kv('Phone',esc(d.phone))+kv('Programme',esc(d.department_name||'—'))+kv('Level',esc(d.level_name||'—'))+kv('JAMB',esc(d.jamb_no||'—'))+kv('Documents',(d.documents||[]).length+' uploaded')+
+      kv('Name',esc((d.first_name||'')+' '+(d.last_name||'')))+kv('Email',esc(d.email))+kv('Phone',esc(d.phone))+(d.campus_name?kv('Campus',esc(d.campus_name)):'')+kv('Programme',esc(d.department_name||'—'))+kv('Level',esc(d.level_name||'—'))+kv('JAMB',esc(d.jamb_no||'—'))+kv('Documents',(d.documents||[]).length+' uploaded')+
       '<div class="btnrow"><button class="btn gho" onclick="STEP=4;renderWizard()">Back</button><button class="btn" id="subBtn" onclick="submitApp()">Submit Application</button></div>';
   }
 }
@@ -3514,7 +3666,7 @@ function renderDocs(){var w=el('docList');if(!w)return;var ds=(APP&&APP.document
 function collectStep(){
   var patch={stage:STEP};
   if(STEP===1){patch.first_name=el('w_first').value.trim();patch.last_name=el('w_last').value.trim();patch.middle_name=el('w_middle').value.trim();patch.gender=el('w_gender').value;patch.date_of_birth=el('w_dob').value;patch.phone=el('w_phone').value.trim();patch.nationality=el('w_nat').value.trim();patch.state_of_origin=el('w_state').value.trim();patch.address=el('w_addr').value.trim();patch.guardian_name=el('w_gname').value.trim();patch.guardian_relation=el('w_grel').value.trim();patch.guardian_phone=el('w_gphone').value.trim();patch.guardian_email=el('w_gemail').value.trim();}
-  else if(STEP===2){patch.department_id=el('w_dept').value;patch.level_id=el('w_level').value;patch.email=el('w_email').value.trim();}
+  else if(STEP===2){if(el('w_campus'))patch.campus_id=el('w_campus').value;patch.department_id=el('w_dept').value;patch.level_id=el('w_level').value;patch.email=el('w_email').value.trim();}
   else if(STEP===3){patch.jamb_no=el('w_jamb').value.trim();patch.jamb_score=el('w_jscore').value;patch.prev_school=el('w_school').value.trim();OLEVEL[0].exam=el('w_oexam').value.trim();OLEVEL[0].year=el('w_oyear').value.trim();patch.olevel=JSON.stringify(OLEVEL);}
   return patch;
 }
