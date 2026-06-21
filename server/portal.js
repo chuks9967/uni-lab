@@ -58,7 +58,7 @@ function numWords(num) { num = Math.floor(Number(num) || 0); if (num === 0) retu
 function amountWords(a, c) { const whole = Math.floor(Number(a) || 0); const k = Math.round((Number(a) - whole) * 100); let s = `${numWords(whole)} ${WORD_CCY[c] || c}`; if (k > 0) s += ` and ${numWords(k)}/100`; return s + ' only'; }
 
 module.exports = function createPortal(deps) {
-  const { all, one, getVersion, secret, institution, update, create, registerDevice, jitsiConfig, onLiveStart, blobFetch } = deps;
+  const { all, one, getVersion, secret, institution, update, create, registerDevice, jitsiConfig, onLiveStart, blobFetch, sendMail } = deps;
   // Resolve a row's binary: inline base64 (legacy) → Buffer, else fetch the offloaded object by key
   // (services/blobstore.js / server/blobstore.js, injected as blobFetch). Returns a Buffer or null.
   const resolveBlob = async (inlineB64, key) => {
@@ -1830,6 +1830,31 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     const { passcode_hash, ...rest } = a; // never expose the passcode hash to the client
     return Object.assign(rest, { department_name: nameOf('departments', a.department_id), faculty_name: nameOf('faculties', a.faculty_id), campus_name: nameOf('campuses', a.campus_id), level_name: nameOf('levels', a.level_id), documents: docs });
   }
+  // ---- applicant emails (application confirmation + status), sent via the hub's SMTP relay (best-effort) ----
+  function applicantEmailHTML(a, bodyHtml) {
+    const i = inst();
+    const logo = i.logo ? `<img src="${esc(i.logo)}" alt="" style="height:46px;margin-bottom:8px">` : '';
+    const link = docBase ? `${docBase}/apply` : '';
+    return `<div style="font-family:Segoe UI,Arial,sans-serif;max-width:560px;margin:0 auto;color:#1e293b">`
+      + `<div style="text-align:center;border-bottom:2px solid #1e3a8a;padding-bottom:10px;margin-bottom:14px">${logo}<div style="font-size:18px;font-weight:800;color:#1e3a8a">${esc(i.name || 'University')}</div><div style="font-size:12px;color:#64748b">Office of Admissions</div></div>`
+      + bodyHtml
+      + `<div style="margin-top:18px;border-top:1px solid #e5e7eb;padding-top:10px;color:#94a3b8;font-size:11px">This is an automated message from the ${esc(i.name || 'University')} admissions portal.${link ? ` You can continue your application or check your status anytime at <a href="${esc(link)}">${esc(link)}</a>.` : ''}</div></div>`;
+  }
+  function applicantSummary(a) {
+    const rows = [['Application No.', a.app_no], ['Name', `${a.first_name || ''} ${a.last_name || ''}`.trim()],
+      ['Campus', nameOf('campuses', a.campus_id)], ['Programme', nameOf('departments', a.department_id)],
+      ['Faculty', nameOf('faculties', a.faculty_id)], ['Level', nameOf('levels', a.level_id)]].filter(([, v]) => v);
+    return `<table style="width:100%;border-collapse:collapse;font-size:13px">${rows.map(([k, v]) => `<tr><td style="padding:5px 8px;color:#64748b;border-bottom:1px solid #f1f5f9">${esc(k)}</td><td style="padding:5px 8px;font-weight:600;border-bottom:1px solid #f1f5f9">${esc(v)}</td></tr>`).join('')}</table>`;
+  }
+  function mailApplicant(a, subject, bodyHtml) {
+    if (typeof sendMail !== 'function' || !a || !a.email) return;
+    try {
+      const html = applicantEmailHTML(a, bodyHtml);
+      const text = String(bodyHtml).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      Promise.resolve(sendMail({ to: a.email, subject, html, text })).catch(() => {});
+    } catch (_) { /* email is best-effort — never block the apply flow */ }
+  }
+
   function programmesPayload() {
     const faculties = all('faculties').filter(f => !f.deleted);
     const departments = all('departments').filter(d => !d.deleted);
@@ -2030,7 +2055,15 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
         campus_id: campusId, faculty_id: dept ? dept.faculty_id : null, department_id: dept ? dept.id : (body.department_id || null), level_id: body.level_id || null, session_id: null,
         status: 'draft', stage: 1, admission_fee_paid: 0, deleted: 0, created_at: now, updated_at: now, origin_node: 'portal',
       });
-      return J(res, 200, { ok: true, app_no: one('admission_applications', id).app_no, passcode, token: applicantToken(id), application: appPublic(one('admission_applications', id)) });
+      const startedApp = one('admission_applications', id);
+      // email the applicant their application number + passcode + chosen programme/campus, so they have
+      // their details on record and can log back in to finish + track their admission status.
+      mailApplicant(startedApp, `Your application to ${inst().name || 'University'} — ${startedApp.app_no}`,
+        `<p>Dear ${esc(first)},</p><p>Thank you for starting your application. Please keep your details below safe — you will use the application number and passcode to log back in, complete your form, upload documents, and check your admission status at any time.</p>`
+        + applicantSummary(startedApp)
+        + `<div style="margin:14px 0;padding:12px 14px;background:#f1f5f9;border-radius:10px"><div style="font-size:11px;color:#64748b;letter-spacing:.04em">APPLICATION NUMBER</div><div style="font-size:18px;font-weight:800;color:#1e3a8a">${esc(startedApp.app_no)}</div><div style="font-size:11px;color:#64748b;letter-spacing:.04em;margin-top:8px">PASSCODE</div><div style="font-size:18px;font-weight:800;letter-spacing:.08em">${esc(passcode)}</div></div>`
+        + `<p style="color:#64748b;font-size:12px">If you did not start this application, you can safely ignore this email.</p>`);
+      return J(res, 200, { ok: true, app_no: startedApp.app_no, passcode, token: applicantToken(id), application: appPublic(startedApp) });
     }
 
     if (p === '/api/apply/login' && method === 'POST') {
@@ -2098,7 +2131,14 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
           }
         } catch (_) { /* notification is best-effort — never block the submission */ }
       }
-      return J(res, 200, { ok: true, application: appPublic(one('admission_applications', a.id)) });
+      const submitted = one('admission_applications', a.id);
+      // confirmation email on first submission: the applicant gets their full application summary and is
+      // told they will be emailed when there is an update (offer / decision).
+      if (firstSubmit) mailApplicant(submitted, `Application submitted — ${submitted.app_no}`,
+        `<p>Dear ${esc(a.first_name || '')},</p><p>Your application has been <b>submitted successfully</b> and is now under review by the admissions office. Here is a summary of your application:</p>`
+        + applicantSummary(submitted)
+        + `<p style="margin-top:14px">We will email you as soon as there is an update on your application (for example, an offer of admission). You can also check your status anytime by logging back in with your application number and passcode.</p>`);
+      return J(res, 200, { ok: true, application: appPublic(submitted) });
     }
 
     if (p === '/api/apply/pay' && method === 'POST') {
@@ -3573,7 +3613,9 @@ function hasCampuses(){return PROG.campuses&&PROG.campuses.length;}
 function deptOptions(campusId,selId){
   var ds='<option value="">Select a department…</option>';
   (PROG.faculties||[]).forEach(function(f){
-    if(campusId&&(f.campus_id||'')!==campusId)return; // only show the chosen campus's programmes
+    // show the chosen campus's programmes PLUS any faculty not yet assigned to a campus (so picking a
+    // campus never hides everything on a partially-configured/legacy institution)
+    if(campusId&&f.campus_id&&f.campus_id!==campusId)return;
     f.departments.forEach(function(d){ds+='<option value="'+d.id+'"'+(selId===d.id?' selected':'')+'>'+esc(d.name)+' ('+esc(f.name)+')</option>';});
   });
   return ds;
