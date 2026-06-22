@@ -482,6 +482,7 @@ const server = http.createServer(async (req, res) => {
       address: body.address || '', email: body.email || '', phone: body.phone || '', base_currency: body.base_currency || '', portal_url: body.portal_url || '',
       updated_at: body.updated_at || new Date().toISOString(),
       session: body.session || '', semester: body.semester || '',
+      licensed: (typeof body.licensed === 'boolean') ? body.licensed : true, // institution activation status
     };
     storeVersion = Date.now(); save();
     cloudSetMeta('branding', JSON.stringify(store.branding));
