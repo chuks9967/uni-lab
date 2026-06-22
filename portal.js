@@ -438,7 +438,7 @@ module.exports = function createPortal(deps) {
   }
 
   // ---- Exam Surveillance: the student's own attendance + any malpractice flag + evidence ----
-  const MALPRACTICE_LABELS = { multiple_faces: 'Another person in your frame', absence: 'You left your seat', left_seat: 'You left your seat', looking_away: 'Looking away from your paper', talking: 'Talking during the exam', phone: 'Phone use', earbuds: 'Earbuds / earphones detected', neck_movement: 'Head/neck turning to a neighbour', notes: 'Unauthorised notes / material', unknown_face: 'Unrecognised face', impersonation: 'Possible impersonation', left_app: 'You left the exam app', manual: 'Flagged by an exam officer',
+  const MALPRACTICE_LABELS = { multiple_faces: 'Another person in your frame', absence: 'You left your seat', left_seat: 'You left your seat', looking_away: 'Looking away from your paper', talking: 'Talking during the exam', phone: 'Phone use', earbuds: 'Earbuds / earphones detected', neck_movement: 'Head/neck turning to a neighbour', notes: 'Unauthorised notes / material', unknown_face: 'Unrecognised face', impersonation: 'Possible impersonation', left_app: 'You left the exam app', left_exam: 'You left the exam app — your exam was ended (no score)', manual: 'Flagged by an exam officer',
     smartwatch: 'Smartwatch / smart band use', smart_glasses: 'Smart / camera glasses', calculator: 'Unauthorised calculator / electronics', second_device: 'Laptop / second screen detected', book: 'Textbook / notebook detected', body_writing: 'Writing on the body', desk_writing: 'Writing on the desk / objects', hidden_material: 'Concealed material', mirror: 'Mirror / reflective surface', copying: 'Copying a neighbour', signaling: 'Hand signals / coded gestures', passing_object: 'Passing notes / objects', script_swap: 'Swapping scripts / papers', suspicious_posture: 'Repeated under-desk / lap glances', face_hidden: 'Face covered / obscured', camera_obstruction: 'Camera covered / blocked' };
   function examTitleOf(examId) { const e = examId ? one('surveillance_sessions', examId) : null; return e ? (e.title || e.course_code || 'Exam') : 'Exam'; }
   function surveillanceForStudent(s) {
@@ -1965,7 +1965,14 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const ended = !live && rows.length > 0;
       return J(res, 200, { ok: true, live, ended });
     }
-    if (p === '/api/branding' && method === 'GET') { const i = inst(); return J(res, 200, { ok: true, name: i.name, short: i.short, logo: i.logo, motto: i.motto, language: i.language || '', i18n_custom: i.i18n_custom || '' }); }
+    if (p === '/api/branding' && method === 'GET') {
+      const i = inst();
+      // expose the campus list publicly so the login page can let a student pick the campus they belong to
+      const campuses = all('campuses').filter(c => !c.deleted).sort((a, b) => (b.is_main ? 1 : 0) - (a.is_main ? 1 : 0)).map(c => ({ id: c.id, name: c.name }));
+      // licensed flag — the desktop is the source of truth and pushes it; default true for older hubs
+      const licensed = (typeof i.licensed === 'boolean') ? i.licensed : true;
+      return J(res, 200, { ok: true, name: i.name, short: i.short, logo: i.logo, motto: i.motto, language: i.language || '', i18n_custom: i.i18n_custom || '', campuses, licensed });
+    }
 
     // ---- installable app assets + public clearance verification (no login) ----
     if (method === 'GET' && p === '/manifest.webmanifest') return S(res, 200, MANIFEST_PORTAL, 'application/manifest+json');
@@ -2016,6 +2023,8 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
 
     if (p === '/api/login' && method === 'POST') {
       const body = await readBody();
+      // license gate: an unactivated institution can't serve the portal/APK (defense-in-depth, not just UI)
+      if (inst().licensed === false) return J(res, 200, { ok: false, error: 'This institution’s software has not been activated. Please contact your administrator.' });
       const key = loginKey(req, body.login);
       const wait = loginBlocked(key);
       if (wait) return J(res, 200, { ok: false, error: `Too many failed attempts. Please wait about ${Math.ceil(wait / 60)} minute(s) and try again.` });
@@ -2027,10 +2036,18 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
         if (!totpVerify(acc.row.mfa_secret, body.code)) { loginFailed(key); return J(res, 200, { ok: false, mfaRequired: true, error: 'Incorrect authenticator code — try again.' }); }
       }
       loginOk(key);
+      // Campus allocation: a student may pick the campus they belong to at login. We only SET it when the
+      // student has no campus yet (allocates legacy/unassigned students); a student already pinned to a
+      // campus keeps it (only an admin can move them). This ensures every student is allocated to a campus.
+      if (acc.kind === 'student' && body.campus_id && !(acc.row.campus_id) && typeof update === 'function') {
+        const camp = one('campuses', String(body.campus_id));
+        if (camp && !camp.deleted) { try { update('students', acc.row.id, { campus_id: camp.id }); acc.row.campus_id = camp.id; } catch (_) {} }
+      }
       const token = sign({ k: acc.kind, id: acc.row.id, role: acc.role, exp: Date.now() + 1000 * 60 * 60 * 12 });
       const name = (acc.kind === 'student') ? `${acc.row.first_name || ''} ${acc.row.last_name || ''}`.trim()
         : (acc.kind === 'parent') ? (acc.row.parent_name || 'Parent/Guardian') : acc.row.full_name;
-      return J(res, 200, { ok: true, token, user: { role: acc.role, kind: acc.kind, name } });
+      const campusName = acc.kind === 'student' && acc.row.campus_id ? nameOf('campuses', acc.row.campus_id) : null;
+      return J(res, 200, { ok: true, token, user: { role: acc.role, kind: acc.kind, name, campus: campusName } });
     }
 
     // ---- Online Admissions (public application portal, temporary-pass auth) ----
@@ -2343,6 +2360,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       if (typeof create !== 'function') return J(res, 200, { ok: false, error: 'Exams are unavailable on this server.' });
       let at = all('exam_attempts').find(a => !a.deleted && a.exam_id === e.id && a.student_id === t.id);
       const now = new Date().toISOString();
+      if (at && at.status === 'voided') return J(res, 200, { ok: false, error: 'This exam was ended because you left the exam app. It was voided and cannot be retaken — contact the exam officer if you believe this is a mistake.' });
       if (at && (at.status === 'submitted' || at.status === 'auto_submitted' || at.status === 'graded')) return J(res, 200, { ok: false, error: 'You have already submitted this exam.' });
       var st = {}; try { st = JSON.parse(e.settings || '{}'); } catch (_) {}
       // late-entry grace: a NEW attempt can't begin more than `late_grace_min` after start_at
@@ -2375,6 +2393,8 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
       const body = await readBody(); const at = body.attempt_id ? one('exam_attempts', body.attempt_id) : null;
       if (!at || at.student_id !== t.id) return J(res, 404, { ok: false });
+      // a voided (forfeited) attempt is final — never let a late submit resurrect it with a score
+      if (at.status === 'voided') return J(res, 200, { ok: false, error: 'This exam was ended.' });
       if (typeof update === 'function') { let ans = {}; try { ans = JSON.parse(at.answers || '{}'); } catch (_) {} Object.assign(ans, body.answers || {}); update('exam_attempts', at.id, { answers: JSON.stringify(ans), status: body.auto ? 'auto_submitted' : 'submitted', submitted_at: new Date().toISOString() }); }
       return J(res, 200, { ok: true });
     }
@@ -2419,6 +2439,35 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       if ((body.type || 'left_app') === 'left_app') cur.away = (cur.away || 0) + 1;
       cur.lastEvent = { type: body.type || 'left_app', ts: Date.now() }; examFrames[examId][t.id] = cur;
       return J(res, 200, { ok: true, away: cur.away || 0 });
+    }
+    // Student: FORFEIT — the proctored app reports the candidate LEFT it (minimised / switched away /
+    // killed the app) while writing. Policy: leaving a proctored exam ENDS it with NO score. We void
+    // the attempt (final, score 0), raise a high-severity malpractice flag (last camera frame as
+    // evidence) on the exam's surveillance session, and mark the roster so the officer monitor + the
+    // student's Exam Conduct both show it. Idempotent: a finished/voided attempt is never resurrected.
+    if (p === '/api/exam/forfeit' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
+      const body = await readBody(); const examId = String(body.exam_id || ''); if (!examId) return J(res, 400, { ok: false });
+      const reason = String(body.reason || 'left_app').slice(0, 60);
+      const at = all('exam_attempts').find(a => !a.deleted && a.exam_id === examId && a.student_id === t.id && a.status === 'in_progress');
+      if (!at) return J(res, 200, { ok: true, voided: false });   // already submitted/ended — nothing to void
+      const e = one('online_exams', examId) || {};
+      const total = Number(e.total_marks) || 0;
+      if (typeof update === 'function') update('exam_attempts', at.id, { status: 'voided', score: 0, max_score: total, autograded: 1, submitted_at: new Date().toISOString() });
+      examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][t.id] || { ring: [], away: 0 };
+      cur.away = (cur.away || 0) + 1; cur.forfeited = true; cur.lastEvent = { type: 'left_exam', ts: Date.now() }; examFrames[examId][t.id] = cur;
+      if (typeof create === 'function') {
+        const svId = e.surveillance_id || examId;
+        const now = new Date().toISOString(); const fid = 'flg-' + crypto.randomBytes(6).toString('hex');
+        create('malpractice_flags', { id: fid, exam_id: svId, student_id: t.id, camera_id: null, type: 'left_exam',
+          severity: 'high', confidence: 1, detail: 'The candidate left the exam app during a proctored exam (' + reason + ') — the exam was ended and the attempt voided with no score.',
+          auto: 1, status: 'open', flagged_by: 'proctor', occurred_at: now, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+        if (cur.jpeg && cur.jpeg.length < 3 * 1024 * 1024) {
+          const eid = 'evd-' + crypto.randomBytes(6).toString('hex');
+          create('malpractice_evidence', { id: eid, flag_id: fid, exam_id: svId, student_id: t.id, kind: 'image', mime: 'image/jpeg', filename: 'left-exam.jpg', data: cur.jpeg, bytes: Math.round(cur.jpeg.length * 0.75), camera_id: null, captured_at: now, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+        }
+      }
+      return J(res, 200, { ok: true, voided: true });
     }
     // Officer: monitor roster — who is online, audio level, last-seen, status.
     if (p === '/api/exam/monitor' && method === 'GET') {
@@ -2941,13 +2990,19 @@ async function renderLogin(msg){
   let b={};try{b=await(await fetch('/api/branding')).json();}catch(_){}
   const uname=eh(b.name||'University Portal');
   const logo=b.logo?'<img class="blogo" src="'+b.logo+'" alt="logo">':'<div class="blogo mono">'+eh((b.short||'UB').slice(0,3))+'</div>';
+  // multi-campus: a student picks the campus they belong to at login (so they're allocated to it)
+  const campusField=(b.campuses&&b.campuses.length)?('<div class="field"><label>🏫 Your campus</label><select id="cmp"><option value="">Select your campus…</option>'+b.campuses.map(function(c){return '<option value="'+c.id+'">'+eh(c.name)+'</option>';}).join('')+'</select></div>'):'';
+  const locked=b.licensed===false;
+  const lockBanner=locked?('<div style="background:#fee2e2;color:#991b1b;border-radius:9px;padding:10px 12px;margin-bottom:10px;font-size:13px">🔒 This institution\\'s software has not been activated. Please contact your administrator.</div>'):'';
   document.getElementById('app').innerHTML='';
   const box=$('<div class="login"><div class="card lbox">'
     +'<div class="brandhead">'+logo+'<div><div class="uname">'+uname+'</div>'+(b.motto?('<div class="umotto">'+eh(b.motto)+'</div>'):'')+'</div></div>'
     +'<div class="psub">🎓 Student, Staff &amp; Lecturer Portal</div>'
+    +lockBanner
     +'<div class="err"></div>'
     +'<div class="field"><label>Matric no · Staff no · Username · Email</label><input id="lg" autofocus autocomplete="username"></div>'
     +'<div class="field"><label>Password</label><input id="pw" type="password" autocomplete="current-password"></div>'
+    +campusField
     +'<button class="btn" id="go">Sign In</button>'
     +'<div class="hintbar">Your login is emailed to you after registration. Forgot it? Ask the bursary or registrar to resend your portal login.</div>'
     +'<div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(148,163,184,.3);text-align:center"><div class="sub" style="margin-bottom:8px">New here? Not yet a student?</div><a href="/apply" style="display:inline-block;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:9px;text-decoration:none;font-weight:700">🎓 Apply for Admission</a></div>'
@@ -2957,7 +3012,7 @@ async function renderLogin(msg){
   document.getElementById('app').appendChild(box);
   try{PI18N.translate(box);}catch(_){}
   if(msg){const e=box.querySelector('.err');e.textContent=msg;e.style.display='block';}
-  const go=async()=>{const login=box.querySelector('#lg').value.trim();const password=box.querySelector('#pw').value;if(!login||!password)return;const btn=box.querySelector('#go');btn.disabled=true;btn.textContent='Signing in…';const r=await api('/api/login',{method:'POST',body:JSON.stringify({login,password})});btn.disabled=false;btn.textContent='Sign In';if(!r.ok){const e=box.querySelector('.err');e.textContent=r.error||'Login failed.';e.style.display='block';return;}TOKEN=r.token;localStorage.setItem('ubu_token',TOKEN);renderApp();};
+  const go=async()=>{if(locked){const e=box.querySelector('.err');e.textContent='This institution\\'s software is not activated. Contact your administrator.';e.style.display='block';return;}const login=box.querySelector('#lg').value.trim();const password=box.querySelector('#pw').value;if(!login||!password)return;const cmpEl=box.querySelector('#cmp');const campus_id=cmpEl?cmpEl.value:undefined;const btn=box.querySelector('#go');btn.disabled=true;btn.textContent='Signing in…';const r=await api('/api/login',{method:'POST',body:JSON.stringify({login,password,campus_id})});btn.disabled=false;btn.textContent='Sign In';if(!r.ok){const e=box.querySelector('.err');e.textContent=r.error||'Login failed.';e.style.display='block';return;}TOKEN=r.token;localStorage.setItem('ubu_token',TOKEN);renderApp();};
   box.querySelector('#go').onclick=go;
   box.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',function(e){if(e.key==='Enter')go();}));
 }
