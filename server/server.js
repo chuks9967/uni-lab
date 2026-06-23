@@ -28,7 +28,7 @@ catch (e) { console.error('[UniBursar] portal.js not loaded (' + e.message + ') 
 let fcm = null;
 try { fcm = require('./fcm'); } catch (_) { fcm = null; }
 
-const BUILD = 'portal-26'; // bump when server changes — visible at /health to confirm the live code
+const BUILD = 'portal-27'; // bump when server changes — visible at /health to confirm the live code
 const PORT = process.env.PORT || 4000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const SYNC_TOKEN = process.env.SYNC_TOKEN || ''; // optional shared secret
@@ -61,14 +61,14 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY || '';
 const supaEnabled = () => !!(SUPABASE_URL && SUPABASE_KEY);
 let lastCloudPull = '';
 
-function supaRest(method, path, body, extraHeaders) {
+function supaRest(method, path, body, extraHeaders, timeoutMs) {
   return new Promise((resolve, reject) => {
     let u; try { u = new URL(SUPABASE_URL + path); } catch (e) { return reject(e); }
     const lib = u.protocol === 'https:' ? https : http;
     const data = body != null ? Buffer.from(JSON.stringify(body)) : null;
     const headers = Object.assign({ 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' }, extraHeaders || {});
     if (data) headers['Content-Length'] = data.length;
-    const req = lib.request({ method, hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search, headers, timeout: 30000 }, (res) => {
+    const req = lib.request({ method, hostname: u.hostname, port: u.port || 443, path: u.pathname + u.search, headers, timeout: timeoutMs || 30000 }, (res) => {
       let buf = ''; res.on('data', d => buf += d); res.on('end', () => { let j = null; try { j = buf ? JSON.parse(buf) : null; } catch (_) {} resolve({ status: res.statusCode, json: j, raw: buf }); });
     });
     req.on('error', reject); req.on('timeout', () => req.destroy(new Error('timeout')));
@@ -233,11 +233,67 @@ function collectPushable(entity, prev, row) {
   if (entity === 'online_exams') { if (row.status !== 'published' && row.status !== 'live') return false; return !prev || !prev.row || (prev.row.status !== 'published' && prev.row.status !== 'live'); } // push when it first becomes published/live
   return !prev || !prev.row || prev.row.deleted; // genuinely new (or un-deleted)
 }
+// ---- Cross-instance LIVE-EXAM frame relay (Cloud Run autoscaling) ---------------------------------
+// The live camera/audio relay is per-instance memory inside portal.js. On a multi-instance host the
+// student's frame upload and the officer's monitor read hit DIFFERENT container instances → no camera
+// ever reaches the monitor. With EXAM_RELAY=1 (and Supabase configured) we back the relay with a shared
+// Supabase table `exam_live`, so every instance sees every student. One-time setup — run in the Supabase
+// SQL editor:
+//   create table if not exists public.exam_live (
+//     exam_id text not null, student_id text not null, updated_at timestamptz default now(), ts int8,
+//     audio_level real, away int, risk real, risk_level text, identity text, forfeited bool, last_event jsonb,
+//     has_jpeg bool, has_kyc bool, has_audio bool, audio_mime text, audio_ts int8,
+//     has_clip bool, clip_mime text, clip_ts int8, jpeg text, kyc text, audio text, clip text,
+//     primary key (exam_id, student_id));
+//   alter table public.exam_live enable row level security;  -- (service_role key bypasses RLS)
+// The simpler alternative to all of this is to pin the service to ONE instance (--max-instances=1).
+const EXAM_RELAY = process.env.EXAM_RELAY === '1' && supaEnabled();
+const RELAY_META_COLS = 'exam_id,student_id,ts,audio_level,away,risk,risk_level,identity,forfeited,last_event,has_jpeg,has_kyc,has_audio,audio_mime,audio_ts,has_clip,clip_mime,clip_ts,updated_at';
+function examRelayStore() {
+  return {
+    async put(examId, sid, fields) {
+      const row = { exam_id: examId, student_id: sid, updated_at: new Date().toISOString() };
+      if (fields.ts != null) row.ts = Number(fields.ts) || null;
+      if (fields.audioLevel != null) row.audio_level = Number(fields.audioLevel) || 0;
+      if (fields.away != null) row.away = Number(fields.away) || 0;
+      if (fields.risk != null) row.risk = Number(fields.risk) || 0;
+      if (fields.riskLevel != null) row.risk_level = String(fields.riskLevel);
+      if (fields.identity != null) row.identity = String(fields.identity);
+      if (fields.forfeited != null) row.forfeited = !!fields.forfeited;
+      if (fields.lastEvent != null) row.last_event = fields.lastEvent;
+      if (fields.jpeg != null) { row.jpeg = fields.jpeg; row.has_jpeg = true; }
+      if (fields.kyc != null) { row.kyc = fields.kyc; row.has_kyc = true; }
+      if (fields.audio != null) { row.audio = fields.audio; row.has_audio = true; if (fields.audioMime) row.audio_mime = fields.audioMime; if (fields.audioTs != null) row.audio_ts = Number(fields.audioTs) || null; }
+      if (fields.clip != null) { row.clip = fields.clip; row.has_clip = true; if (fields.clipMime) row.clip_mime = fields.clipMime; if (fields.clipTs != null) row.clip_ts = Number(fields.clipTs) || null; }
+      await supaRest('POST', '/rest/v1/exam_live?on_conflict=exam_id,student_id', [row], { 'Prefer': 'resolution=merge-duplicates,return=minimal' }, 8000);
+    },
+    async listMeta(examId) {
+      const r = await supaRest('GET', '/rest/v1/exam_live?select=' + RELAY_META_COLS + '&exam_id=eq.' + encodeURIComponent(examId), null, null, 8000);
+      if (!(r.status >= 200 && r.status < 300 && Array.isArray(r.json))) return [];
+      return r.json.map(x => ({ student_id: x.student_id, ts: Number(x.ts) || 0,
+        state: { audioLevel: x.audio_level, away: x.away, risk: x.risk, riskLevel: x.risk_level, identity: x.identity, forfeited: x.forfeited, lastEvent: x.last_event, audioMime: x.audio_mime, clipMime: x.clip_mime },
+        has_jpeg: x.has_jpeg, has_kyc: x.has_kyc, has_audio: x.has_audio, has_clip: x.has_clip, audio_ts: Number(x.audio_ts) || 0, clip_ts: Number(x.clip_ts) || 0 }));
+    },
+    async getBytes(examId, sid, kind) {
+      const col = kind === 'audio' ? 'audio,audio_mime' : kind === 'clip' ? 'clip,clip_mime' : kind === 'kyc' ? 'kyc' : 'jpeg';
+      const r = await supaRest('GET', '/rest/v1/exam_live?select=' + col + '&exam_id=eq.' + encodeURIComponent(examId) + '&student_id=eq.' + encodeURIComponent(sid) + '&limit=1', null, null, 8000);
+      const x = (r.json && r.json[0]) || null; if (!x) return null;
+      if (kind === 'audio') return x.audio ? { data: x.audio, mime: x.audio_mime || 'audio/webm' } : null;
+      if (kind === 'clip') return x.clip ? { data: x.clip, mime: x.clip_mime || 'video/webm' } : null;
+      const data = kind === 'kyc' ? x.kyc : x.jpeg; return data ? { data, mime: 'image/jpeg' } : null;
+    },
+  };
+}
+// prune stale live-frame rows (a few hours after an exam) so the relay table stays small
+if (EXAM_RELAY) setInterval(() => { try { supaRest('DELETE', '/rest/v1/exam_live?updated_at=lt.' + encodeURIComponent(new Date(Date.now() - 3 * 3600 * 1000).toISOString()), null, { 'Prefer': 'return=minimal' }).catch(() => {}); } catch (_) {} }, 30 * 60 * 1000);
+
 let portal = null;
 if (createPortal) {
   try {
     portal = createPortal({
       all: allEntity, one: oneEntity, getVersion: () => storeVersion, secret: SYNC_TOKEN || 'unibursar-portal',
+      // shared cross-instance live-frame relay (Cloud Run); null ⇒ portal uses pure in-memory (pinned single instance)
+      frameStore: EXAM_RELAY ? examRelayStore() : null,
       // resolve offloaded book/document bytes from object storage (env creds) — see server/blobstore.js
       blobFetch: (key) => require('./blobstore').getBuffer(key),
       // portal writes (e.g. password reset) update the store and bump updated_at so the
@@ -436,7 +492,7 @@ const server = http.createServer(async (req, res) => {
   // friendly root when the portal module isn't loaded (so the domain never looks "broken")
   if (p === '/' && req.method === 'GET' && !portal) { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('UniBursar hub is running. The web portal is unavailable because server/portal.js was not uploaded — add it and Restart. Sync endpoint: /health'); }
 
-  if (p === '/health') return send(res, 200, { ok: true, build: BUILD, epoch: store.epoch, records: Object.keys(store.records).length, portal: !!portal, secured: !!SYNC_TOKEN, time: new Date().toISOString() });
+  if (p === '/health') return send(res, 200, { ok: true, build: BUILD, epoch: store.epoch, records: Object.keys(store.records).length, portal: !!portal, secured: !!SYNC_TOKEN, examRelay: EXAM_RELAY, cloud: supaEnabled(), time: new Date().toISOString() });
 
   // protected endpoints require the shared token (when one is configured)
   if ((p === '/sync/push' || p === '/sync/pull' || p === '/email/send') && !tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized — missing or wrong sync token.' });
@@ -480,6 +536,9 @@ const server = http.createServer(async (req, res) => {
       name: body.name || '', short: body.short || '', logo: body.logo || '', motto: body.motto || '',
       // extra identity fields so a fresh client can recover the FULL branding via GET /branding
       address: body.address || '', email: body.email || '', phone: body.phone || '', base_currency: body.base_currency || '', portal_url: body.portal_url || '',
+      // per-university theme + document marks
+      primary: body.primary || '', accent: body.accent || '', seal: body.seal || '', signature: body.signature || '',
+      letterhead: body.letterhead || '', watermark: body.watermark || '', login_bg: body.login_bg || '', favicon: body.favicon || '',
       updated_at: body.updated_at || new Date().toISOString(),
       session: body.session || '', semester: body.semester || '',
       licensed: (typeof body.licensed === 'boolean') ? body.licensed : true, // institution activation status

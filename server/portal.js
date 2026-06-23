@@ -72,7 +72,53 @@ module.exports = function createPortal(deps) {
   // ---- Online-exam proctor frames (transient, in-memory; never synced) ----
   // examFrames[examId][studentId] = { jpeg(base64), audioLevel, ts, ring:[base64,…] }
   const examFrames = {};
-  const lastFrameTs = {};                         // per-student rate-limit
+  const lastFrameTs = {};                         // per-student client-upload rate-limit
+  const lastRelayTs = {};                         // per-student SHARED-relay write throttle (cuts cost on Cloud Run)
+  const frameClient = {};                         // examId:studentId → { id, seen, conflicts, flagged } (concurrent-device detection)
+  // A per-process id so the officer monitor can DETECT a multi-instance host (Cloud Run autoscaling),
+  // which silently splits the in-memory relay — students upload to one instance, the officer reads
+  // another, and no camera reaches the monitor. Surfaced in /api/exam/monitor.
+  const INSTANCE_ID = crypto.randomBytes(4).toString('hex');
+  // Optional SHARED relay (injected by server.js when EXAM_RELAY is on + Supabase is configured) so the
+  // live camera survives multi-instance autoscaling: the in-memory examFrames becomes a fast local cache
+  // and this store is the cross-instance source of truth. Absent (LAN desktop / pinned single instance)
+  // ⇒ pure in-memory, unchanged. All methods are async + best-effort (any failure degrades gracefully).
+  const frameRelay = (deps && deps.frameStore) || null;
+  function efGet(examId, sid) { examFrames[examId] = examFrames[examId] || {}; return examFrames[examId][sid] || { ring: [], away: 0 }; }
+  /** Store a student's frame record locally AND (best-effort) push the given fields to the shared relay. */
+  function efPut(examId, sid, cur, relayFields) {
+    examFrames[examId] = examFrames[examId] || {}; examFrames[examId][sid] = cur;
+    if (frameRelay && relayFields) { try { Promise.resolve(frameRelay.put(examId, sid, relayFields)).catch(() => {}); } catch (_) {} }
+  }
+  /** Pull all students' LIGHTWEIGHT state for an exam from the relay into the local cache (no byte blobs),
+   *  so the officer's monitor roster reflects students whose frames landed on OTHER instances. */
+  async function efHydrate(examId) {
+    if (!frameRelay) return;
+    try {
+      const rows = await frameRelay.listMeta(examId); if (!Array.isArray(rows)) return;
+      examFrames[examId] = examFrames[examId] || {};
+      for (const r of rows) {
+        if (!r || !r.student_id) continue;
+        const cur = examFrames[examId][r.student_id] || { ring: [], away: 0 };
+        const remoteTs = Number(r.ts) || 0;
+        if (remoteTs >= (cur.ts || 0)) {   // remote is newer (this instance isn't the writer) → adopt its state
+          if (r.state && typeof r.state === 'object') Object.assign(cur, r.state);
+          cur.ts = remoteTs || cur.ts;
+          cur.remoteJpeg = !!r.has_jpeg; cur.remoteKyc = !!r.has_kyc; cur.remoteAudio = !!r.has_audio; cur.remoteClip = !!r.has_clip;
+          if (r.audio_ts) cur.audioTs = r.audio_ts; if (r.clip_ts) cur.clipTs = r.clip_ts;
+        }
+        examFrames[examId][r.student_id] = cur;
+      }
+    } catch (_) { /* best-effort */ }
+  }
+  /** Resolve one student's bytes (jpeg|kyc|audio|clip): local cache first, else pull from the relay. */
+  async function efBytes(examId, sid, kind) {
+    const cur = (examFrames[examId] || {})[sid] || {};
+    const localKey = kind === 'jpeg' ? 'jpeg' : kind;
+    if (cur[localKey]) return { data: cur[localKey], mime: kind === 'audio' ? (cur.audioMime || 'audio/webm') : kind === 'clip' ? (cur.clipMime || 'video/webm') : 'image/jpeg' };
+    if (frameRelay) { try { const b = await frameRelay.getBytes(examId, sid, kind); if (b && b.data) return b; } catch (_) {} }
+    return null;
+  }
 
   // ---- login brute-force throttle (in-memory; keyed per login+IP) ----
   // The portal is network-facing and its HMAC tokens are stateless (no server session store to lean on),
@@ -438,7 +484,7 @@ module.exports = function createPortal(deps) {
   }
 
   // ---- Exam Surveillance: the student's own attendance + any malpractice flag + evidence ----
-  const MALPRACTICE_LABELS = { multiple_faces: 'Another person in your frame', absence: 'You left your seat', left_seat: 'You left your seat', looking_away: 'Looking away from your paper', talking: 'Talking during the exam', phone: 'Phone use', earbuds: 'Earbuds / earphones detected', neck_movement: 'Head/neck turning to a neighbour', notes: 'Unauthorised notes / material', unknown_face: 'Unrecognised face', impersonation: 'Possible impersonation', left_app: 'You left the exam app', left_exam: 'You left the exam app — your exam was ended (no score)', disqualified: 'Disqualified by the exam officer (exam voided)', manual: 'Flagged by an exam officer',
+  const MALPRACTICE_LABELS = { multiple_faces: 'Another person in your frame', absence: 'You left your seat', left_seat: 'You left your seat', looking_away: 'Looking away from your paper', talking: 'Talking during the exam', phone: 'Phone use', earbuds: 'Earbuds / earphones detected', neck_movement: 'Head/neck turning to a neighbour', notes: 'Unauthorised notes / material', unknown_face: 'Unrecognised face', impersonation: 'Possible impersonation', left_app: 'You left the exam app', left_exam: 'You left the exam app — your exam was ended (no score)', disqualified: 'Disqualified by the exam officer (exam voided)', connection_lost: 'You dropped offline during the exam', multiple_devices: 'Exam open on two devices at once', manual: 'Flagged by an exam officer',
     smartwatch: 'Smartwatch / smart band use', smart_glasses: 'Smart / camera glasses', calculator: 'Unauthorised calculator / electronics', second_device: 'Laptop / second screen detected', book: 'Textbook / notebook detected', body_writing: 'Writing on the body', desk_writing: 'Writing on the desk / objects', hidden_material: 'Concealed material', mirror: 'Mirror / reflective surface', copying: 'Copying a neighbour', signaling: 'Hand signals / coded gestures', passing_object: 'Passing notes / objects', script_swap: 'Swapping scripts / papers', suspicious_posture: 'Repeated under-desk / lap glances', face_hidden: 'Face covered / obscured', camera_obstruction: 'Camera covered / blocked' };
   function examTitleOf(examId) { const e = examId ? one('surveillance_sessions', examId) : null; return e ? (e.title || e.course_code || 'Exam') : 'Exam'; }
   function surveillanceForStudent(s) {
@@ -697,6 +743,7 @@ ${faceEnrolled ? '<script defer src="/vendor/face-api.min.js"></script>' : ''}
 var EXAM=${cfg}, TOKEN=${tk};
 var EX=(function(){
   var stream=null, attemptId=null, endsAt=0, questions=[], answers={}, away=0, live=false;
+  var CLIENT_ID=(Math.random().toString(36).slice(2)+Date.now().toString(36));   // session nonce → concurrent-device detection
   var proctorT=null, clockT=null, saveT=null, audioCtx=null, analyser=null, pendingAudio=null, recBusy=false, started=false;
   var cur=0, marked={}, visited={}, editors={};   // CBT navigation state (current index, flagged, visited, code editors)
   function qs(id){return document.getElementById(id);}
@@ -771,7 +818,7 @@ var EX=(function(){
   async function captureKyc(){
     var img=frameJpeg();if(!img)return alert('Camera not ready yet.');
     qs('kycbtn').disabled=true;qs('kycbtn').textContent='Sending…';
-    try{await api('/api/exam/frame',{exam_id:EXAM.id,kyc:true,image_base64:img});}catch(_){qs('kycbtn').disabled=false;qs('kycbtn').textContent='📸 Capture my photo';return;}
+    try{await api('/api/exam/frame',{exam_id:EXAM.id,kyc:true,image_base64:img,client_id:CLIENT_ID});}catch(_){qs('kycbtn').disabled=false;qs('kycbtn').textContent='📸 Capture my photo';return;}
     if(!FACE.ok){qs('kycbtn').textContent='✓ Photo captured';return;}
     // face-enrolled: verify this is really them (1:1) before they may begin
     qs('kycbtn').textContent='🔍 Verifying your face…';
@@ -953,7 +1000,7 @@ var EX=(function(){
   // ---- proctor loop ----
   function startProctor(){var since=0;
     var loop=function(){
-      var body={exam_id:EXAM.id,image_base64:frameJpeg(),audioLevel:micLevel()};
+      var body={exam_id:EXAM.id,image_base64:frameJpeg(),audioLevel:micLevel(),client_id:CLIENT_ID};
       if(pendingAudio){body.audio_base64=pendingAudio.b64;body.audio_mime=pendingAudio.mime;pendingAudio=null;}
       api('/api/exam/frame',body).then(function(r){if(r&&typeof r.live==='boolean'&&r.live!==live){live=r.live;qs('livebadge').style.display=live?'':'none';}}).catch(function(){});
       since++;var audioEvery=live?2:5;if(since%audioEvery===0)recordClip();
@@ -1971,7 +2018,9 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const campuses = all('campuses').filter(c => !c.deleted).sort((a, b) => (b.is_main ? 1 : 0) - (a.is_main ? 1 : 0)).map(c => ({ id: c.id, name: c.name }));
       // licensed flag — the desktop is the source of truth and pushes it; default true for older hubs
       const licensed = (typeof i.licensed === 'boolean') ? i.licensed : true;
-      return J(res, 200, { ok: true, name: i.name, short: i.short, logo: i.logo, motto: i.motto, language: i.language || '', i18n_custom: i.i18n_custom || '', campuses, licensed });
+      return J(res, 200, { ok: true, name: i.name, short: i.short, logo: i.logo, motto: i.motto, language: i.language || '', i18n_custom: i.i18n_custom || '', campuses, licensed,
+        // per-university theme so the web portal + APK colour their UI to match the institution
+        primary: i.primary || '', accent: i.accent || '', login_bg: i.login_bg || '', favicon: i.favicon || '' });
     }
 
     // ---- installable app assets + public clearance verification (no login) ----
@@ -2377,7 +2426,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       if (st.pick && st.pick > 0 && st.pick < qs.length) qs = seededShuffle(e.id + ':pick:' + t.id, qs).slice(0, st.pick);   // each student gets a random N-of-total subset
       if (e.shuffle !== 0) qs = seededShuffle(e.id + ':' + t.id, qs); else qs.sort((a, b) => (a.seq || 0) - (b.seq || 0));
       let answers = {}; try { answers = JSON.parse(at.answers || '{}'); } catch (_) {}
-      return J(res, 200, { ok: true, attempt_id: at.id, endsAt, duration_min: e.duration_min || 60, room: 'exam-' + e.id, exam: { id: e.id, title: e.title || e.course_code, instructions: e.instructions || '', require_camera: e.require_camera !== 0 }, answers, questions: qs });
+      return J(res, 200, { ok: true, attempt_id: at.id, endsAt, duration_min: e.duration_min || 60, room: 'exam-' + e.id, exam: { id: e.id, title: e.title || e.course_code, instructions: e.instructions || '', require_camera: e.require_camera !== 0, lockdown: st.lockdown !== false }, answers, questions: qs });
     }
     // Student: autosave answers (during the exam).
     if (p === '/api/exam/answer' && method === 'POST') {
@@ -2403,21 +2452,50 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
       const body = await readBody(); const examId = String(body.exam_id || ''); if (!examId) return J(res, 400, { ok: false });
       const now = Date.now(); const key = examId + ':' + t.id;
+      // CONCURRENT-DEVICE detection — runs BEFORE the rate-limit so it sees BOTH devices' streams. Each
+      // client sends a stable session nonce; two different nonces alternating within ~8s means the exam is
+      // open on 2+ devices (a second screen for notes, or someone else signed in as this candidate). A
+      // clean device-switch (the old device goes silent) is tolerated. Raises a synced high-severity flag.
+      const clientId = String(body.client_id || '').slice(0, 40);
+      if (clientId) {
+        const fc = frameClient[key] || {};
+        if (fc.id && fc.id !== clientId && fc.seen && (now - fc.seen) < 8000) {
+          fc.conflicts = (fc.conflicts || 0) + 1;
+          if (fc.conflicts >= 2 && !fc.flagged && typeof create === 'function') {
+            fc.flagged = true;
+            const e2 = one('online_exams', examId) || {}; const svId = e2.surveillance_id || examId;
+            const ni = new Date().toISOString(); const fid = 'flg-' + crypto.randomBytes(6).toString('hex');
+            create('malpractice_flags', { id: fid, exam_id: svId, student_id: t.id, camera_id: null, type: 'multiple_devices',
+              severity: 'high', confidence: 0.9, detail: 'The exam was streamed from TWO devices at the same time (a second screen, or another device signed in as this candidate).',
+              auto: 1, status: 'open', flagged_by: 'proctor', occurred_at: ni, created_at: ni, updated_at: ni, deleted: 0, origin_node: 'portal' });
+          }
+        }
+        fc.id = clientId; fc.seen = now; frameClient[key] = fc;
+      }
       if (!body.kyc && lastFrameTs[key] && now - lastFrameTs[key] < 1000) return J(res, 200, { ok: true, throttled: true });  // KYC selfie bypasses the rate-limit
       lastFrameTs[key] = now;
-      examFrames[examId] = examFrames[examId] || {};
-      const cur = examFrames[examId][t.id] || { ring: [], away: 0 };
+      const cur = efGet(examId, t.id);
+      const relayFields = { ts: now };
       const jpeg = String(body.image_base64 || '').replace(/^data:[^;]+;base64,/, '');
-      if (jpeg) { cur.jpeg = jpeg; cur.ts = now; cur.ring = (cur.ring || []).concat([jpeg]).slice(-20); if (body.kyc) cur.kyc = jpeg; }
-      if (body.audioLevel != null) { cur.audioLevel = Number(body.audioLevel) || 0; cur.ts = now; }
+      if (jpeg) { cur.jpeg = jpeg; cur.ts = now; cur.ring = (cur.ring || []).concat([jpeg]).slice(-20); relayFields.jpeg = jpeg; if (body.kyc) { cur.kyc = jpeg; relayFields.kyc = jpeg; } }
+      if (body.audioLevel != null) { cur.audioLevel = Number(body.audioLevel) || 0; cur.ts = now; relayFields.audioLevel = cur.audioLevel; }
       // a short captured audio clip (webm/opus) so the officer can actually HEAR the student, not just see a level bar
       const aud = String(body.audio_base64 || '').replace(/^data:[^;]+;base64,/, '');
-      if (aud && aud.length < 4 * 1024 * 1024) { cur.audio = aud; cur.audioMime = String(body.audio_mime || 'audio/webm'); cur.audioTs = now; }
-      examFrames[examId][t.id] = cur;
+      if (aud && aud.length < 4 * 1024 * 1024) { cur.audio = aud; cur.audioMime = String(body.audio_mime || 'audio/webm'); cur.audioTs = now; relayFields.audio = aud; relayFields.audioMime = cur.audioMime; relayFields.audioTs = now; }
       const at = all('exam_attempts').find(a => !a.deleted && a.exam_id === examId && a.student_id === t.id);
+      const liveBoost = !!(at && at.live_requested);
+      // SHARED-RELAY write throttle: routine frames write to the relay at most ~1/2.5s per student (the
+      // monitor refreshes each tile slower than that), which cuts the Supabase write/egress cost massively
+      // at class scale. A KYC selfie + a student the officer is viewing LIVE always relay every frame.
+      let push = relayFields;
+      if (frameRelay && !body.kyc && !liveBoost) {
+        const rk = examId + ':' + t.id;
+        if (lastRelayTs[rk] && now - lastRelayTs[rk] < 2500) push = null; else lastRelayTs[rk] = now;
+      }
+      efPut(examId, t.id, cur, push);
       // `live` tells the client to BOOST its capture cadence (≈1s frames + continuous audio) for true
       // near-real-time monitoring — without a second camera consumer (avoids getUserMedia contention).
-      return J(res, 200, { ok: true, live_requested: !!(at && at.live_requested), live: !!(at && at.live_requested), room: 'exam-' + examId });
+      return J(res, 200, { ok: true, live_requested: liveBoost, live: liveBoost, room: 'exam-' + examId });
     }
     // Student: upload a short (~15s) VIDEO evidence clip when a proctoring event fires — the officer
     // monitor attaches it to the flag. Transient in-memory (never synced); the flag's evidence is.
@@ -2426,8 +2504,9 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const body = await readBody(); const examId = String(body.exam_id || ''); if (!examId) return J(res, 400, { ok: false });
       const clip = String(body.video_base64 || '').replace(/^data:[^;]+;base64,/, '');
       if (clip && clip.length < 14 * 1024 * 1024) {
-        examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][t.id] || { ring: [], away: 0 };
-        cur.clip = clip; cur.clipMime = String(body.video_mime || 'video/webm'); cur.clipTs = Date.now(); examFrames[examId][t.id] = cur;
+        const cur = efGet(examId, t.id); const cts = Date.now();
+        cur.clip = clip; cur.clipMime = String(body.video_mime || 'video/webm'); cur.clipTs = cts;
+        efPut(examId, t.id, cur, { clip, clipMime: cur.clipMime, clipTs: cts });
       }
       return J(res, 200, { ok: true });
     }
@@ -2435,9 +2514,10 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     if (p === '/api/exam/event' && method === 'POST') {
       const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
       const body = await readBody(); const examId = String(body.exam_id || ''); if (!examId) return J(res, 400, { ok: false });
-      examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][t.id] || { ring: [], away: 0 };
+      const cur = efGet(examId, t.id);
       if ((body.type || 'left_app') === 'left_app') cur.away = (cur.away || 0) + 1;
-      cur.lastEvent = { type: body.type || 'left_app', ts: Date.now() }; examFrames[examId][t.id] = cur;
+      cur.lastEvent = { type: body.type || 'left_app', ts: Date.now() };
+      efPut(examId, t.id, cur, { away: cur.away || 0, lastEvent: cur.lastEvent, ts: cur.ts || Date.now() });
       return J(res, 200, { ok: true, away: cur.away || 0 });
     }
     // Student: FORFEIT — the proctored app reports the candidate LEFT it (minimised / switched away /
@@ -2454,17 +2534,19 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const e = one('online_exams', examId) || {};
       const total = Number(e.total_marks) || 0;
       if (typeof update === 'function') update('exam_attempts', at.id, { status: 'voided', score: 0, max_score: total, autograded: 1, submitted_at: new Date().toISOString() });
-      examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][t.id] || { ring: [], away: 0 };
-      cur.away = (cur.away || 0) + 1; cur.forfeited = true; cur.lastEvent = { type: 'left_exam', ts: Date.now() }; examFrames[examId][t.id] = cur;
+      const cur = efGet(examId, t.id);
+      cur.away = (cur.away || 0) + 1; cur.forfeited = true; cur.lastEvent = { type: 'left_exam', ts: Date.now() };
+      efPut(examId, t.id, cur, { away: cur.away, forfeited: true, lastEvent: cur.lastEvent, ts: cur.ts || Date.now() });
+      let evJpeg = cur.jpeg; if (!evJpeg) { try { const b = await efBytes(examId, t.id, 'jpeg'); if (b) evJpeg = b.data; } catch (_) {} }  // frame may be on another instance
       if (typeof create === 'function') {
         const svId = e.surveillance_id || examId;
         const now = new Date().toISOString(); const fid = 'flg-' + crypto.randomBytes(6).toString('hex');
         create('malpractice_flags', { id: fid, exam_id: svId, student_id: t.id, camera_id: null, type: 'left_exam',
           severity: 'high', confidence: 1, detail: 'The candidate left the exam app during a proctored exam (' + reason + ') — the exam was ended and the attempt voided with no score.',
           auto: 1, status: 'open', flagged_by: 'proctor', occurred_at: now, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
-        if (cur.jpeg && cur.jpeg.length < 3 * 1024 * 1024) {
+        if (evJpeg && evJpeg.length < 3 * 1024 * 1024) {
           const eid = 'evd-' + crypto.randomBytes(6).toString('hex');
-          create('malpractice_evidence', { id: eid, flag_id: fid, exam_id: svId, student_id: t.id, kind: 'image', mime: 'image/jpeg', filename: 'left-exam.jpg', data: cur.jpeg, bytes: Math.round(cur.jpeg.length * 0.75), camera_id: null, captured_at: now, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+          create('malpractice_evidence', { id: eid, flag_id: fid, exam_id: svId, student_id: t.id, kind: 'image', mime: 'image/jpeg', filename: 'left-exam.jpg', data: evJpeg, bytes: Math.round(evJpeg.length * 0.75), camera_id: null, captured_at: now, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
         }
       }
       return J(res, 200, { ok: true, voided: true });
@@ -2472,7 +2554,9 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     // Officer: monitor roster — who is online, audio level, last-seen, status.
     if (p === '/api/exam/monitor' && method === 'GET') {
       const t = isExamOfficer(req, u); if (!t) return J(res, 401, { ok: false, error: 'Not authorised — connect the monitor with the sync token or an officer login.' });
-      const examId = u.searchParams.get('exam_id') || ''; const now = Date.now(); const frames = examFrames[examId] || {};
+      const examId = u.searchParams.get('exam_id') || ''; const now = Date.now();
+      await efHydrate(examId);   // pull cross-instance state so the roster reflects students on other instances
+      const frames = examFrames[examId] || {};
       const e = one('online_exams', examId) || {};
       const attempts = all('exam_attempts').filter(a => !a.deleted && a.exam_id === examId);
       // build the grid from the COHORT roster (so the officer sees the whole class, even before anyone
@@ -2485,40 +2569,51 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
         const st = one('students', sid) || {}; const a = attempts.find(x => x.student_id === sid) || {}; const f = frames[sid];
         return { student_id: sid, name: `${st.first_name || ''} ${st.last_name || ''}`.trim(), matric: st.matric_no || '', status: a.status || 'not_started', score: a.score,
           live_requested: !!a.live_requested, identity: a.identity_verified || (f && f.kyc ? 'pending' : 'none'),
-          hasFrame: !!(f && f.jpeg), hasKyc: !!(f && f.kyc), away: f ? (f.away || 0) : 0, audioLevel: f ? f.audioLevel : 0,
-          hasAudio: !!(f && f.audio), audioTs: f ? (f.audioTs || 0) : 0,
-          hasClip: !!(f && f.clip), clipTs: f ? (f.clipTs || 0) : 0,
+          hasFrame: !!(f && (f.jpeg || f.remoteJpeg)), hasKyc: !!(f && (f.kyc || f.remoteKyc)), away: f ? (f.away || 0) : 0, audioLevel: f ? f.audioLevel : 0,
+          hasAudio: !!(f && (f.audio || f.remoteAudio)), audioTs: f ? (f.audioTs || 0) : 0,
+          hasClip: !!(f && (f.clip || f.remoteClip)), clipTs: f ? (f.clipTs || 0) : 0,
           risk: (f && f.risk != null) ? f.risk : (a.risk_score != null ? a.risk_score : null),
           riskLevel: (f && f.riskLevel) || a.risk_level || null,
-          lastSeen: f ? f.ts : 0, online: !!(f && now - f.ts < 8000) };
+          lastSeen: f ? f.ts : 0, online: !!(f && f.ts && now - f.ts < 8000) };
       }).sort((x, y) => (y.online - x.online) || String(x.name).localeCompare(String(y.name)));
       const onlineN = rows.filter(r => r.online).length;
-      return J(res, 200, { ok: true, room: 'exam-' + examId, status: e.status, students: rows, onlineCount: onlineN, frameCount: rows.filter(r => r.hasFrame).length });
+      return J(res, 200, { ok: true, room: 'exam-' + examId, status: e.status, students: rows, onlineCount: onlineN, frameCount: rows.filter(r => r.hasFrame).length, instanceId: INSTANCE_ID, relay: !!frameRelay });
     }
-    // Officer: latest frame JPEG for a student tile in the live grid.
+    // Officer: latest frame JPEG for a student tile in the live grid. (Pulls from the shared relay if the
+    // student's frame landed on another instance.)
     if (method === 'GET' && p === '/api/exam/frame') {
       const t = isExamOfficer(req, u); if (!t) return H(res, 401, '<p>Unauthorized.</p>');
       const examId = u.searchParams.get('exam_id') || ''; const sid = u.searchParams.get('student_id') || '';
-      const f = (examFrames[examId] || {})[sid];
-      const pic = (u.searchParams.get('kyc') === '1') ? (f && f.kyc) : (f && f.jpeg);
-      if (!pic) return H(res, 404, '<p>No frame.</p>');
-      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' }); res.end(Buffer.from(pic, 'base64')); return true;
+      const b = await efBytes(examId, sid, (u.searchParams.get('kyc') === '1') ? 'kyc' : 'jpeg');
+      if (!b || !b.data) return H(res, 404, '<p>No frame.</p>');
+      res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' }); res.end(Buffer.from(b.data, 'base64')); return true;
     }
     // Officer: latest captured audio clip for a student (so the monitor can HEAR them, not just a level bar).
     if (method === 'GET' && p === '/api/exam/audio') {
       const t = isExamOfficer(req, u); if (!t) return H(res, 401, '<p>Unauthorized.</p>');
       const examId = u.searchParams.get('exam_id') || ''; const sid = u.searchParams.get('student_id') || '';
-      const f = (examFrames[examId] || {})[sid];
-      if (!f || !f.audio) return H(res, 404, '<p>No audio.</p>');
-      res.writeHead(200, { 'Content-Type': f.audioMime || 'audio/webm', 'Cache-Control': 'no-store' }); res.end(Buffer.from(f.audio, 'base64')); return true;
+      const b = await efBytes(examId, sid, 'audio');
+      if (!b || !b.data) return H(res, 404, '<p>No audio.</p>');
+      res.writeHead(200, { 'Content-Type': b.mime || 'audio/webm', 'Cache-Control': 'no-store' }); res.end(Buffer.from(b.data, 'base64')); return true;
     }
     // Officer: the student's latest ~15s video evidence clip (to attach to a flag).
     if (method === 'GET' && p === '/api/exam/clip') {
       const t = isExamOfficer(req, u); if (!t) return H(res, 401, '<p>Unauthorized.</p>');
       const examId = u.searchParams.get('exam_id') || ''; const sid = u.searchParams.get('student_id') || '';
-      const f = (examFrames[examId] || {})[sid];
-      if (!f || !f.clip) return H(res, 404, '<p>No clip.</p>');
-      res.writeHead(200, { 'Content-Type': f.clipMime || 'video/webm', 'Cache-Control': 'no-store' }); res.end(Buffer.from(f.clip, 'base64')); return true;
+      const b = await efBytes(examId, sid, 'clip');
+      if (!b || !b.data) return H(res, 404, '<p>No clip.</p>');
+      res.writeHead(200, { 'Content-Type': b.mime || 'video/webm', 'Cache-Control': 'no-store' }); res.end(Buffer.from(b.data, 'base64')); return true;
+    }
+    // Officer: recent malpractice flags for a live exam — so the monitor's LIVE alerts feed shows the
+    // SERVER-side flags (forfeit / multiple-devices / browser impersonation) immediately, not only after
+    // they sync to the desktop or when the officer drills into one student. `exam_id` = the surveillance id.
+    if (method === 'GET' && p === '/api/exam/flags') {
+      const t = isExamOfficer(req, u); if (!t) return J(res, 401, { ok: false });
+      const svId = u.searchParams.get('exam_id') || ''; const since = u.searchParams.get('since') || '';
+      const rows = all('malpractice_flags').filter(f => !f.deleted && f.exam_id === svId && (!since || String(f.occurred_at || f.created_at) > since))
+        .sort((a, b) => String(b.occurred_at || b.created_at).localeCompare(String(a.occurred_at || a.created_at))).slice(0, 50)
+        .map(f => { const s = f.student_id ? one('students', f.student_id) : null; return { id: f.id, student_id: f.student_id, name: s ? `${s.first_name || ''} ${s.last_name || ''}`.trim() : (f.matched_name || null), type: f.type, severity: f.severity, detail: f.detail, occurred_at: f.occurred_at || f.created_at, flagged_by: f.flagged_by }; });
+      return J(res, 200, { ok: true, flags: rows });
     }
     // Officer: push a live AI-proctoring RISK score (0–100) for a student → roster + synced attempt.
     if (p === '/api/exam/risk' && method === 'POST') {
@@ -2526,8 +2621,9 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const body = await readBody(); const examId = String(body.exam_id || ''); const sid = String(body.student_id || '');
       const score = Math.max(0, Math.min(100, Math.round(Number(body.score) || 0)));
       const level = body.level || (score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low');
-      examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][sid] || { ring: [], away: 0 };
-      cur.risk = score; cur.riskLevel = level; examFrames[examId][sid] = cur;
+      const cur = efGet(examId, sid);
+      cur.risk = score; cur.riskLevel = level;
+      efPut(examId, sid, cur, { risk: score, riskLevel: level, ts: cur.ts || Date.now() });
       const at = all('exam_attempts').find(a => !a.deleted && a.exam_id === examId && a.student_id === sid);
       if (at && typeof update === 'function') update('exam_attempts', at.id, { risk_score: score, risk_level: level });  // syncs back to the desktop
       return J(res, 200, { ok: true });
@@ -2547,17 +2643,19 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const e = one('online_exams', examId) || {};
       const total = Number(e.total_marks) || 0;
       if (typeof update === 'function') update('exam_attempts', at.id, { status: 'voided', score: 0, max_score: total, autograded: 1, submitted_at: at.submitted_at || new Date().toISOString() });
-      examFrames[examId] = examFrames[examId] || {}; const cur = examFrames[examId][sid] || { ring: [], away: 0 };
-      cur.forfeited = true; cur.lastEvent = { type: 'disqualified', ts: Date.now() }; examFrames[examId][sid] = cur;
+      const cur = efGet(examId, sid);
+      cur.forfeited = true; cur.lastEvent = { type: 'disqualified', ts: Date.now() };
+      efPut(examId, sid, cur, { forfeited: true, lastEvent: cur.lastEvent, ts: cur.ts || Date.now() });
+      let evJpeg = cur.jpeg; if (!evJpeg) { try { const b = await efBytes(examId, sid, 'jpeg'); if (b) evJpeg = b.data; } catch (_) {} }  // frame may be on another instance
       if (typeof create === 'function') {
         const svId = e.surveillance_id || examId;
         const now = new Date().toISOString(); const fid = 'flg-' + crypto.randomBytes(6).toString('hex');
         create('malpractice_flags', { id: fid, exam_id: svId, student_id: sid, camera_id: null, type: 'disqualified',
           severity: 'high', confidence: 1, detail: 'Disqualified by the exam officer — ' + reason + '. The attempt was voided (no score).',
           auto: 0, status: 'open', flagged_by: 'officer', occurred_at: now, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
-        if (cur.jpeg && cur.jpeg.length < 3 * 1024 * 1024) {
+        if (evJpeg && evJpeg.length < 3 * 1024 * 1024) {
           const eid = 'evd-' + crypto.randomBytes(6).toString('hex');
-          create('malpractice_evidence', { id: eid, flag_id: fid, exam_id: svId, student_id: sid, kind: 'image', mime: 'image/jpeg', filename: 'disqualified.jpg', data: cur.jpeg, bytes: Math.round(cur.jpeg.length * 0.75), camera_id: null, captured_at: now, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+          create('malpractice_evidence', { id: eid, flag_id: fid, exam_id: svId, student_id: sid, kind: 'image', mime: 'image/jpeg', filename: 'disqualified.jpg', data: evJpeg, bytes: Math.round(evJpeg.length * 0.75), camera_id: null, captured_at: now, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
         }
       }
       return J(res, 200, { ok: true, voided: true });
@@ -2845,7 +2943,7 @@ const PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta n
 <title>UniBursar Portal</title>
 <link rel="manifest" href="/manifest.webmanifest"><meta name="theme-color" content="#1e3a8a"><link rel="icon" href="/favicon">
 <style>
-:root{--navy:#0f1e3d;--brand:#2563eb;--ink:#0f172a;--muted:#64748b;--line:#e6eaf0;--bg:#eef2f8}
+:root{--navy:#0f1e3d;--brand:#2563eb;--brand-rgb:37,99,235;--ink:#0f172a;--muted:#64748b;--line:#e6eaf0;--bg:#eef2f8}
 *{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',system-ui,Arial,sans-serif;background:var(--bg);color:var(--ink)}
 a{color:var(--brand)}
 .login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:radial-gradient(1200px 600px at 20% -10%,#1e3a8a22,transparent),var(--bg)}
@@ -3560,15 +3658,15 @@ function cap(s){s=String(s||'');return s.charAt(0).toUpperCase()+s.slice(1).repl
 if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(()=>{});}
 (function(){
   function boot(){ if(TOKEN){renderApp().catch(()=>renderLogin());}else{renderLogin();} }
-  // apply the institution default language (only when this device hasn't chosen one) + any custom
-  // translation overrides, BEFORE the first render — then boot. Per-device choice always wins.
+  // colour the portal to the institution's brand (overrides the --brand CSS variable the UI is built on)
+  function applyTheme(b){ try{ var hx=/^#([0-9a-fA-F]{6})$/; var r=document.documentElement.style; var p=(b&&String(b.primary||'').trim())||''; if(hx.test(p)){r.setProperty('--brand',p);r.setProperty('--brand-rgb',[parseInt(p.slice(1,3),16),parseInt(p.slice(3,5),16),parseInt(p.slice(5,7),16)].join(','));} if(b&&hx.test(String(b.accent||'').trim()))r.setProperty('--navy',b.accent.trim()); if(b&&b.favicon){var fl=document.querySelector('link[rel=icon]');if(fl)fl.href=b.favicon;} }catch(_){} }
+  // fetch branding ONCE up front → apply theme + i18n (device language choice always wins), then boot.
   try{
-    if(!PI18N.hasPref()){
-      fetch('/api/branding').then(function(r){return r.json();}).then(function(b){
-        try{ if(b&&b.i18n_custom){try{PI18N.merge(JSON.parse(b.i18n_custom));}catch(_){}} if(b&&b.language)PI18N.use(b.language); }catch(_){}
-        boot();
-      }).catch(boot);
-    } else boot();
+    fetch('/api/branding').then(function(r){return r.json();}).then(function(b){
+      applyTheme(b);
+      try{ if(!PI18N.hasPref()){ if(b&&b.i18n_custom){try{PI18N.merge(JSON.parse(b.i18n_custom));}catch(_){}} if(b&&b.language)PI18N.use(b.language); } }catch(_){}
+      boot();
+    }).catch(boot);
   }catch(_){ boot(); }
 })();
 </script></body></html>`;
