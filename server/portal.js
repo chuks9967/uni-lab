@@ -59,6 +59,9 @@ function amountWords(a, c) { const whole = Math.floor(Number(a) || 0); const k =
 
 module.exports = function createPortal(deps) {
   const { all, one, getVersion, secret, institution, update, create, registerDevice, jitsiConfig, onLiveStart, blobFetch, sendMail } = deps;
+  // Multi-provider online-payment gateway (Paystack/Flutterwave). Injected by the hub; falls back to the
+  // bundled module so it always works. Tests inject a MOCK so the money path runs without a live gateway.
+  const gateway = (deps && deps.paymentGateway) || (function () { try { return require('./payments-gateway'); } catch (_) { return null; } })();
   // Resolve a row's binary: inline base64 (legacy) → Buffer, else fetch the offloaded object by key
   // (services/blobstore.js / server/blobstore.js, injected as blobFetch). Returns a Buffer or null.
   const resolveBlob = async (inlineB64, key) => {
@@ -1914,19 +1917,237 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     if (orphans.length) grouped.push({ id: '_other', name: 'Other Programmes', campus_id: null, departments: orphans.map(d => ({ id: d.id, name: d.name })) });
     return { faculties: grouped, levels, campuses, open: (String(process.env.ADMISSIONS_OPEN || '1') !== '0') };
   }
-  // minimal Paystack client (optional — only used when PAYSTACK_SECRET is set in the server env)
-  function paystackReq(pathName, method, payload) {
-    return new Promise((resolve) => {
-      try {
-        const https = require('https');
-        const data = payload ? JSON.stringify(payload) : null;
-        const r = https.request({ hostname: 'api.paystack.co', path: pathName, method, headers: Object.assign({ Authorization: 'Bearer ' + process.env.PAYSTACK_SECRET, 'Content-Type': 'application/json' }, data ? { 'Content-Length': Buffer.byteLength(data) } : {}) }, (resp) => {
-          let b = ''; resp.on('data', d => b += d); resp.on('end', () => { try { resolve(JSON.parse(b)); } catch (_) { resolve(null); } });
-        });
-        r.on('error', () => resolve(null));
-        if (data) r.write(data); r.end();
-      } catch (_) { resolve(null); }
+  // ---- Online payment: record + alert + email (shared by the redirect callback AND the webhook) ----
+  // Idempotent on provider:reference. Records a COMPLETED payment (reuses the normal ledger so it shows as
+  // a receipt + reduces the chosen fee's balance), alerts the fee office, and emails the student a
+  // provisional receipt. NEVER trusts the client — only ever called AFTER gateway.verify() succeeds.
+  function notifyFeeOffice(s, category, amt, cur, receiptNo) {
+    if (typeof create !== 'function') return;
+    const nm = `${s.first_name || ''} ${s.last_name || ''}`.trim();
+    const roles = new Set(['accountant', 'admin']);
+    try { all('charges').filter(c => !c.deleted && c.student_id === s.id && c.category === category).forEach(c => { if (c.raised_role) roles.add(c.raised_role); }); } catch (_) {}
+    const now = new Date().toISOString();
+    for (const role of roles) {
+      try { create('notifications', { id: crypto.randomUUID(), target_user: null, target_role: role, title: '💰 Online payment received', body: `${nm} paid ${money(amt, cur)} for ${category} online — receipt ${receiptNo}.`, type: 'system', payload: JSON.stringify({ student_id: s.id, receipt_no: receiptNo, category }), is_read: 0, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' }); } catch (_) {}
+    }
+  }
+  function emailReceipt(s, r) {
+    if (typeof sendMail !== 'function' || !s.email) return;
+    const i = inst();
+    const logo = i.logo ? `<img src="${esc(i.logo)}" alt="" style="height:42px;margin-bottom:6px">` : '';
+    const html = `<div style="font-family:Segoe UI,Arial,sans-serif;max-width:560px;margin:0 auto;color:#1e293b">`
+      + `<div style="text-align:center;border-bottom:2px solid #1e3a8a;padding-bottom:10px;margin-bottom:14px">${logo}<div style="font-size:18px;font-weight:800;color:#1e3a8a">${esc(i.name || 'University')}</div><div style="font-size:12px;color:#64748b">Office of the Bursar</div></div>`
+      + `<div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:10px;padding:12px 14px;text-align:center;margin-bottom:14px"><div style="font-size:30px">✅</div><b>Payment received</b></div>`
+      + `<p>Dear ${esc(`${s.first_name || ''} ${s.last_name || ''}`.trim() || 'Student')},</p>`
+      + `<p>We have received your online payment. This is your <b>provisional receipt</b> — the official receipt is also on your portal under <b>Fees</b>.</p>`
+      + `<table style="width:100%;border-collapse:collapse;font-size:14px;margin:8px 0 14px">`
+      + `<tr><td style="padding:7px 0;color:#64748b;width:150px">Receipt no.</td><td style="padding:7px 0;font-weight:700">${esc(r.receiptNo)}</td></tr>`
+      + `<tr><td style="padding:7px 0;color:#64748b">Paid for</td><td style="padding:7px 0;font-weight:700">${esc(r.category)}</td></tr>`
+      + `<tr><td style="padding:7px 0;color:#64748b">Amount</td><td style="padding:7px 0;font-weight:700">${esc(money(r.amt, r.cur))}</td></tr>`
+      + `<tr><td style="padding:7px 0;color:#64748b">Method</td><td style="padding:7px 0;font-weight:700">Online · ${esc(r.provider)}</td></tr>`
+      + `<tr><td style="padding:7px 0;color:#64748b">Date</td><td style="padding:7px 0;font-weight:700">${esc(new Date(r.date).toLocaleString())}</td></tr></table>`
+      + `<div style="color:#94a3b8;font-size:11px;border-top:1px solid #e5e7eb;padding-top:10px">Keep this receipt. If your balance is not updated within a few minutes, contact the Bursary with the receipt number above.</div></div>`;
+    try { Promise.resolve(sendMail({ to: s.email, subject: `Payment receipt ${r.receiptNo} — ${i.name || ''}`, html })).catch(() => {}); } catch (_) {}
+  }
+  async function recordOnlinePayment(provider, verified, ctx) {
+    ctx = ctx || {};
+    const md = (verified && verified.metadata) || {};
+    // TRUST the server-built intent (ctx) over any provider/client metadata — student/category/charge
+    // come from what WE created at checkout-start, never from the browser.
+    const sid = ctx.student_id || md.student_id; if (!sid) return { ok: false, error: 'no student in metadata' };
+    const s = one('students', sid); if (!s) return { ok: false, error: 'student not found' };
+    const reference = String(verified.reference || ctx.reference || md.reference || '');
+    const tag = provider + ':' + reference;
+    const dup = all('payments').find(x => !x.deleted && String(x.decision_note || '') === tag);
+    if (dup) return { ok: true, already: true, payment: dup };                      // idempotent
+    const amt = Math.round((Number(verified.amount) || 0) * 100) / 100;
+    const cur = String(verified.currency || ctx.currency || md.currency || 'NGN').toUpperCase();
+    const category = String(ctx.category || md.category || 'tuition').slice(0, 40);
+    if (!(amt > 0) || typeof create !== 'function') return { ok: false, error: 'invalid amount' };
+    // FRAUD GUARD: when we have the expected intent, the gateway-verified currency MUST match it, and
+    // the amount cannot exceed what we asked for (a provider should never report MORE than the order).
+    if (ctx.expectCurrency && cur !== String(ctx.expectCurrency).toUpperCase()) return { ok: false, error: 'currency mismatch' };
+    if (ctx.expectAmount != null && amt > Number(ctx.expectAmount) + 1) return { ok: false, error: 'amount exceeds the order' };
+    const now = new Date().toISOString();
+    const receiptNo = 'ONL-' + now.slice(0, 7).replace('-', '') + '-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+    const pid = crypto.randomUUID();
+    create('payments', {
+      id: pid, receipt_no: receiptNo, student_id: sid, charge_id: md.charge_id || null, category,
+      description: 'Online payment (' + provider + ')', currency: cur, amount: amt,
+      method: 'online', channel: provider, status: 'completed',
+      raised_by: null, raised_role: md.raised_role || 'accountant', decided_by: null, decided_at: now,
+      decision_note: tag, session_id: md.session_id || null, semester_id: md.semester_id || null,
+      created_at: now, updated_at: now, deleted: 0, origin_node: 'portal',
     });
+    notifyFeeOffice(s, category, amt, cur, receiptNo);
+    emailReceipt(s, { receiptNo, category, amt, cur, provider, date: now });
+    return { ok: true, payment: { id: pid, receipt_no: receiptNo, amount: amt, currency: cur, category } };
+  }
+  // Resolve the requested provider to one this deployment actually has keys for (default = first configured).
+  function pickProvider(x) {
+    if (!gateway) return null;
+    const list = gateway.providers(); if (!list.length) return null;
+    const id = String(x || '').toLowerCase().trim();
+    return (id && list.some(p => p.id === id)) ? id : list[0].id;
+  }
+  // Re-derive what the student still owes for a fee straight from the ledger, so we can refuse an overpay
+  // (auto-debit the chosen fee, not more). Returns null when the fee is unknown here (don't block then).
+  function outstandingFor(s, category, currency) {
+    try {
+      const cur = String(currency || 'NGN').toUpperCase();
+      const charges = all('charges').filter(c => !c.deleted && c.student_id === s.id && c.category === category && String(c.currency || 'NGN').toUpperCase() === cur);
+      if (!charges.length) return null;
+      const billed = charges.reduce((a, c) => a + (Number(c.amount) || 0), 0);
+      const paid = all('payments').filter(x => !x.deleted && x.student_id === s.id && x.category === category && String(x.currency || 'NGN').toUpperCase() === cur && x.status === 'completed').reduce((a, x) => a + (Number(x.amount) || 0), 0);
+      return Math.max(0, Math.round((billed - paid) * 100) / 100);
+    } catch (_) { return null; }
+  }
+  // After a VERIFIED transaction, route it to the right place: a student fee payment, or an admission
+  // fee. `intent` (when present) is the server-built record we trust for student/amount/currency; the
+  // verified provider data is the source of truth for "was it actually paid + how much".
+  async function settlePayment(provider, verified, intent) {
+    const md = (verified && verified.metadata) || {};
+    const appId = (intent && intent.application_id) || md.application_id;
+    if (appId) {
+      const a = one('admission_applications', appId);
+      if (a && typeof update === 'function') {
+        // FRAUD GUARD: when we have the expected intent, the gateway-verified currency must match it and
+        // the paid amount cannot fall short of the admission fee (so a tampered/underpaid checkout never
+        // marks the fee paid).
+        if (intent) {
+          const vcur = String(verified.currency || '').toUpperCase();
+          const vamt = Math.round((Number(verified.amount) || 0) * 100) / 100;
+          if ((intent.currency && vcur && vcur !== String(intent.currency).toUpperCase()) || (intent.amount && vamt > 0 && vamt + 1 < Number(intent.amount))) return { ok: false, error: 'amount/currency mismatch' };
+        }
+        if (!a.admission_fee_paid) update('admission_applications', a.id, { admission_fee_paid: 1, payment_ref: verified.reference, status: a.status === 'admitted' ? 'admitted' : 'fee_paid' });
+        if (intent) markIntent(intent.id, { status: 'paid' });
+        return { ok: true, kind: 'admission' };
+      }
+      return { ok: false, error: 'application not found' };
+    }
+    const sid = (intent && intent.student_id) || md.student_id;
+    if (sid) {
+      const ctx = intent
+        ? { student_id: intent.student_id, category: intent.category, reference: intent.reference, expectAmount: intent.amount, expectCurrency: intent.currency }
+        : {};
+      const out = await recordOnlinePayment(provider, verified, ctx);
+      if (intent && out && out.ok) markIntent(intent.id, { status: 'paid', payment_id: out.payment && out.payment.id });
+      return Object.assign({ kind: 'student' }, out);
+    }
+    return { ok: false, error: 'unknown payment target' };
+  }
+  function payResultPage(okPaid, paidText) {
+    return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:Segoe UI,Arial,sans-serif;background:#0b1220;color:#fff;text-align:center;padding:60px 20px"><div style="font-size:54px">${okPaid ? '✅' : '⚠️'}</div><h2>${okPaid ? 'Payment received' : 'Payment not confirmed'}</h2><p style="opacity:.8">${okPaid ? ('Your payment' + (paidText ? ' of ' + esc(paidText) : '') + ' has been recorded. Your receipt is now in the app under Fees, and a copy has been emailed to you.') : 'We could not confirm your payment yet. If you were debited, it will reflect automatically once the bank confirms — or contact the Bursary with your transaction reference.'}</p><p style="opacity:.6;font-size:13px">You can close this window and return to the app.</p></body>`;
+  }
+
+  // ---- Online-payment INTENTS + smart reconciliation -----------------------
+  // An intent is created the moment a checkout STARTS, correlating OUR reference to the provider's id.
+  // It lets the redirect callback, the webhook AND a periodic sweep all verify+settle the SAME payment
+  // (idempotently), so a payment is recorded even if the student closes the tab before redirecting.
+  function paymentsTestMode() { try { return !!(gateway && gateway.isTestMode && gateway.isTestMode()); } catch (_) { return false; } }
+  function createIntent(o) {
+    if (typeof create !== 'function') return null;
+    const id = crypto.randomUUID(); const now = new Date().toISOString();
+    const row = { id, reference: o.reference, provider: o.provider, provider_ref: o.provider_ref || o.reference || null,
+      student_id: o.student_id || null, application_id: o.application_id || null, category: o.category || null,
+      amount: Math.round((Number(o.amount) || 0) * 100) / 100, currency: String(o.currency || 'NGN').toUpperCase(),
+      status: 'initiated', payment_id: null, test_mode: o.test_mode ? 1 : 0, ip: (o.ip || '').slice(0, 60), attempts: 0,
+      last_checked_at: null, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' };
+    create('payment_intents', row); return row;
+  }
+  function intentByReference(ref) { if (!ref) return null; try { return all('payment_intents').find(x => !x.deleted && x.reference === ref) || null; } catch (_) { return null; } }
+  function markIntent(id, patch) { if (typeof update === 'function' && id) update('payment_intents', id, Object.assign({ updated_at: new Date().toISOString() }, patch)); }
+  /** How many checkouts this student STARTED in the last `minutes` (velocity / anti-abuse guard). */
+  function recentIntentCount(studentId, minutes) {
+    if (!studentId) return 0; const since = Date.now() - (minutes || 60) * 60000;
+    try { return all('payment_intents').filter(x => !x.deleted && x.student_id === studentId && new Date(x.created_at || 0).getTime() >= since).length; } catch (_) { return 0; }
+  }
+  /** The id we must hand to gateway.verify(), per provider — from the redirect query and/or the intent. */
+  function resolveVerifyRef(provider, query, intent) {
+    const ir = intent && intent.provider_ref;
+    if (provider === 'flutterwave') return query.transaction_id || ir || query.tx_ref || query.reference;
+    if (provider === 'stripe') return query.session_id || ir;
+    if (provider === 'paypal') return query.token || ir;
+    if (provider === 'razorpay') return query.razorpay_payment_link_id || ir;
+    if (provider === 'mollie') return ir;
+    return query.reference || query.trxref || ir; // paystack + default
+  }
+  /** Periodic sweep: re-verify checkouts that never came back (closed tab / dropped webhook) and settle
+   *  the ones that actually paid; give up on very old ones. Safe to call on an interval. Idempotent. */
+  async function reconcileIntents(opts) {
+    opts = opts || {};
+    if (!gateway || typeof all !== 'function') return { checked: 0, settled: 0 };
+    const now = Date.now();
+    const minAge = (opts.minAgeMin != null ? opts.minAgeMin : 2) * 60000;   // let callback/webhook try first
+    const maxAge = (opts.maxAgeMin != null ? opts.maxAgeMin : 720) * 60000; // give up after 12h
+    const recheck = (opts.recheckMin != null ? opts.recheckMin : 5) * 60000;
+    let checked = 0, settled = 0;
+    let pending;
+    try { pending = all('payment_intents').filter(x => !x.deleted && x.status === 'initiated'); } catch (_) { return { checked: 0, settled: 0 }; }
+    for (const it of pending) {
+      const age = now - new Date(it.created_at || 0).getTime();
+      if (age < minAge) continue;
+      if (age > maxAge) { markIntent(it.id, { status: 'abandoned' }); continue; }
+      if (it.last_checked_at && (now - new Date(it.last_checked_at).getTime()) < recheck) continue;
+      markIntent(it.id, { attempts: (it.attempts || 0) + 1, last_checked_at: new Date().toISOString() });
+      if (!it.provider_ref) continue;
+      checked++;
+      let v = null; try { v = await gateway.verify(it.provider, it.provider_ref); } catch (_) {}
+      if (v && v.ok) { try { const out = await settlePayment(it.provider, v, it); if (out && out.ok) settled++; } catch (_) {} }
+    }
+    return { checked, settled };
+  }
+
+  // ---- Final-clearance view helpers (assembled from the SYNCED tables; owed computed live) ----
+  const FC_STAGES = ['financial', 'academic', 'project', 'results', 'physical'];
+  const FC_STAGE_LABEL = { request: 'Request', financial: 'Financial clearance', academic: 'Academic clearance', project: 'Project defence', results: 'Results, transcript & certificate', physical: 'Physical certificate & transcript', done: 'Completed' };
+  const FC_ROLE_LABEL = { accountant: 'Bursary / Accountant', registrar: 'Registrar', dean: 'Faculty Head (Dean)', student_affairs: 'Student Affairs', hod: 'Head of Department', ict: 'ICT', library: 'Library', project_committee: 'Project committee' };
+  function finalEligible(s) {
+    const lvlName = (one('levels', s.level_id) || {}).name || '';
+    const mm = String(lvlName).match(/\d{3,}/); const ln = mm ? Number(mm[0]) : null;
+    if (ln != null) return ln >= 300;
+    const lv = all('levels').slice().sort((a, b) => (a.rank || 0) - (b.rank || 0));
+    return lv.findIndex(l => l.id === s.level_id) >= 2;
+  }
+  function fcBalLive(sid) {
+    const bal = {};
+    for (const c of all('charges')) if (!c.deleted && c.student_id === sid) bal[c.currency] = (bal[c.currency] || 0) + Number(c.amount || 0);
+    for (const pm of all('payments')) if (!pm.deleted && pm.student_id === sid && pm.status === 'completed') bal[pm.currency] = (bal[pm.currency] || 0) - Number(pm.amount || 0);
+    const out = {}; for (const k of Object.keys(bal)) if (bal[k] > 0.001) out[k] = Math.round(bal[k] * 100) / 100; return out;
+  }
+  function fcOwedCat(sid, cat) {
+    if (!cat) return {}; const ch = {}, pd = {};
+    for (const c of all('charges')) if (!c.deleted && c.student_id === sid && c.category === cat) ch[c.currency] = (ch[c.currency] || 0) + Number(c.amount || 0);
+    for (const pm of all('payments')) if (!pm.deleted && pm.student_id === sid && pm.category === cat && pm.status === 'completed') pd[pm.currency] = (pd[pm.currency] || 0) + Number(pm.amount || 0);
+    const out = {}; for (const k of new Set([...Object.keys(ch), ...Object.keys(pd)])) { const o = Math.round(((ch[k] || 0) - (pd[k] || 0)) * 100) / 100; if (o > 0.001) out[k] = o; } return out;
+  }
+  function fcItemOwed(it, sid) {
+    if (it.type === 'financial_all') return fcBalLive(sid);
+    if ((it.type === 'office_fees' || it.type === 'manual') && it.pay_category) return fcOwedCat(sid, it.pay_category);
+    return {};
+  }
+  function finalClearanceView(s) {
+    const eligible = finalEligible(s);
+    const clr = all('grad_clearances').filter(c => !c.deleted && c.student_id === s.id).sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))[0];
+    if (!clr) return { exists: false, eligible, minLevel: 300 };
+    const allItems = all('grad_clearance_items').filter(i => !i.deleted && i.clearance_id === clr.id);
+    const stages = FC_STAGES.map((st, i) => {
+      const its = (clr.status === 'denied') ? [] : allItems.filter(x => x.stage === st).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0)).map(it => {
+        const owed = fcItemOwed(it, s.id);
+        let status = it.status;
+        if (status !== 'cleared' && Object.keys(owed).length) status = 'owing';
+        let detail = null; try { detail = it.detail ? JSON.parse(it.detail) : null; } catch (_) {}
+        return { id: it.id, name: it.name, type: it.type, stage: it.stage, status, oversee_label: FC_ROLE_LABEL[it.oversee_role] || it.oversee_role || '—', owed, online_pay: !!it.online_pay, pay_category: it.pay_category || null, detail, note: it.note };
+      });
+      const reached = FC_STAGES.indexOf(clr.stage) > i || clr.status === 'completed';
+      return { key: st, label: FC_STAGE_LABEL[st], items: its, current: clr.stage === st && clr.status === 'active', done: (its.length && its.every(x => x.status === 'cleared')) || reached };
+    });
+    const docByKind = (k) => { const d = all('portal_documents').find(x => !x.deleted && x.student_id === s.id && x.auto_kind === k); return d ? { id: d.id, title: d.title, filename: d.filename } : null; };
+    return {
+      exists: true, eligible, id: clr.id, status: clr.status, stage: clr.stage, stage_label: FC_STAGE_LABEL[clr.stage] || clr.stage,
+      deny_reason: clr.deny_reason, cgpa: clr.cgpa, classification: clr.classification, stages,
+      documents: { project: docByKind('project'), transcript: docByKind('transcript'), certificate: docByKind('certificate'), scanned_transcript: docByKind('scanned_transcript'), scanned_certificate: docByKind('scanned_certificate') },
+    };
   }
 
   async function handle(req, res, u, method, readBody) {
@@ -2211,14 +2432,31 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const a = applicantFrom(req, u); if (!a) return J(res, 401, { ok: false });
       if (!(Number(a.admission_fee_amount) > 0)) return J(res, 200, { ok: false, error: 'No admission fee has been set yet. Please wait for your offer.' });
       const amount = Number(a.admission_fee_amount), currency = a.admission_fee_currency || 'NGN';
-      if (process.env.PAYSTACK_SECRET && a.email) {
-        const init = await paystackReq('/transaction/initialize', 'POST', { email: a.email, amount: Math.round(amount * 100), currency, reference: 'ADM-' + String(a.id).slice(0, 8) + '-' + Date.now(), callback_url: `${buildBase(req)}/api/apply/pay/callback`, metadata: { application_id: a.id, app_no: a.app_no } });
-        if (init && init.status && init.data && init.data.authorization_url) {
-          if (typeof update === 'function') update('admission_applications', a.id, { payment_ref: init.data.reference });
-          return J(res, 200, { ok: true, mode: 'paystack', authorization_url: init.data.authorization_url });
+      const body = await readBody();
+      const provider = pickProvider(body && body.provider);
+      if (provider && gateway && a.email) {
+        // anti-abuse: cap how many admission-fee checkouts ONE application can start in an hour
+        try { const since = Date.now() - 60 * 60000; if (all('payment_intents').filter(x => !x.deleted && x.application_id === a.id && new Date(x.created_at || 0).getTime() >= since).length >= 12) return J(res, 200, { ok: false, error: 'Too many payment attempts. Please wait a little, or contact the Bursary.' }); } catch (_) {}
+        const reference = 'ADM-' + provider.slice(0, 3).toUpperCase() + '-' + String(a.id).slice(0, 8) + '-' + Date.now();
+        const base = buildBase(req);
+        const r = await gateway.init(provider, {
+          email: a.email, name: `${a.first_name || ''} ${a.last_name || ''}`.trim(),
+          amount, currency, reference,
+          callback_url: `${base}/api/apply/pay/callback?provider=${provider}&reference=${encodeURIComponent(reference)}`,
+          webhook_url: `${base}/api/pay/webhook/${provider}`,
+          title: `${inst().name || 'School'} — Admission fee`, metadata: { application_id: a.id, app_no: a.app_no, reference },
+        });
+        if (r.ok) {
+          if (typeof update === 'function') update('admission_applications', a.id, { payment_ref: r.reference });
+          // an intent makes the admission payment as robust as a student fee: the redirect, the webhook
+          // AND the reconciliation sweep all settle the SAME payment (idempotent), so a closed tab can't
+          // lose a paid admission fee.
+          createIntent({ reference: r.reference || reference, provider, provider_ref: r.provider_ref || r.reference || reference, application_id: a.id, category: 'admission', amount, currency, test_mode: paymentsTestMode(), ip: (req.headers['x-forwarded-for'] || (req.socket && req.socket.remoteAddress) || '') });
+          return J(res, 200, { ok: true, mode: provider, provider, authorization_url: r.url, reference: r.reference, test_mode: paymentsTestMode() });
         }
+        return J(res, 200, { ok: false, error: r.error || 'Could not start the online payment right now. Please try again later.' });
       }
-      return J(res, 200, { ok: true, mode: 'manual', amount, currency, bank: process.env.ADMISSION_BANK || 'Contact the Bursary for the bank account details, then declare your payment below.' });
+      return J(res, 200, { ok: true, mode: 'manual', amount, currency, providers: gateway ? gateway.providers() : [], bank: process.env.ADMISSION_BANK || 'Contact the Bursary for the bank account details, then declare your payment below.' });
     }
 
     if (p === '/api/apply/pay/declare' && method === 'POST') {
@@ -2229,21 +2467,28 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     }
 
     if (p === '/api/apply/pay/callback' && method === 'GET') {
-      const reference = u.searchParams.get('reference') || u.searchParams.get('trxref') || '';
+      const provider = pickProvider(u.searchParams.get('provider'));
+      const query = {}; u.searchParams.forEach((val, key) => { query[key] = val; });
+      const intent = intentByReference(query.reference);
+      const ref = resolveVerifyRef(provider, query, intent);
       let okPaid = false;
-      if (process.env.PAYSTACK_SECRET && reference) {
-        const v = await paystackReq('/transaction/verify/' + encodeURIComponent(reference), 'GET', null);
-        if (v && v.status && v.data && v.data.status === 'success') {
-          const appId = (v.data.metadata && v.data.metadata.application_id) || '';
-          const a = appId ? one('admission_applications', appId) : null;
-          if (a && typeof update === 'function') { update('admission_applications', a.id, { admission_fee_paid: 1, payment_ref: reference, status: a.status === 'admitted' ? 'admitted' : 'fee_paid' }); okPaid = true; }
-        }
+      if (provider && gateway && ref) {
+        const v = await gateway.verify(provider, ref);
+        if (v.ok) { const out = await settlePayment(provider, v, intent); okPaid = !!out.ok; }
       }
-      return H(res, 200, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:Segoe UI,Arial,sans-serif;background:#0b1220;color:#fff;text-align:center;padding:60px 20px"><div style="font-size:54px">${okPaid ? '✅' : '⚠️'}</div><h2>${okPaid ? 'Payment received' : 'Payment not confirmed'}</h2><p style="opacity:.8">${okPaid ? 'Your admission fee has been received. Your admission will be finalized shortly.' : 'We could not confirm your payment. If you were debited, contact the Bursary.'}</p><a href="/apply" style="display:inline-block;margin-top:18px;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Back to application</a></body>`);
+      return H(res, 200, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:Segoe UI,Arial,sans-serif;background:#0b1220;color:#fff;text-align:center;padding:60px 20px"><div style="font-size:54px">${okPaid ? '✅' : '⚠️'}</div><h2>${okPaid ? 'Payment received' : 'Payment not confirmed'}</h2><p style="opacity:.8">${okPaid ? 'Your admission fee has been received. Your admission will be finalized shortly.' : 'We could not confirm your payment yet. If you were debited, it will reflect automatically once the bank confirms — or contact the Bursary.'}</p><a href="/apply" style="display:inline-block;margin-top:18px;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Back to application</a></body>`);
     }
 
-    // ---- Student fee payment (Paystack) — pay an outstanding fee from inside the app/portal ----
-    // init → returns a Paystack authorization_url (when PAYSTACK_SECRET is set) or manual bank details.
+    // ---- Student fee payment (multi-provider: Paystack / Flutterwave / …) ----
+    // providers → which gateways this deployment has configured, so the app/portal offers the right choices.
+    if (p === '/api/pay/providers' && method === 'GET') {
+      const list = gateway ? gateway.providers() : [];
+      return J(res, 200, { ok: true, providers: list, enabled: list.length > 0, bank: process.env.FEES_BANK || inst().fees_bank || process.env.ADMISSION_BANK || '' });
+    }
+
+    // init → start a checkout with the chosen provider (the app/WebView opens the returned URL), or return
+    // manual bank details when no gateway is configured. The student picks WHICH fee (category) to pay and
+    // the amount is auto-debited from that fee — we re-derive what's owed and refuse an overpay.
     if (p === '/api/pay/init' && method === 'POST') {
       const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student to pay.' });
       const s = accountById('student', t.id); if (!s) return J(res, 401, { ok: false });
@@ -2251,53 +2496,69 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const amount = Math.round((Number(body.amount) || 0) * 100) / 100;
       const currency = String(body.currency || 'NGN').toUpperCase();
       const category = String(body.category || 'tuition').slice(0, 40);
+      const provider = pickProvider(body.provider);
       if (!(amount > 0)) return J(res, 200, { ok: false, error: 'Enter a valid amount to pay.' });
-      if (process.env.PAYSTACK_SECRET && s.email) {
-        const reference = 'STU-' + String(s.id).slice(0, 8) + '-' + Date.now();
-        const init = await paystackReq('/transaction/initialize', 'POST', {
-          email: s.email, amount: Math.round(amount * 100), currency, reference,
-          callback_url: `${buildBase(req)}/api/pay/callback`,
-          metadata: { student_id: s.id, category, currency },
+      if (provider && gateway && s.email) {
+        // auto-debit guard: never let an online payment exceed what the chosen fee still owes
+        const owed = outstandingFor(s, category, currency);
+        if (owed != null && amount > owed + 0.01) return J(res, 200, { ok: false, error: `You owe ${money(owed, currency)} for ${category}. Please enter ${money(owed, currency)} or less.` });
+        // velocity / anti-abuse: cap how many checkouts a student can START in a short window
+        if (recentIntentCount(s.id, 60) >= 12) return J(res, 200, { ok: false, error: 'Too many payment attempts in the last hour. Please wait a little, or contact the Bursary.' });
+        const reference = 'STU-' + provider.slice(0, 3).toUpperCase() + '-' + String(s.id).slice(0, 8) + '-' + Date.now();
+        const base = buildBase(req);
+        // our reference rides on the callback URL so the redirect can find the intent for ANY provider
+        const r = await gateway.init(provider, {
+          email: s.email, name: `${s.first_name || ''} ${s.last_name || ''}`.trim(), phone: s.phone || '',
+          amount, currency, reference,
+          callback_url: `${base}/api/pay/callback?provider=${provider}&reference=${encodeURIComponent(reference)}`,
+          webhook_url: `${base}/api/pay/webhook/${provider}`,
+          title: `${inst().name || 'School'} — ${category}`,
+          metadata: { student_id: s.id, category, currency, charge_id: body.charge_id || null, reference },
         });
-        if (init && init.status && init.data && init.data.authorization_url)
-          return J(res, 200, { ok: true, mode: 'paystack', authorization_url: init.data.authorization_url, reference: init.data.reference });
-        return J(res, 200, { ok: false, error: 'Could not start the online payment right now. Please try again later.' });
+        if (r.ok) {
+          createIntent({ reference: r.reference || reference, provider, provider_ref: r.provider_ref || r.reference || reference, student_id: s.id, category, amount, currency, test_mode: paymentsTestMode(), ip: (req.headers['x-forwarded-for'] || (req.socket && req.socket.remoteAddress) || '') });
+          return J(res, 200, { ok: true, mode: provider, provider, authorization_url: r.url, reference: r.reference, test_mode: paymentsTestMode() });
+        }
+        return J(res, 200, { ok: false, error: r.error || 'Could not start the online payment right now. Please try again later.' });
       }
-      return J(res, 200, { ok: true, mode: 'manual', amount, currency, bank: process.env.FEES_BANK || process.env.ADMISSION_BANK || 'Online card payment is not enabled. Contact the Bursary for the bank account to pay into.' });
+      return J(res, 200, { ok: true, mode: 'manual', amount, currency, bank: process.env.FEES_BANK || inst().fees_bank || process.env.ADMISSION_BANK || 'Online card payment is not enabled. Contact the Bursary for the bank account to pay into.' });
     }
 
-    // callback → Paystack redirects the WebView here after payment. We VERIFY server-side and record a
-    // COMPLETED payment for the student (idempotent on the Paystack reference) so it shows as a receipt
-    // and reduces the balance — reusing the normal ledger (raised_role='accountant' = bursary/online).
+    // callback → the provider redirects the WebView/browser here after payment. We VERIFY server-side (the
+    // ONLY source of truth) and settle (record the student payment + email a temporary receipt + alert the
+    // fee office), idempotently on the provider reference.
     if (p === '/api/pay/callback' && method === 'GET') {
-      const reference = u.searchParams.get('reference') || u.searchParams.get('trxref') || '';
+      const provider = pickProvider(u.searchParams.get('provider'));
+      const query = {}; u.searchParams.forEach((val, key) => { query[key] = val; });
+      const intent = intentByReference(query.reference);
+      const ref = resolveVerifyRef(provider, query, intent);
       let okPaid = false; let paidText = '';
-      if (process.env.PAYSTACK_SECRET && reference) {
-        const v = await paystackReq('/transaction/verify/' + encodeURIComponent(reference), 'GET', null);
-        if (v && v.status && v.data && v.data.status === 'success') {
-          const md = v.data.metadata || {};
-          const s = md.student_id ? one('students', md.student_id) : null;
-          const dup = all('payments').find(x => !x.deleted && String(x.decision_note || '') === 'paystack:' + reference);
-          if (dup) { okPaid = true; }
-          else if (s && typeof create === 'function') {
-            const now = new Date().toISOString();
-            const amt = (Number(v.data.amount) || 0) / 100;
-            const cur = String(v.data.currency || md.currency || 'NGN').toUpperCase();
-            const ym = now.slice(0, 7).replace('-', '');
-            create('payments', {
-              id: crypto.randomUUID(), receipt_no: 'ONL-' + ym + '-' + crypto.randomBytes(3).toString('hex').toUpperCase(),
-              student_id: s.id, charge_id: null, category: String(md.category || 'tuition'),
-              description: 'Online payment (Paystack)', currency: cur, amount: amt,
-              method: 'online', channel: 'card', status: 'completed',
-              raised_by: null, raised_role: 'accountant', decided_by: null, decided_at: now,
-              decision_note: 'paystack:' + reference, session_id: null, semester_id: null,
-              created_at: now, updated_at: now, deleted: 0, origin_node: 'portal',
-            });
-            okPaid = true; paidText = money(amt, cur);
-          }
+      if (provider && gateway && ref) {
+        const v = await gateway.verify(provider, ref);
+        if (v.ok) { const out = await settlePayment(provider, v, intent); if (out.ok) { okPaid = true; if (out.payment) paidText = money(out.payment.amount, out.payment.currency); } }
+      }
+      return H(res, 200, payResultPage(okPaid, paidText));
+    }
+
+    // webhook → the provider's server-to-server notification (the robust confirmation path: it fires even
+    // if the student closes the WebView before the redirect). We re-verify via the gateway API before
+    // settling, so a forged/replayed webhook can never create or duplicate a payment. Always ack 200.
+    if (p.startsWith('/api/pay/webhook/') && method === 'POST') {
+      const provider = pickProvider(p.slice('/api/pay/webhook/'.length));
+      let bodyObj = null; try { bodyObj = await readBody(); } catch (_) {}
+      if (provider && gateway) {
+        // SECURITY: the webhook body is only a TRIGGER. We pull the provider reference out of it and
+        // ALWAYS re-verify the transaction against the provider's API with our secret key before
+        // recording — so a forged/replayed webhook can neither create nor duplicate a payment. (Each
+        // provider also ships a webhook-signature check in payments-gateway.js for deployments that
+        // forward the raw body; the API re-verify here is the hard guarantee regardless.)
+        const ref = gateway.webhookRef(provider, bodyObj);
+        if (ref) {
+          const v = await gateway.verify(provider, ref);
+          if (v.ok) { const intent = intentByReference(v.reference); try { await settlePayment(provider, v, intent); } catch (_) {} }
         }
       }
-      return H(res, 200, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:Segoe UI,Arial,sans-serif;background:#0b1220;color:#fff;text-align:center;padding:60px 20px"><div style="font-size:54px">${okPaid ? '✅' : '⚠️'}</div><h2>${okPaid ? 'Payment received' : 'Payment not confirmed'}</h2><p style="opacity:.8">${okPaid ? ('Your payment' + (paidText ? ' of ' + esc(paidText) : '') + ' has been recorded. Your receipt is now in the app under Fees.') : 'We could not confirm your payment. If you were debited, contact the Bursary with your transaction reference.'}</p><p style="opacity:.6;font-size:13px">You can close this window and return to the app.</p></body>`);
+      return J(res, 200, { ok: true });
     }
 
     if (p === '/api/reset-password' && method === 'POST') {
@@ -2329,6 +2590,50 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const nm = `${s.first_name || ''} ${s.last_name || ''}`.trim();
       for (const role of ['registrar', 'admin', 'ict']) create('notifications', { id: crypto.randomUUID(), target_user: null, target_role: role, title: 'New transcript request 📜', body: `${nm} requested an official ${kind}.`, type: 'system', payload: JSON.stringify({ request_id: id }), is_read: 0, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
       return J(res, 200, { ok: true, request: { id, kind, status: 'pending', date: now } });
+    }
+
+    // ---- Graduation FINAL CLEARANCE (student request + live progress tracking + project upload) ----
+    // The portal reads the SYNCED clearance tables and computes the student's live owed so the desktop
+    // never has to be online for the student to track progress, pay (reuses /api/pay) and upload.
+    if (p === '/api/final-clearance' && method === 'GET') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student.' });
+      const s = accountById('student', t.id); if (!s) return J(res, 401, { ok: false });
+      return J(res, 200, { ok: true, clearance: finalClearanceView(s) });
+    }
+    if (p === '/api/final-clearance/request' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student.' });
+      const s = accountById('student', t.id); if (!s) return J(res, 401, { ok: false });
+      if (typeof create !== 'function') return J(res, 200, { ok: false, error: 'Final clearance is unavailable on this server.' });
+      if (s.status === 'alumni' || s.status === 'graduated') return J(res, 200, { ok: false, error: 'You have already graduated.' });
+      if (!finalEligible(s)) return J(res, 200, { ok: false, error: 'Final clearance is only open to students in 300 level and above.' });
+      const open = all('grad_clearances').find(c => !c.deleted && c.student_id === s.id && (c.status === 'requested' || c.status === 'active'));
+      if (open) return J(res, 200, { ok: false, error: open.status === 'requested' ? 'Your request is already awaiting the Bursary.' : 'Your final clearance is already in progress.' });
+      const id = crypto.randomUUID(); const now = new Date().toISOString();
+      create('grad_clearances', { id, student_id: s.id, status: 'requested', stage: 'request', requested_at: now, requested_via: 'portal', created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+      const nm = `${s.first_name || ''} ${s.last_name || ''}`.trim();
+      create('notifications', { id: crypto.randomUUID(), target_user: null, target_role: 'accountant', title: '🎓 Final-clearance request', body: `${nm} (${s.matric_no || 'matric pending'}) requested final clearance.`, type: 'clearance', payload: JSON.stringify({ student_id: s.id, clearance_id: id }), is_read: 0, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+      return J(res, 200, { ok: true, clearance: finalClearanceView(s) });
+    }
+    if (p === '/api/final-clearance/project' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student.' });
+      const s = accountById('student', t.id); if (!s) return J(res, 401, { ok: false });
+      if (typeof create !== 'function' || typeof update !== 'function') return J(res, 200, { ok: false, error: 'Uploads are unavailable on this server.' });
+      const clr = all('grad_clearances').find(c => !c.deleted && c.student_id === s.id && c.status === 'active');
+      if (!clr) return J(res, 200, { ok: false, error: 'You have no active final clearance.' });
+      const body = await readBody();
+      let file = String(body.file || ''); const m = /^data:([^;]+);base64,(.*)$/.exec(file);
+      const mime = body.mime || (m ? m[1] : 'application/octet-stream');
+      if (m) file = m[2];
+      if (!file) return J(res, 200, { ok: false, error: 'Attach your project document (PDF or Word).' });
+      if (file.length > 11 * 1024 * 1024) return J(res, 200, { ok: false, error: 'File too large (about 8 MB max).' });
+      if (!/pdf|word|officedocument|msword|octet-stream/i.test(mime) && !/\.(pdf|docx?)$/i.test(body.filename || '')) return J(res, 200, { ok: false, error: 'Upload a PDF, DOC or DOCX file.' });
+      // one current project per student
+      for (const old of all('portal_documents').filter(d => !d.deleted && d.student_id === s.id && d.auto_kind === 'project')) update('portal_documents', old.id, { deleted: 1 });
+      const id = crypto.randomUUID(); const now = new Date().toISOString();
+      create('portal_documents', { id, title: 'Final Year Project', category: 'Other', file, file_key: null, mime, filename: String(body.filename || 'project.pdf').slice(0, 120), faculty_id: s.faculty_id || null, department_id: s.department_id || null, level_id: s.level_id || null, student_id: s.id, auto_kind: 'project', uploaded_by: 'student', office: 'Student', session_id: null, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+      update('grad_clearances', clr.id, { project_doc_id: id });
+      create('notifications', { id: crypto.randomUUID(), target_user: null, target_role: 'registrar', title: 'Project submitted', body: `${(s.first_name || '') + ' ' + (s.last_name || '')} uploaded their final project.`, type: 'clearance', payload: JSON.stringify({ student_id: s.id }), is_read: 0, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+      return J(res, 200, { ok: true, clearance: finalClearanceView(s) });
     }
 
     // A student appeals a malpractice flag ("the AI got the wrong person / it wasn't me"). Creates an
@@ -2935,7 +3240,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     return false;
   }
 
-  return { handle };
+  return { handle, reconcile: reconcileIntents };
 };
 
 // ----------------------- single-page portal client -----------------------
@@ -2946,7 +3251,7 @@ const PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta n
 :root{--navy:#0f1e3d;--brand:#2563eb;--brand-rgb:37,99,235;--ink:#0f172a;--muted:#64748b;--line:#e6eaf0;--bg:#eef2f8}
 *{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',system-ui,Arial,sans-serif;background:var(--bg);color:var(--ink)}
 a{color:var(--brand)}
-.login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:radial-gradient(1200px 600px at 20% -10%,#1e3a8a22,transparent),var(--bg)}
+.login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:radial-gradient(1200px 600px at 20% -10%,rgba(var(--brand-rgb,30,58,138),.13),transparent),var(--login-bg-img,linear-gradient(transparent,transparent)) center/cover no-repeat,var(--bg)}
 .card{background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:0 20px 60px rgba(15,23,42,.12)}
 .lbox{width:380px;max-width:94vw;padding:30px}
 .lbox h1{margin:0 0 2px;font-size:22px;color:var(--navy)}.lbox .sub{color:var(--muted);font-size:13px;margin-bottom:18px}
@@ -3212,6 +3517,111 @@ async function reqTranscript(kind){
     if(r&&r.ok){alert('Request submitted. The Registry will process it, email you a signed copy and place it here for download.');renderApp();}
     else{alert((r&&r.error)||'Could not submit the request.');}}catch(e){alert('Could not submit the request right now.');}
 }
+// Pay an outstanding fee online: pick a gateway + amount, then hand off to the provider's secure checkout.
+// On return the /api/pay/callback verifies the payment server-side, issues the receipt and emails it.
+async function payFee(catEnc,currency,outstanding){
+  var category=decodeURIComponent(catEnc);
+  var pr;try{pr=await api('/api/pay/providers');}catch(e){pr={ok:false};}
+  var providers=(pr&&pr.providers)||[];
+  var ov=document.createElement('div');
+  ov.style.cssText='position:fixed;inset:0;z-index:9500;background:rgba(2,6,23,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+  var provHtml=providers.length?providers.map(function(p,i){return '<label style="display:flex;align-items:center;gap:10px;padding:11px 12px;border:1px solid #e2e8f0;border-radius:10px;margin-bottom:8px;cursor:pointer"><input type="radio" name="payprov" value="'+eh(p.id)+'"'+(i===0?' checked':'')+'><span style="font-weight:600">'+eh(p.label)+'</span></label>';}).join(''):'<div class="muted" style="font-size:13px">Online card payment is not enabled here yet. Continue to see the bank account to pay into.</div>';
+  ov.innerHTML='<div style="background:#fff;border-radius:16px;max-width:430px;width:100%;padding:20px;box-shadow:0 24px 60px rgba(2,6,23,.4)">'
+    +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><h3 style="margin:0">💳 Pay '+eh(cap(category))+'</h3><span id="payX" style="cursor:pointer;font-size:22px;color:#64748b">×</span></div>'
+    +'<div class="muted" style="font-size:13px;margin-bottom:12px">Outstanding: <b>'+money(outstanding,currency)+'</b></div>'
+    +'<label style="font-size:12px;color:#64748b">Amount to pay ('+eh(currency)+')</label>'
+    +'<input id="payAmt" type="number" min="1" step="0.01" max="'+Number(outstanding)+'" value="'+Number(outstanding)+'" style="width:100%;border:1px solid #cbd5e1;border-radius:10px;padding:10px;margin:4px 0 14px;font-size:15px;box-sizing:border-box">'
+    +(providers.length?'<div style="font-size:12px;color:#64748b;margin-bottom:6px">Choose a payment method</div>':'')+provHtml
+    +'<div id="payErr" style="color:#b91c1c;font-size:13px;margin-top:6px"></div>'
+    +'<button id="payGo" class="btn full" style="margin-top:12px">Pay now</button>'
+    +'<div id="payManual" style="margin-top:10px"></div>'
+    +'<div class="muted" style="font-size:11px;margin-top:10px;text-align:center">🔒 Payments are processed securely by the gateway. We never see your card details.</div></div>';
+  document.body.appendChild(ov);
+  function close(){try{document.body.removeChild(ov);}catch(_){}}
+  ov.querySelector('#payX').onclick=close;
+  ov.addEventListener('click',function(e){if(e.target===ov)close();});
+  ov.querySelector('#payGo').onclick=async function(){
+    var amt=parseFloat(ov.querySelector('#payAmt').value||'0');
+    var sel=ov.querySelector('input[name=payprov]:checked');
+    var provider=sel?sel.value:'';
+    var ee=ov.querySelector('#payErr');ee.textContent='';
+    if(!(amt>0)){ee.textContent='Enter a valid amount to pay.';return;}
+    if(amt>Number(outstanding)+0.01){ee.textContent='You cannot pay more than the outstanding amount.';return;}
+    var go=ov.querySelector('#payGo');go.disabled=true;go.textContent='Starting secure checkout…';
+    var r;try{r=await api('/api/pay/init',{method:'POST',body:JSON.stringify({provider:provider,category:category,currency:currency,amount:amt})});}catch(e){r={ok:false,error:'Network error.'};}
+    go.disabled=false;go.textContent='Pay now';
+    if(!r||!r.ok){ee.textContent=(r&&r.error)||'Could not start the payment.';return;}
+    if(r.authorization_url){location.href=r.authorization_url;return;}
+    ov.querySelector('#payManual').innerHTML='<div class="ok" style="text-align:left;font-size:13px">Pay by bank transfer:<br><b>'+eh(r.bank||'Contact the Bursary for the bank details.')+'</b><br><span class="muted">Your receipt is issued once the Bursary confirms your transfer.</span></div>';
+    go.style.display='none';
+  };
+}
+// ---- Final Clearance (Graduation) — lazy-loaded tab ----
+async function loadFinalClearance(){
+  var box=document.getElementById('fcBody'); if(!box)return; if(box.getAttribute('data-busy'))return; box.setAttribute('data-busy','1');
+  var r; try{ r=await api('/api/final-clearance'); }catch(e){ r=null; }
+  box.removeAttribute('data-busy');
+  if(!r||!r.ok||!r.clearance){ box.innerHTML='<div class="empty">Final clearance is unavailable right now.</div>'; return; }
+  box.innerHTML=renderFinalClearance(r.clearance);
+}
+function fcStageIcon(done,current){return done?'✓':(current?'➤':'○');}
+function renderFinalClearance(c){
+  if(!c.exists){
+    if(!c.eligible) return '<div class="panel"><div class="muted">Final clearance is for graduating students in <b>300 level and above</b>. You are not eligible yet.</div></div>';
+    return '<div class="panel"><h3>Ready to graduate?</h3><div class="muted" style="margin-bottom:10px">Request your final clearance to begin the graduation process. You can pay any office online and track every step right here.</div><button class="btn full" onclick="fcRequest()">🎓 Request final clearance</button><div class="err" id="fcErr" style="color:#b91c1c;font-size:13px;margin-top:6px"></div></div>';
+  }
+  if(c.status==='requested') return '<div class="panel"><div class="ok">✅ Your request has been sent to the Bursary. You will be notified when it is accepted so you can begin. Check back here to track your progress.</div></div>';
+  if(c.status==='denied') return '<div class="panel"><div class="exbar bad">Your final-clearance request was not approved.'+(c.deny_reason?(' Reason: '+eh(c.deny_reason)):'')+'</div><button class="btn" style="margin-top:10px" onclick="fcRequest()">Request again</button><div class="err" id="fcErr" style="color:#b91c1c;font-size:13px;margin-top:6px"></div></div>';
+  var head=c.status==='completed'?'<div class="exbar ok">🎓 Congratulations — your final clearance is complete. You are now an alumnus/alumna.</div>':('<div class="exbar warn">In progress — current step: <b>'+eh(c.stage_label)+'</b></div>');
+  var stagesHtml=(c.stages||[]).map(function(st){
+    var items=(st.items||[]).map(function(it){return fcItemHtml(it);}).join('');
+    return '<div class="panel" style="'+(st.current?'border:2px solid var(--brand)':'')+'"><h3 style="margin-top:0">'+fcStageIcon(st.done,st.current)+' '+eh(st.label)+(st.done?' <span class="pos" style="font-size:12px">cleared</span>':(st.current?' <span class="badge" style="background:#fef3c7;color:#92400e">current</span>':''))+'</h3>'+(items||'<div class="muted" style="font-size:12px">No actions needed here.</div>')+'</div>';
+  }).join('');
+  var docs=c.documents||{}; var dl=[];
+  function dlink(d,label){ if(d) dl.push('<button class="btn sm" onclick="doc(\\'/doc/portal-document/'+d.id+'\\')">⬇️ '+label+'</button>'); }
+  dlink(docs.project,'My project'); dlink(docs.transcript,'Transcript (Student Copy)'); dlink(docs.certificate,'Certificate (Student Copy)'); dlink(docs.scanned_transcript,'Official transcript'); dlink(docs.scanned_certificate,'Official certificate');
+  var docsHtml=dl.length?('<div class="panel"><h3 style="margin-top:0">My Documents</h3><div class="muted" style="font-size:11px;margin-bottom:6px">Copies on your portal are marked “Student Copy”.</div><div class="qa">'+dl.join('')+'</div></div>'):'';
+  return head+stagesHtml+docsHtml;
+}
+function fcItemHtml(it){
+  var st=it.status;
+  var badge=st==='cleared'?'<span class="pos" style="font-weight:800">✓ Cleared</span>':st==='owing'?'<span class="neg" style="font-weight:800">Owing</span>':st==='reviewing'?'<span class="badge" style="background:#dbeafe;color:#1e40af">Under review</span>':st==='failed'?'<span class="neg">Not approved</span>':'<span class="muted">Pending</span>';
+  var line='<div style="padding:7px 0;border-top:1px solid #f1f5f9"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><div style="flex:1;min-width:140px"><b style="font-size:13.5px">'+eh(it.name)+'</b><div class="muted" style="font-size:11px">'+eh(it.oversee_label)+'</div></div>'+badge+'</div>';
+  if(st==='owing'&&it.owed&&Object.keys(it.owed).length){
+    var cur=Object.keys(it.owed)[0]; var amt=it.owed[cur];
+    line+='<div style="font-size:12px;margin-top:4px" class="neg">You owe '+money(amt,cur)+' for this.</div>';
+    if(it.online_pay&&it.pay_category) line+='<button class="btn sm" style="margin-top:4px" onclick="payFee(\\''+encodeURIComponent(it.pay_category)+'\\',\\''+eh(cur)+'\\','+Number(amt)+')">💳 Pay '+money(amt,cur)+' online</button>';
+  }
+  if(it.detail){
+    var dd=[];
+    if(it.detail.carryovers&&it.detail.carryovers.length) dd.push('Carry-overs: '+it.detail.carryovers.map(function(x){return eh(x.code||'');}).join(', '));
+    if(it.detail.malpractices&&it.detail.malpractices.length) dd.push(it.detail.malpractices.length+' malpractice flag(s)');
+    if(it.detail.suspensions&&it.detail.suspensions.length) dd.push('Suspension on record');
+    if(dd.length) line+='<div style="font-size:11px;margin-top:4px" class="neg">⚠ '+dd.join(' · ')+' — awaiting the Dean/Registrar.</div>';
+  }
+  if(it.type==='project_upload'&&st!=='cleared'){
+    line+='<label class="btn sm" style="cursor:pointer;margin-top:4px">📎 Upload my project (PDF/Word)<input type="file" accept=".pdf,.doc,.docx" style="display:none" onchange="fcUploadProject(this)"></label>';
+  }
+  line+='</div>';
+  return line;
+}
+async function fcRequest(){
+  var e=document.getElementById('fcErr'); if(e)e.textContent='';
+  var r; try{ r=await api('/api/final-clearance/request',{method:'POST',body:'{}'}); }catch(_){ r={ok:false,error:'Network error.'}; }
+  if(!r||!r.ok){ if(e)e.textContent=(r&&r.error)||'Could not request.'; else alert((r&&r.error)||'Could not request.'); return; }
+  loadFinalClearance();
+}
+async function fcUploadProject(input){
+  var f=input.files&&input.files[0]; if(!f)return;
+  if(f.size>8*1024*1024){ alert('That file is larger than 8MB.'); return; }
+  var rd=new FileReader();
+  rd.onload=async function(){
+    var r; try{ r=await api('/api/final-clearance/project',{method:'POST',body:JSON.stringify({filename:f.name,file:rd.result,mime:f.type})}); }catch(_){ r={ok:false,error:'Upload failed.'}; }
+    if(!r||!r.ok){ alert((r&&r.error)||'Upload failed.'); return; }
+    loadFinalClearance();
+  };
+  rd.readAsDataURL(f);
+}
 let CHAT_MOUNTED=false;
 function mountChat(){
   if(CHAT_MOUNTED)return;CHAT_MOUNTED=true;
@@ -3274,7 +3684,7 @@ function studentView(w,d){
   var unread=notifs.filter(function(n){return String(n.date||'')>lastSeen;}).length;
   window.__seenKey=seenKey; window.__notifMax=(notifs[0]&&notifs[0].date)||'';
   var exNow=(d.exams||[]).filter(function(e){return e.window!=='closed' && e.status!=='ended' && (!e.attempt || e.attempt.status==='in_progress');}).length;
-  var segs=[['overview','🏠','Overview',0],['notifications','🔔','Updates',unread],['fees','💳','Fees & Payments',owingCount],['receipts','🧾','Receipts',0],['timetable','🗓','Timetable',ttCount],['liveclasses','🎥','Live Classes',liveCount],['exams','📝','Exams',exNow],['library','📚','Library',0],['results','📑','Results',0],['clearance','✅','Clearance',0],['documents','📂','Documents',0]];
+  var segs=[['overview','🏠','Overview',0],['notifications','🔔','Updates',unread],['fees','💳','Fees & Payments',owingCount],['receipts','🧾','Receipts',0],['timetable','🗓','Timetable',ttCount],['liveclasses','🎥','Live Classes',liveCount],['exams','📝','Exams',exNow],['library','📚','Library',0],['results','📑','Results',0],['clearance','✅','Clearance',0],['finalclr','🎓','Graduation',0],['documents','📂','Documents',0]];
   if(d.misconduct&&d.misconduct.length)segs.push(['discipline','⚖️','Discipline',d.misconduct.length]);
   if((sv.flags&&sv.flags.length)||(sv.attendance&&sv.attendance.length))segs.push(['surveillance','🛡','Exam Conduct',openFlags]);
   if(d.surveys&&d.surveys.length)segs.push(['evaluation','⭐','Evaluation',d.surveys.length]);
@@ -3322,7 +3732,7 @@ function studentView(w,d){
   // FEES
   html+=seg('fees',
     '<h2 class="sectitle">💳 Fees &amp; Payments</h2>'
-    +'<div class="panel"><h3>Outstanding Fees</h3>'+tbl([{t:'Fee Category',f:function(r){return cap(r.category);}},{t:'Currency',f:function(r){return r.currency;}},{t:'Billed',r:1,f:function(r){return money(r.billed,r.currency);}},{t:'Paid',r:1,f:function(r){return money(r.paid,r.currency);}},{t:'Outstanding',r:1,f:function(r){return '<span class=neg>'+money(r.outstanding,r.currency)+'</span>';}}],d.outstanding,'You owe nothing. 🎉')+'</div>'
+    +'<div class="panel"><h3>Outstanding Fees</h3><div class="muted" style="font-size:12px;margin-bottom:8px">Tap <b>Pay online</b> on any fee to pay securely by card, bank or USSD — your receipt is issued instantly and emailed to you.</div>'+tbl([{t:'Fee Category',f:function(r){return cap(r.category);}},{t:'Currency',f:function(r){return r.currency;}},{t:'Billed',r:1,f:function(r){return money(r.billed,r.currency);}},{t:'Paid',r:1,f:function(r){return money(r.paid,r.currency);}},{t:'Outstanding',r:1,f:function(r){return '<span class=neg>'+money(r.outstanding,r.currency)+'</span>';}},{t:'',r:1,f:function(r){return Number(r.outstanding)>0?'<button class="btn sm" onclick="payFee(\\''+encodeURIComponent(r.category)+'\\',\\''+eh(r.currency)+'\\','+Number(r.outstanding)+')">💳 Pay online</button>':'<span class="muted">Paid</span>';}}],d.outstanding,'You owe nothing. 🎉')+'</div>'
     +'<div class="panel"><h3>All Fees &amp; Charges</h3>'+tbl([{t:'Date',f:function(r){return fmt(r.date);}},{t:'Description',f:function(r){return (eh(r.description)||cap(r.category))+' '+(r.rollover?'<span class="badge" style="background:#fef3c7;color:#92400e">Rollover'+(r.rolled_from?' · '+eh(r.rolled_from):'')+'</span>':'<span class="badge" style="background:#dbeafe;color:#1e40af">Current</span>');}},{t:'Category',f:function(r){return cap(r.category);}},{t:'Set By',f:function(r){return eh(r.by||'—');}},{t:'Amount',r:1,f:function(r){return money(r.amount,r.currency);}}],d.charges,'No charges yet.')+'</div>'
     +((d.invoices&&d.invoices.length)?('<div class="panel"><h3>Fee Invoices</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Download the invoice PDF from your <b>Documents</b> tab.</div>'+tbl([{t:'Invoice',f:function(r){return eh(r.invoice_no);}},{t:'Amount',r:1,f:function(r){return money(r.amount,r.currency);}},{t:'Due',f:function(r){return eh(r.due_date||'—');}},{t:'Status',f:function(r){return '<span class="badge">'+cap(r.status)+'</span>';}}],d.invoices,'No invoices.')+'</div>'):''));
   // RECEIPTS
@@ -3469,6 +3879,11 @@ function studentView(w,d){
     +'<div class="exbar '+clrCls+'">'+clrTxt+'</div>'
     +(((clr.certs&&clr.certs.length))?('<div class="qa">'+clr.certs.map(function(ct){return '<button class="btn sm" onclick="doc(\\'/doc/clearance/'+ct.id+'\\')">📄 Download my '+eh(ct.typeName)+' clearance certificate</button>';}).join('')+'</div>'):'')
     +'<div class="panel"><h3>Exam Validation History</h3>'+tbl([{t:'Date',f:function(r){return fmt(r.date);}},{t:'Type',f:function(r){return cap(r.exam_type||'exam');}},{t:'Session',f:function(r){return eh(r.session||'—')+(r.semester?(' · '+eh(r.semester)):'');}},{t:'Result',f:function(r){return '<span class="'+(r.status==='valid'?'pos':'neg')+'" style="font-weight:800">'+(r.status==='valid'?'CLEARED':'DENIED')+'</span>';}},{t:'Reason',f:function(r){return eh(r.reason||'—');}}],d.validations,'No exam validations yet.')+'</div>');
+  // FINAL CLEARANCE (Graduation) — lazy-loaded from /api/final-clearance when the tab opens
+  html+=seg('finalclr',
+    '<h2 class="sectitle">🎓 Final Clearance (Graduation)</h2>'
+    +'<div class="muted" style="font-size:12.5px;margin-bottom:10px">Your end-to-end graduation clearance — financial clearance, academic checks, project defence, transcript &amp; certificate, and collection of your physical documents. Pay any office online and track every step here.</div>'
+    +'<div id="fcBody"><div class="empty">Loading…</div></div>');
   // DOCUMENTS
   var trqRows=(d.transcriptRequests||[]);
   var trqBadge=function(s){var c=s==='dispatched'?'pos':(s==='rejected'?'neg':'');return '<span class="'+c+'" style="font-weight:800">'+cap(s||'pending')+'</span>';};
@@ -3526,6 +3941,7 @@ function studentView(w,d){
     Array.prototype.forEach.call(content.querySelectorAll('.seg'),function(el){el.classList.toggle('on',el.getAttribute('data-seg')===s);});
     Array.prototype.forEach.call(navEl.querySelectorAll('a'),function(a){a.classList.toggle('active',a.getAttribute('data-seg')===s);});
     window.__seg=s;
+    if(s==='finalclr'){ try{ loadFinalClearance(); }catch(_){} }
     // opening Updates marks everything seen → clears the unread pill
     if(s==='notifications'){ try{ if(window.__notifMax) localStorage.setItem(window.__seenKey, window.__notifMax); }catch(_){}
       var nb=navEl.querySelector('a[data-seg="notifications"] .pill'); if(nb)nb.remove(); }
@@ -3659,7 +4075,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catc
 (function(){
   function boot(){ if(TOKEN){renderApp().catch(()=>renderLogin());}else{renderLogin();} }
   // colour the portal to the institution's brand (overrides the --brand CSS variable the UI is built on)
-  function applyTheme(b){ try{ var hx=/^#([0-9a-fA-F]{6})$/; var r=document.documentElement.style; var p=(b&&String(b.primary||'').trim())||''; if(hx.test(p)){r.setProperty('--brand',p);r.setProperty('--brand-rgb',[parseInt(p.slice(1,3),16),parseInt(p.slice(3,5),16),parseInt(p.slice(5,7),16)].join(','));} if(b&&hx.test(String(b.accent||'').trim()))r.setProperty('--navy',b.accent.trim()); if(b&&b.favicon){var fl=document.querySelector('link[rel=icon]');if(fl)fl.href=b.favicon;} }catch(_){} }
+  function applyTheme(b){ try{ var hx=/^#([0-9a-fA-F]{6})$/; var r=document.documentElement.style; var p=(b&&String(b.primary||'').trim())||''; if(hx.test(p)){r.setProperty('--brand',p);r.setProperty('--brand-rgb',[parseInt(p.slice(1,3),16),parseInt(p.slice(3,5),16),parseInt(p.slice(5,7),16)].join(','));} if(b&&hx.test(String(b.accent||'').trim()))r.setProperty('--navy',b.accent.trim()); if(b&&b.login_bg)r.setProperty('--login-bg-img','url("'+String(b.login_bg).replace(/["\\)]/g,'')+'")'); if(b&&b.favicon){var fl=document.querySelector('link[rel=icon]');if(fl)fl.href=b.favicon;} }catch(_){} }
   // fetch branding ONCE up front → apply theme + i18n (device language choice always wins), then boot.
   try{
     fetch('/api/branding').then(function(r){return r.json();}).then(function(b){
@@ -3922,11 +4338,26 @@ function renderStatus(){
   el('statusBody').innerHTML='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><h2 style="margin:0">'+esc((d.first_name||'')+' '+(d.last_name||''))+'</h2>'+statusPill(st)+'</div><div class="muted">Application '+esc(d.app_no||'')+' • '+esc(d.department_name||'')+'</div>'+tl+'</div>'+pay+'<div class="btnrow"><button class="btn gho" onclick="logoutApp()">Sign out</button></div>';
 }
 async function pay(){
-  err('payErr','');var pb=el('payBtn');if(pb)pb.disabled=true;
-  var r=await api('/api/apply/pay',{method:'POST',body:JSON.stringify({})});
+  err('payErr','');
+  var pr;try{pr=await api('/api/pay/providers');}catch(e){pr=null;}
+  var providers=(pr&&pr.providers)||[];
+  if(providers.length>1){
+    // more than one gateway configured → let the applicant choose which platform to pay with
+    el('payArea').innerHTML='<div style="font-size:13px;color:#64748b;margin-bottom:6px">Choose a payment method</div>'
+      +providers.map(function(p,i){return '<label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid #e2e8f0;border-radius:10px;margin-bottom:8px;cursor:pointer"><input type="radio" name="apayprov" value="'+esc(p.id)+'"'+(i===0?' checked':'')+'><span style="font-weight:600">'+esc(p.label)+'</span></label>';}).join('')
+      +'<button class="btn full" id="payBtn2" onclick="payGo()">Continue to payment</button>';
+    return;
+  }
+  await payGo();
+}
+async function payGo(){
+  err('payErr','');var pb=el('payBtn2')||el('payBtn');if(pb)pb.disabled=true;
+  var sel=document.querySelector('input[name=apayprov]:checked');
+  var provider=sel?sel.value:'';
+  var r=await api('/api/apply/pay',{method:'POST',body:JSON.stringify({provider:provider})});
   if(pb)pb.disabled=false;
   if(!r.ok){err('payErr',r.error||'Could not start payment.');return;}
-  if(r.mode==='paystack'&&r.authorization_url){location.href=r.authorization_url;return;}
+  if(r.authorization_url){location.href=r.authorization_url;return;}
   el('payArea').innerHTML='<div class="ok" style="text-align:left">Pay the admission fee by bank transfer:<br><b>'+esc(r.bank)+'</b></div><label>Payment reference / teller number</label><input id="payRef" placeholder="Enter your transfer reference"><button class="btn full" style="margin-top:8px" onclick="declarePay()">I have paid — notify the Bursary</button>';
 }
 async function declarePay(){var ref=(el('payRef')&&el('payRef').value.trim())||'';var r=await api('/api/apply/pay/declare',{method:'POST',body:JSON.stringify({ref:ref})});if(r&&r.ok){APP=r.application;el('payArea').innerHTML='<div class="ok">Thank you. Your payment has been recorded and will be confirmed by the Bursary. You will be admitted once confirmed.</div>';}}

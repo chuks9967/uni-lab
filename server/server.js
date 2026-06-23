@@ -296,6 +296,8 @@ if (createPortal) {
       frameStore: EXAM_RELAY ? examRelayStore() : null,
       // resolve offloaded book/document bytes from object storage (env creds) — see server/blobstore.js
       blobFetch: (key) => require('./blobstore').getBuffer(key),
+      // multi-provider online-payment gateway (Paystack/Flutterwave; env-keyed) — server/payments-gateway.js
+      paymentGateway: (() => { try { return require('./payments-gateway'); } catch (_) { return null; } })(),
       // portal writes (e.g. password reset) update the store and bump updated_at so the
       // change syncs back to the desktop app on the next /sync/pull
       update: (entity, id, patch) => {
@@ -580,6 +582,13 @@ server.on('error', (e) => {
   console.error('Server error:', e.message); process.exit(1);
 });
 server.listen(PORT, () => console.log(`UniBursar hub [build ${BUILD}] listening on http://0.0.0.0:${PORT}  portal=${!!portal}  cloud=${supaEnabled()}  (data: ${STORE})`));
+
+// Reconcile online-payment intents every ~3 minutes: re-verify any checkout that never came back
+// (student closed the tab / a webhook was missed) and record the ones that actually paid — so the
+// system "knows" about a real online transaction even without a successful redirect/webhook.
+if (portal && typeof portal.reconcile === 'function') {
+  setInterval(() => { try { portal.reconcile().catch(() => {}); } catch (_) {} }, 180000);
+}
 
 // When backed by Supabase, load the full dataset on boot and then poll for deltas every ~5s
 // so the portal reflects changes the desktop wrote DIRECTLY to the cloud (cloud-sync mode).
