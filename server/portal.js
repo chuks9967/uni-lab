@@ -468,6 +468,16 @@ module.exports = function createPortal(deps) {
       add('surveillance', '🛡️', 'Exam conduct notice', (MALPRACTICE_LABELS[f.type] || 'A conduct alert was recorded') + ' — tap to see the evidence and appeal if it was a mistake', f.occurred_at || f.created_at, 'surveillance', null);
     for (const e of all('online_exams').filter(e => examVisibleTo(e, s)))
       add('exam', '📝', 'Online exam: ' + (e.title || e.course_code || 'Exam'), (e.start_at ? 'Scheduled ' + fmtDate(e.start_at) : 'Open now') + ' — tap to open it in the Exams tab', e.published_at || e.created_at, 'exam', null);
+    // Graduation FINAL CLEARANCE — request, every completed step, and the outcome (also pushed to the device).
+    const fcl = all('grad_clearances').filter(c => !c.deleted && c.student_id === s.id).sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))[0];
+    if (fcl) {
+      add('finalclr', '🎓', 'Final clearance requested', 'Your final-clearance request was sent to the Bursary.', fcl.requested_at, 'finalclr', null);
+      if (fcl.status === 'denied') add('finalclr', '🎓', 'Final-clearance request declined', fcl.deny_reason || 'Your request was not approved at this time.', fcl.decided_at, 'finalclr', null);
+      else if (fcl.status !== 'requested') add('finalclr', '🎓', 'Final clearance started', 'Your request was accepted — begin with financial clearance.', fcl.decided_at, 'finalclr', null);
+      for (const it of all('grad_clearance_items').filter(i => !i.deleted && i.clearance_id === fcl.id && i.status === 'cleared' && i.cleared_at))
+        out.push({ id: 'finalclr-item:' + it.id, type: 'finalclr', icon: '✅', title: (it.name || 'A requirement') + ' cleared', text: 'One more step done on your final clearance — tap to see your progress.', date: it.cleared_at, seg: 'finalclr', doc: null });
+      if (fcl.status === 'completed') add('finalclr', '🎓', 'Final clearance complete', 'Congratulations — you are now an alumnus/alumna. Download your documents from the Graduation tab.', fcl.completed_at, 'finalclr', null);
+    }
     out.sort((a, b) => String(b.date).localeCompare(String(a.date)));
     return out.slice(0, 80);
   }
@@ -1173,6 +1183,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       currentSemester: i.semester || '',
       balances: balancesFor(s.id),
       examClearance: clr,
+      finalClearance: finalClearanceView(s),
       validations,
       results: all('results').filter(r => r.student_id === s.id).map(r => ({ id: r.id, title: r.title, level: nameOf('levels', r.level_id), semester: nameOf('semesters', r.semester_id), session: nameOf('academic_sessions', r.session_id), gpa: r.gpa, remark: r.remark, mime: r.mime, date: r.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       scores: scoresFor(s.id),
@@ -2143,8 +2154,21 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       return { key: st, label: FC_STAGE_LABEL[st], items: its, current: clr.stage === st && clr.status === 'active', done: (its.length && its.every(x => x.status === 'cleared')) || reached };
     });
     const docByKind = (k) => { const d = all('portal_documents').find(x => !x.deleted && x.student_id === s.id && x.auto_kind === k); return d ? { id: d.id, title: d.title, filename: d.filename } : null; };
+    // a single 0–100 figure the portal/APK render as a progress bar (mirrors finalclearance.progressOf)
+    const fcProgress = () => {
+      const total = FC_STAGES.length;
+      if (clr.status === 'completed') return { percent: 100, stageIndex: total, totalStages: total, label: 'Completed' };
+      if (clr.status === 'denied') return { percent: 0, stageIndex: 0, totalStages: total, label: 'Declined' };
+      if (clr.status === 'requested') return { percent: 0, stageIndex: 0, totalStages: total, label: 'Awaiting approval' };
+      const idx = Math.max(0, FC_STAGES.indexOf(clr.stage));
+      const cur = stages.find(st => st.key === clr.stage); const items = (cur && cur.items) || [];
+      const cleared = items.filter(i => i.status === 'cleared').length;
+      const within = items.length ? cleared / items.length : 0; const per = 100 / total;
+      return { percent: Math.max(1, Math.min(99, Math.round(idx * per + within * per))), stageIndex: idx, totalStages: total, label: FC_STAGE_LABEL[clr.stage] || clr.stage, cleared, total: items.length };
+    };
     return {
       exists: true, eligible, id: clr.id, status: clr.status, stage: clr.stage, stage_label: FC_STAGE_LABEL[clr.stage] || clr.stage,
+      progress: fcProgress(),
       deny_reason: clr.deny_reason, cgpa: clr.cgpa, classification: clr.classification, stages,
       documents: { project: docByKind('project'), transcript: docByKind('transcript'), certificate: docByKind('certificate'), scanned_transcript: docByKind('scanned_transcript'), scanned_certificate: docByKind('scanned_certificate') },
     };
@@ -3328,6 +3352,22 @@ select{padding:9px 10px;border:1px solid var(--line);border-radius:9px;font-size
 .exbar.ok{background:#dcfce7;color:#166534;border:1px solid #86efac}
 .exbar.warn{background:#fef9c3;color:#854d0e;border:1px solid #fde68a}
 .exbar.bad{background:#fee2e2;color:#991b1b;border:1px solid #fca5a5}
+/* ---- final-clearance progress bar + stepper ---- */
+.fcprog{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px 18px;margin-bottom:16px;box-shadow:0 4px 16px rgba(15,23,42,.06)}
+.fcprog .top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px}
+.fcprog .pct{font-size:30px;font-weight:900;background:linear-gradient(135deg,#2563eb,#4338ca);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;line-height:1}
+.fcprog .lbl{font-size:12.5px;color:var(--muted);font-weight:700;text-align:right}
+.fcbar{height:12px;border-radius:999px;background:#eef2f8;overflow:hidden;position:relative}
+.fcbar>span{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#2563eb,#4338ca,#7c3aed);background-size:200% 100%;transition:width .9s cubic-bezier(.22,1,.36,1);animation:fcsheen 2.4s linear infinite}
+.fcprog.done .fcbar>span{background:linear-gradient(90deg,#059669,#10b981)}
+@keyframes fcsheen{0%{background-position:0 0}100%{background-position:200% 0}}
+.fcsteps{display:flex;gap:4px;margin-top:14px}
+.fcstep{flex:1;text-align:center;font-size:10px;color:var(--muted);position:relative}
+.fcstep .dot{width:26px;height:26px;border-radius:50%;margin:0 auto 5px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;background:#eef2f8;color:#94a3b8;border:2px solid #e2e8f0;transition:.3s}
+.fcstep.done .dot{background:#10b981;color:#fff;border-color:#10b981}
+.fcstep.current .dot{background:#2563eb;color:#fff;border-color:#2563eb;box-shadow:0 0 0 4px rgba(37,99,235,.18)}
+.fcstep.current{color:#2563eb;font-weight:800}
+.fcstep.done{color:#059669;font-weight:700}
 /* ---- segmented student portal ---- */
 /* single column: photo + info at the TOP, section tabs beneath, content below — the
    WHOLE page scrolls as one (no separate scrolling side panel). */
@@ -3637,14 +3677,30 @@ async function loadFinalClearance(){
   box.innerHTML=renderFinalClearance(r.clearance);
 }
 function fcStageIcon(done,current){return done?'✓':(current?'➤':'○');}
+function fcProgressBar(c){
+  var prog=c.progress||{percent:0,label:c.stage_label||''};
+  var pct=Math.max(0,Math.min(100,prog.percent||0));
+  var done=c.status==='completed';
+  var SHORT={financial:'Fees',academic:'Academic',project:'Project',results:'Results',physical:'Documents'};
+  var steps=(c.stages||[]).map(function(st){
+    var cls=st.done?'done':(st.current?'current':'');
+    var icon=st.done?'✓':(st.current?'●':'○');
+    return '<div class="fcstep '+cls+'"><div class="dot">'+icon+'</div>'+eh(SHORT[st.key]||st.label||'')+'</div>';
+  }).join('');
+  var right=done?'Final clearance complete':('Current step<br><b style="color:#1e293b">'+eh(prog.label||c.stage_label||'')+'</b>');
+  return '<div class="fcprog'+(done?' done':'')+'">'
+    +'<div class="top"><div class="pct">'+pct+'%</div><div class="lbl">'+right+'</div></div>'
+    +'<div class="fcbar"><span style="width:'+pct+'%"></span></div>'
+    +'<div class="fcsteps">'+steps+'</div></div>';
+}
 function renderFinalClearance(c){
   if(!c.exists){
     if(!c.eligible) return '<div class="panel"><div class="muted">Final clearance is for graduating students in <b>300 level and above</b>. You are not eligible yet.</div></div>';
     return '<div class="panel"><h3>Ready to graduate?</h3><div class="muted" style="margin-bottom:10px">Request your final clearance to begin the graduation process. You can pay any office online and track every step right here.</div><button class="btn full" onclick="fcRequest()">🎓 Request final clearance</button><div class="err" id="fcErr" style="color:#b91c1c;font-size:13px;margin-top:6px"></div></div>';
   }
-  if(c.status==='requested') return '<div class="panel"><div class="ok">✅ Your request has been sent to the Bursary. You will be notified when it is accepted so you can begin. Check back here to track your progress.</div></div>';
+  if(c.status==='requested') return '<div class="fcprog"><div class="top"><div class="pct">0%</div><div class="lbl">Awaiting<br><b style="color:#1e293b">Bursary approval</b></div></div><div class="fcbar"><span style="width:4%"></span></div></div><div class="panel"><div class="ok">✅ Your request has been sent to the Bursary. You will be notified the moment it is accepted so you can begin — then track every step right here.</div></div>';
   if(c.status==='denied') return '<div class="panel"><div class="exbar bad">Your final-clearance request was not approved.'+(c.deny_reason?(' Reason: '+eh(c.deny_reason)):'')+'</div><button class="btn" style="margin-top:10px" onclick="fcRequest()">Request again</button><div class="err" id="fcErr" style="color:#b91c1c;font-size:13px;margin-top:6px"></div></div>';
-  var head=c.status==='completed'?'<div class="exbar ok">🎓 Congratulations — your final clearance is complete. You are now an alumnus/alumna.</div>':('<div class="exbar warn">In progress — current step: <b>'+eh(c.stage_label)+'</b></div>');
+  var head=fcProgressBar(c)+(c.status==='completed'?'<div class="exbar ok">🎓 Congratulations — your final clearance is complete. You are now an alumnus/alumna.</div>':'');
   var stagesHtml=(c.stages||[]).map(function(st){
     var items=(st.items||[]).map(function(it){return fcItemHtml(it);}).join('');
     return '<div class="panel" style="'+(st.current?'border:2px solid var(--brand)':'')+'"><h3 style="margin-top:0">'+fcStageIcon(st.done,st.current)+' '+eh(st.label)+(st.done?' <span class="pos" style="font-size:12px">cleared</span>':(st.current?' <span class="badge" style="background:#fef3c7;color:#92400e">current</span>':''))+'</h3>'+(items||'<div class="muted" style="font-size:12px">No actions needed here.</div>')+'</div>';

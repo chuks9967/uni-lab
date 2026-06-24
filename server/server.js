@@ -197,14 +197,46 @@ async function pushLiveSession(row) {
   const tokens = tokensForStudents(ids);
   if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: '🔴 Live class started', body: (row.subject || row.course_code || 'Your class') + ' is live now — tap to join' }, { seg: 'liveclasses', id: String(row.id || ''), room: String(row.room || '') }));
 }
+// Small display helpers for push bodies (server.js has no access to the portal's money/label helpers).
+function titleCase(s) { return String(s || '').replace(/[_-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim() || 'Fee'; }
+function fmtMoney(amount, currency) { const n = Number(amount) || 0; return (currency ? currency + ' ' : '') + n.toLocaleString('en-US', { maximumFractionDigits: 2 }); }
 async function pushNewRecords(recs) {
   if (!pushReady || !fcm || !fcm.configured() || !recs || !recs.length) return;
+  // Coalesce newly-billed fees per student, so a batch-bill (many charge rows at once) sends ONE
+  // "you have new fees" push instead of a dozen — and the student still always hears about being billed.
+  const feeByStudent = new Map();
+  for (const rec of recs) {
+    if (rec.entity === 'charges' && rec.row && rec.row.student_id && !rec.row.deleted) {
+      const sid = rec.row.student_id; const agg = feeByStudent.get(sid) || []; agg.push(rec.row); feeByStudent.set(sid, agg);
+    }
+  }
+  for (const [sid, rows] of feeByStudent) {
+    try {
+      const tokens = tokensForStudents([sid]); if (!tokens.length) continue;
+      const body = rows.length === 1
+        ? (titleCase(rows[0].category) + ' — ' + fmtMoney(rows[0].amount, rows[0].currency))
+        : (rows.length + ' new charges on your account — open Fees to view and pay.');
+      pruneStaleTokens(await fcm.sendToTokens(tokens, { title: '💳 New fee on your account', body }, { seg: 'fees' }));
+    } catch (_) { /* best-effort */ }
+  }
   for (const rec of recs) {
     try {
       const row = rec.row;
       if (rec.entity === 'portal_documents') {
         const tokens = tokensForStudents(studentsForDoc(row));
         if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: 'New document', body: row.title || 'A new document was posted for you' }, { seg: 'documents', id: String(row.id || '') }));
+      } else if (rec.entity === 'grad_clearance_items' && row.student_id) {
+        // A graduation FINAL-CLEARANCE task changed — congratulate on a clear, or flag a rejection.
+        const tokens = tokensForStudents([row.student_id]); if (!tokens.length) continue;
+        if (row.status === 'cleared') pruneStaleTokens(await fcm.sendToTokens(tokens, { title: '✅ Clearance step completed', body: (row.name || 'A clearance requirement') + ' has been cleared. Tap to see your graduation progress and what comes next.' }, { seg: 'finalclr', id: String(row.clearance_id || '') }));
+        else if (row.status === 'failed') pruneStaleTokens(await fcm.sendToTokens(tokens, { title: 'Final clearance — action needed', body: (row.name || 'A clearance requirement') + ' was not approved. Tap for details.' }, { seg: 'finalclr', id: String(row.clearance_id || '') }));
+      } else if (rec.entity === 'grad_clearances' && row.student_id) {
+        const tokens = tokensForStudents([row.student_id]); if (!tokens.length) continue;
+        let title, body;
+        if (row.status === 'completed') { title = '🎓 Final clearance complete'; body = 'Congratulations! Your final clearance is complete — you are now an alumnus/alumna. Tap to download your documents.'; }
+        else if (row.status === 'denied') { title = 'Final-clearance request update'; body = row.deny_reason ? ('Not approved: ' + row.deny_reason) : 'Your final-clearance request was not approved at this time. Tap for details.'; }
+        else { title = '✅ Final clearance started'; body = 'Your request was accepted. Begin with financial clearance — tap to track every step right here.'; }
+        pruneStaleTokens(await fcm.sendToTokens(tokens, { title, body }, { seg: 'finalclr', id: String(row.id || '') }));
       } else if (rec.entity === 'results' && row.student_id) {
         const tokens = tokensForStudents([row.student_id]);
         if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: 'Result published', body: row.title || 'A new statement of result is available' }, { seg: 'results', id: String(row.id || '') }));
@@ -224,13 +256,25 @@ async function pushNewRecords(recs) {
     } catch (_) { /* best-effort */ }
   }
 }
-/** Records whose arrival should trigger a push (new, not-deleted documents/results). */
+/** Records whose arrival should trigger a push (new, not-deleted documents/results/fees/clearance steps). */
+const PUSH_ENTITIES = ['portal_documents', 'results', 'live_sessions', 'malpractice_flags', 'online_exams', 'charges', 'grad_clearance_items', 'grad_clearances'];
 function collectPushable(entity, prev, row) {
-  if (entity !== 'portal_documents' && entity !== 'results' && entity !== 'live_sessions' && entity !== 'malpractice_flags' && entity !== 'online_exams') return false;
+  if (!PUSH_ENTITIES.includes(entity)) return false;
   if (!row || row.deleted) return false;
   if (entity === 'live_sessions' && !row.active) return false; // only a started (active) session pushes
   if (entity === 'malpractice_flags' && !row.student_id) return false; // only an identified student can be pushed/notified
   if (entity === 'online_exams') { if (row.status !== 'published' && row.status !== 'live') return false; return !prev || !prev.row || (prev.row.status !== 'published' && prev.row.status !== 'live'); } // push when it first becomes published/live
+  if (entity === 'charges') { if (!row.student_id) return false; return !prev || !prev.row || prev.row.deleted; } // a newly-billed fee
+  if (entity === 'grad_clearance_items') { // a final-clearance task that just cleared / was rejected
+    if (!row.student_id) return false;
+    const was = prev && prev.row ? prev.row.status : null;
+    return (row.status === 'cleared' && was !== 'cleared') || (row.status === 'failed' && was !== 'failed');
+  }
+  if (entity === 'grad_clearances') { // request accepted / completed / denied
+    if (!row.student_id) return false;
+    const was = prev && prev.row ? prev.row.status : null;
+    return ['active', 'completed', 'denied'].includes(row.status) && row.status !== was;
+  }
   return !prev || !prev.row || prev.row.deleted; // genuinely new (or un-deleted)
 }
 // ---- Cross-instance LIVE-EXAM frame relay (Cloud Run autoscaling) ---------------------------------
