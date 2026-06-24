@@ -18,6 +18,9 @@ const path = require('path');
 let qrcode = null; try { qrcode = require('./qrcode'); } catch (_) { qrcode = null; }
 // 8x8 JaaS / self-host JWT helper (zero-dep) — removes the meet.jit.si Google-login wall for live classes.
 let jitsi = null; try { jitsi = require('./jitsi'); } catch (_) { jitsi = null; }
+// SINGLE SOURCE OF TRUTH for the live-class room id — shared byte-for-byte with the desktop host
+// (electron/services/liveclasses.js) so a host and the cohort always land in the SAME room.
+const roomid = require('./roomid');
 function verifyQrSvg(targetUrl) {
   if (!qrcode || !targetUrl) return '';
   // force a fixed display size (viewBox keeps it crisp + scannable at any QR version)
@@ -25,7 +28,9 @@ function verifyQrSvg(targetUrl) {
 }
 
 const SYM = { NGN: '₦', XOF: 'CFA', USD: '$', EUR: '€', GBP: '£', GHS: '₵', KES: 'KSh', ZAR: 'R', GMD: 'D', SLL: 'Le' };
-function money(a, c) { const n = Number(a || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); return `${SYM[c] || (c ? c + ' ' : '')}${n}`; }
+// zero-decimal currencies (CFA franc, yen, …) have no subunit — never show ".00" for them.
+const ZERO_DEC_CUR = new Set(['JPY', 'KRW', 'VND', 'CLP', 'XOF', 'XAF', 'BIF', 'DJF', 'GNF', 'KMF', 'MGA', 'PYG', 'RWF', 'UGX', 'VUV', 'XPF']);
+function money(a, c) { const d = ZERO_DEC_CUR.has(String(c || '').toUpperCase()) ? 0 : 2; const n = Number(a || 0).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }); return `${SYM[c] || (c ? c + ' ' : '')}${n}`; }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m])); }
 function fmtDate(d) { if (!d) return '—'; try { return new Date(d).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }); } catch (_) { return '—'; } }
 
@@ -268,9 +273,8 @@ module.exports = function createPortal(deps) {
   // hard-to-guess id from the (already-synced) allocation scope, so no writable state is needed.
   // Knowing the id (only shown to the cohort + the lecturer) is the capability to join.
   function classRoom(parts) {
-    const raw = [secret || 'unibursar', 'liveclass'].concat((parts || []).map(x => String(x || ''))).join('|');
-    const short = String(inst().short || 'WAUU').replace(/[^A-Za-z0-9]/g, '').toLowerCase() || 'wauu';
-    return short + '-' + crypto.createHash('sha256').update(raw).digest('hex').slice(0, 28);
+    // SHARED derivation (server/roomid.js) — byte-identical to the desktop host's so they share the room.
+    return roomid.classRoom(secret, inst().short, parts);
   }
   // next scheduled time for a course, taken from the cohort's published LECTURE timetable (if any)
   function classWhen(s, code) {
@@ -341,13 +345,14 @@ module.exports = function createPortal(deps) {
     return null;
   }
   /** Standalone page that embeds Jitsi Meet for one class room (capability URL: the room id is a secret). */
-  function classPageHTML(room, name, subject, host) {
+  function classPageHTML(room, name, subject, host, principal) {
     const dn = esc(String(name || 'Guest').slice(0, 60));
     const subj = esc(String(subject || 'Live Class').slice(0, 80));
     const isHost = !!host;
-    // JaaS/self-host aware: mint a per-user JWT (moderator for the lecturer) so there is NO Google
-    // login and students join reliably. Falls back to plain meet.jit.si when nothing is configured.
-    const emb = jitsi ? jitsi.classEmbed(jitsiCfg(), { room, displayName: String(name || 'Guest').slice(0, 60), moderator: isHost })
+    // JaaS/self-host aware: mint a per-user JWT (moderator ONLY for the verified lecturer/host) so there is
+    // NO Google login and students join reliably. The moderator claim is server-signed from the caller's
+    // authenticated role — not the client — so a student cannot mint themselves a moderator token.
+    const emb = jitsi ? jitsi.classEmbed(jitsiCfg(), { room, displayName: String(name || 'Guest').slice(0, 60), moderator: isHost, userId: (principal && principal.id) || 'u' })
       : { domain: 'meet.jit.si', roomName: String(room || '').replace(/[^a-zA-Z0-9-]/g, '').slice(0, 80), jwt: '', scriptUrl: 'https://meet.jit.si/external_api.js', mode: 'public' };
     const domain = emb.domain;
     const r = emb.roomName;
@@ -1859,10 +1864,14 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
   function S(res, code, body, type) { res.writeHead(code, { 'Content-Type': type, 'Access-Control-Allow-Origin': '*' }); res.end(body); return true; }
   function rawBearer(req, u) { const hdr = req.headers['authorization'] || ''; const b = /^Bearer\s+(.+)$/i.exec(hdr); return (b && b[1]) || u.searchParams.get('t') || ''; }
   function authOf(req, u) { return verifyToken(rawBearer(req, u)); }
-  // Exam-monitor caller = a portal OFFICER (user) OR the trusted desktop sync node presenting the
-  // sync token (so an officer needn't have a separate portal login to monitor exams).
+  // Roles that may monitor an exam — MUST match the desktop surveillance/online-exam officer gate
+  // (electron/services/surveillance.js + onlineexams.js). A logged-in staff user who is NOT one of these
+  // (e.g. an accountant or a bursary clerk) must NOT be able to watch students' cameras / audio.
+  const EXAM_OFFICER_ROLES = ['admin', 'campus_admin', 'registrar', 'dean', 'hod', 'ict'];
+  // Exam-monitor caller = a portal OFFICER (a user with an exam-officer role) OR the trusted desktop
+  // sync node presenting the sync token (so an officer needn't have a separate portal login to monitor).
   function isExamOfficer(req, u) {
-    const t = authOf(req, u); if (t && t.k === 'user') return t;
+    const t = authOf(req, u); if (t && t.k === 'user' && EXAM_OFFICER_ROLES.includes(t.role)) return t;
     const raw = rawBearer(req, u); if (raw && secret && raw === secret) return { k: 'sync', role: 'officer', id: 'sync' };
     return null;
   }
@@ -2175,6 +2184,39 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     };
   }
 
+  // Server-side safety net: finalise any attempt whose personal time has passed but that was never
+  // submitted (the student closed the app/lost connection at the buzzer). Without this its autosaved
+  // answers would stay 'in_progress' forever — never graded — unless an officer manually ends the
+  // sitting. Marks it 'auto_submitted' (keeping the saved answers) so it enters the grading queue.
+  function autoCloseExpiredAttempts(e) {
+    if (!e || !e.id || typeof update !== 'function') return 0;
+    let st = {}; try { st = JSON.parse(e.settings || '{}'); } catch (_) {}
+    const now = Date.now(); let closed = 0;
+    for (const a of all('exam_attempts')) {
+      if (a.deleted || a.exam_id !== e.id || a.status !== 'in_progress') continue;
+      const startedMs = Date.parse(a.started_at || a.created_at || '') || 0; if (!startedMs) continue;
+      const extraMin = (st.extensions && Number(st.extensions[a.student_id])) || 0;
+      const durEnd = startedMs + ((Number(e.duration_min) || 60) + extraMin) * 60000;
+      const winEnd = e.end_at ? Date.parse(e.end_at) + extraMin * 60000 : durEnd;
+      if (now > Math.min(durEnd, winEnd) + 10000) {   // +10s grace for clock skew / in-flight autosave
+        update('exam_attempts', a.id, { status: 'auto_submitted', submitted_at: new Date().toISOString() });
+        closed++;
+      }
+    }
+    return closed;
+  }
+  // Auto-end "ghost" live classes: a host who closes their tab/loses connection never calls endSession,
+  // so the live_sessions row stays active=1 forever. Mark any active session older than the live window
+  // (3h) inactive at the SOURCE, so the lecturer's desktop, the sync state and pushes never treat a long-
+  // abandoned class as still live. Idempotent.
+  function sweepStaleLive() {
+    if (typeof update !== 'function') return 0;
+    const cap = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    let n = 0;
+    for (const v of all('live_sessions')) { if (!v.deleted && v.active && String(v.started_at || '') < cap) { update('live_sessions', v.id, { active: 0 }); n++; } }
+    return n;
+  }
+
   async function handle(req, res, u, method, readBody) {
     const p = u.pathname.replace(/\/+$/, '') || '/';
     docBase = buildBase(req); // so any document we render this request can build absolute verify URLs
@@ -2183,7 +2225,16 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     // Live class room (Jitsi). The room id is a secret capability shown only to the cohort + lecturer.
     if (method === 'GET' && p.startsWith('/class/')) {
       const room = p.slice('/class/'.length);
-      return H(res, 200, classPageHTML(room, u.searchParams.get('n') || 'Guest', u.searchParams.get('s') || 'Live Class', u.searchParams.get('host') === '1'));
+      const t = authOf(req, u);
+      // Must be signed in to join a class (room ids are a capability, but we still require a valid session).
+      if (!t || (t.k !== 'student' && t.k !== 'staff' && t.k !== 'user')) {
+        return H(res, 401, '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:Segoe UI,Arial,sans-serif;background:#0b1220;color:#fff;text-align:center;padding:60px 20px"><div style="font-size:48px">🔒</div><h2>Please sign in to join the class</h2><p style="opacity:.8">Open this class from your portal or the app after signing in.</p><a href="/" style="display:inline-block;margin-top:18px;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Go to portal</a></body>');
+      }
+      // MODERATOR LOCK: host/moderator status is derived from the AUTHENTICATED role — only teaching staff /
+      // management may host. A student can never self-promote by passing ?host=1 (which would otherwise hand
+      // them a moderator JWT: recording, lobby control, mute-everyone). Students always join as students.
+      const isHost = (u.searchParams.get('host') === '1') && (t.k === 'staff' || t.k === 'user');
+      return H(res, 200, classPageHTML(room, u.searchParams.get('n') || 'Guest', u.searchParams.get('s') || 'Live Class', isHost, t));
     }
     // E-library: read online (in-app pdf.js viewer), stream the file, or download. Student-scoped.
     if (method === 'GET' && p.startsWith('/library/')) {
@@ -2250,6 +2301,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     // class a student opened with no host session is never force-closed. (Room id is a secret capability.)
     if (p === '/api/class-live' && method === 'GET') {
       const room = u.searchParams.get('room') || '';
+      sweepStaleLive();   // end any long-abandoned (>3h) live session at the source
       const now = Date.now();
       const liveCut = new Date(now - 3 * 60 * 60 * 1000).toISOString();
       const recentCut = new Date(now - 12 * 60 * 60 * 1000).toISOString();
@@ -2495,6 +2547,9 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const amount = Number(a.admission_fee_amount), currency = a.admission_fee_currency || 'NGN';
       const body = await readBody();
       const provider = pickProvider(body && body.provider);
+      if (provider && gateway && gateway.providerAllowedForCurrency && !gateway.providerAllowedForCurrency(provider, currency)) {
+        return J(res, 200, { ok: false, error: `That payment method is not accepted for ${currency}. Please choose another.` });
+      }
       if (provider && gateway && a.email) {
         // anti-abuse: cap how many admission-fee checkouts ONE application can start in an hour
         try { const since = Date.now() - 60 * 60000; if (all('payment_intents').filter(x => !x.deleted && x.application_id === a.id && new Date(x.created_at || 0).getTime() >= since).length >= 12) return J(res, 200, { ok: false, error: 'Too many payment attempts. Please wait a little, or contact the Bursary.' }); } catch (_) {}
@@ -2517,7 +2572,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
         }
         return J(res, 200, { ok: false, error: r.error || 'Could not start the online payment right now. Please try again later.' });
       }
-      return J(res, 200, { ok: true, mode: 'manual', amount, currency, providers: gateway ? gateway.providers() : [], bank: process.env.ADMISSION_BANK || 'Contact the Bursary for the bank account details, then declare your payment below.' });
+      return J(res, 200, { ok: true, mode: 'manual', amount, currency, providers: gateway ? ((gateway.providersForCurrency) ? gateway.providersForCurrency(currency) : gateway.providers()) : [], bank: process.env.ADMISSION_BANK || 'Contact the Bursary for the bank account details, then declare your payment below.' });
     }
 
     if (p === '/api/apply/pay/declare' && method === 'POST') {
@@ -2543,8 +2598,10 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     // ---- Student fee payment (multi-provider: Paystack / Flutterwave / …) ----
     // providers → which gateways this deployment has configured, so the app/portal offers the right choices.
     if (p === '/api/pay/providers' && method === 'GET') {
-      const list = gateway ? gateway.providers() : [];
-      return J(res, 200, { ok: true, providers: list, enabled: list.length > 0, bank: process.env.FEES_BANK || inst().fees_bank || process.env.ADMISSION_BANK || '' });
+      // a currency may accept only some gateways (admin-assigned) — offer the student exactly those.
+      const cur = String(u.searchParams.get('currency') || '').toUpperCase();
+      const list = gateway ? ((cur && gateway.providersForCurrency) ? gateway.providersForCurrency(cur) : gateway.providers()) : [];
+      return J(res, 200, { ok: true, providers: list, enabled: list.length > 0, currency: cur || null, bank: process.env.FEES_BANK || inst().fees_bank || process.env.ADMISSION_BANK || '' });
     }
 
     // init → start a checkout with the chosen provider (the app/WebView opens the returned URL), or return
@@ -2559,6 +2616,10 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const category = String(body.category || 'tuition').slice(0, 40);
       const provider = pickProvider(body.provider);
       if (!(amount > 0)) return J(res, 200, { ok: false, error: 'Enter a valid amount to pay.' });
+      // accepted-method guard: the admin can restrict which gateways may take a given currency
+      if (provider && gateway && gateway.providerAllowedForCurrency && !gateway.providerAllowedForCurrency(provider, currency)) {
+        return J(res, 200, { ok: false, error: `That payment method is not accepted for ${currency}. Please choose another.` });
+      }
       if (provider && gateway && s.email) {
         // auto-debit guard: never let an online payment exceed what the chosen fee still owes
         const owed = outstandingFor(s, category, currency);
@@ -2756,6 +2817,8 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     if (p === '/api/exam/active' && method === 'GET') {
       const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
       const s = one('students', t.id); if (!s) return J(res, 401, { ok: false });
+      // sweep this student's own attempts so a self-paced exam they closed at the buzzer is still finalised
+      for (const a of all('exam_attempts')) { if (!a.deleted && a.student_id === t.id && a.status === 'in_progress') { const e = one('online_exams', a.exam_id); if (e) autoCloseExpiredAttempts(e); } }
       return J(res, 200, { ok: true, exams: examsForStudent(s) });
     }
     // Student: start (or resume) an attempt → shuffled questions (NO answers) + a server-authoritative end time.
@@ -2924,6 +2987,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       await efHydrate(examId);   // pull cross-instance state so the roster reflects students on other instances
       const frames = examFrames[examId] || {};
       const e = one('online_exams', examId) || {};
+      if (e.id) autoCloseExpiredAttempts(e);   // finalise anyone whose time elapsed (closed app at the buzzer)
       const attempts = all('exam_attempts').filter(a => !a.deleted && a.exam_id === examId);
       // build the grid from the COHORT roster (so the officer sees the whole class, even before anyone
       // uploads a frame) unioned with any attempt that isn't in the cohort.
@@ -3432,7 +3496,8 @@ html[dir=rtl] .tscroll th.r,html[dir=rtl] .tscroll td.r{text-align:left}
 const $=(h)=>{const d=document.createElement('div');d.innerHTML=h;return d.firstElementChild;};
 let TOKEN=localStorage.getItem('ubu_token')||'';let VER=0;let TIMER=null;
 const SYM={NGN:'₦',XOF:'CFA',USD:'$',EUR:'€',GBP:'£',GHS:'₵',KES:'KSh',ZAR:'R'};
-function money(a,c){return (SYM[c]||(c?c+' ':''))+Number(a||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
+const ZERO_DEC_CUR=new Set(['JPY','KRW','VND','CLP','XOF','XAF','BIF','DJF','GNF','KMF','MGA','PYG','RWF','UGX','VUV','XPF']);
+function money(a,c){var d=ZERO_DEC_CUR.has(String(c||'').toUpperCase())?0:2;return (SYM[c]||(c?c+' ':''))+Number(a||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});}
 function mapMoney(m){const e=Object.entries(m||{});return e.length?e.map(([c,v])=>money(v,c)).join(' • '):money(0);}
 function fmt(d){if(!d)return '—';try{return new Date(d).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'});}catch(_){return '—';}}
 async function api(path,opts={}){opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});if(TOKEN)opts.headers.Authorization='Bearer '+TOKEN;const r=await fetch(path,opts);return r.json();}
@@ -3634,7 +3699,7 @@ async function reqTranscript(kind){
 // On return the /api/pay/callback verifies the payment server-side, issues the receipt and emails it.
 async function payFee(catEnc,currency,outstanding){
   var category=decodeURIComponent(catEnc);
-  var pr;try{pr=await api('/api/pay/providers');}catch(e){pr={ok:false};}
+  var pr;try{pr=await api('/api/pay/providers?currency='+encodeURIComponent(currency||''));}catch(e){pr={ok:false};}
   var providers=(pr&&pr.providers)||[];
   var ov=document.createElement('div');
   ov.style.cssText='position:fixed;inset:0;z-index:9500;background:rgba(2,6,23,.55);display:flex;align-items:center;justify-content:center;padding:16px';
@@ -3769,7 +3834,7 @@ function mountChat(){
 }
 // Open a live class room (Jitsi). Navigate in the SAME webview so the app's camera/mic permission
 // applies; Jitsi's "Back to portal" returns here. name is already URL-encoded.
-function joinClass(room,subjEnc){var n=window.__lcName||encodeURIComponent('Guest');var host=window.__lcHost?'1':'0';location.href='/class/'+room+'?n='+n+'&s='+subjEnc+'&host='+host;}
+function joinClass(room,subjEnc){var n=window.__lcName||encodeURIComponent('Guest');var host=window.__lcHost?'1':'0';location.href='/class/'+room+'?n='+n+'&s='+subjEnc+'&host='+host+'&t='+encodeURIComponent(TOKEN||localStorage.getItem('ubu_token')||'');}
 // E-library: read in-app (navigate so the pdf.js viewer fills the screen; "Back" returns here) / download
 function readBook(id){location.href='/library/read/'+id+'?t='+encodeURIComponent(TOKEN);}
 function downloadBook(id){window.open('/library/download/'+id+'?t='+encodeURIComponent(TOKEN),'_blank');}
@@ -4468,7 +4533,7 @@ function renderStatus(){
 }
 async function pay(){
   err('payErr','');
-  var pr;try{pr=await api('/api/pay/providers');}catch(e){pr=null;}
+  var pr;try{pr=await api('/api/pay/providers?currency='+encodeURIComponent((d&&d.admission_fee_currency)||''));}catch(e){pr=null;}
   var providers=(pr&&pr.providers)||[];
   if(providers.length>1){
     // more than one gateway configured → let the applicant choose which platform to pay with

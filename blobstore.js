@@ -17,12 +17,31 @@ const http = require('http');
 const crypto = require('crypto');
 const { URL } = require('url');
 
-const SUPA_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
-const SUPA_KEY = process.env.SUPABASE_KEY || '';
+// Credentials resolve from a CONFIG GETTER first (the desktop hub pushes its own storage settings to the
+// hub — see electron/services/sync.pushStorageConfig + server.js /storage-config), then fall back to the
+// host's environment. Without the getter the hub could only read env vars, so a deployment that set up
+// object storage on the DESKTOP (Supabase/R2) but never mirrored those creds into the hub env served
+// "This document is unavailable" for every offloaded file. The push makes the bytes resolvable with no
+// manual env setup — exactly like the payment-gateway keys already work.
+let cfgGet = null;
+function configure(getter) { cfgGet = (typeof getter === 'function') ? getter : null; }
+function cfg(settingKey, envKey) {
+  if (cfgGet) { try { const v = cfgGet(settingKey); if (v) return String(v).trim(); } catch (_) {} }
+  return (process.env[envKey] || '').trim();
+}
 const SUPA_BUCKET = 'unibursar'; // matches the desktop's fixed Supabase bucket
-const R2 = { account: process.env.R2_ACCOUNT_ID || '', accessKey: process.env.R2_ACCESS_KEY || '', secret: process.env.R2_SECRET || '', bucket: process.env.R2_BUCKET || 'unibursar' };
-const r2Configured = () => !!(R2.account && R2.accessKey && R2.secret);
-const supaConfigured = () => !!(SUPA_URL && SUPA_KEY);
+function supaUrl() { return cfg('supabase_url', 'SUPABASE_URL').replace(/\/+$/, ''); }
+function supaKey() { return cfg('supabase_key', 'SUPABASE_KEY'); }
+function r2Creds() {
+  return {
+    account: cfg('r2_account_id', 'R2_ACCOUNT_ID'),
+    accessKey: cfg('r2_access_key', 'R2_ACCESS_KEY'),
+    secret: cfg('r2_secret', 'R2_SECRET'),
+    bucket: cfg('r2_bucket', 'R2_BUCKET') || 'unibursar',
+  };
+}
+const r2Configured = () => { const c = r2Creds(); return !!(c.account && c.accessKey && c.secret); };
+const supaConfigured = () => !!(supaUrl() && supaKey());
 
 function encKey(key) { return String(key).split('/').map(encodeURIComponent).join('/'); }
 
@@ -39,7 +58,8 @@ function get(urlStr, headers) {
 }
 
 async function supaGet(key) {
-  const res = await get(SUPA_URL + '/storage/v1/object/' + SUPA_BUCKET + '/' + encKey(key), { 'apikey': SUPA_KEY, 'Authorization': 'Bearer ' + SUPA_KEY });
+  const url = supaUrl(), apiKey = supaKey();
+  const res = await get(url + '/storage/v1/object/' + SUPA_BUCKET + '/' + encKey(key), { 'apikey': apiKey, 'Authorization': 'Bearer ' + apiKey });
   return (res.status >= 200 && res.status < 300) ? res.buf : null;
 }
 
@@ -47,8 +67,9 @@ const EMPTY_SHA = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b
 function sha256hex(d) { return crypto.createHash('sha256').update(d).digest('hex'); }
 function hmac(k, d) { return crypto.createHmac('sha256', k).update(d).digest(); }
 async function r2Get(key) {
-  const host = R2.account + '.r2.cloudflarestorage.com';
-  const canonicalUri = '/' + R2.bucket + '/' + encKey(key);
+  const c = r2Creds();
+  const host = c.account + '.r2.cloudflarestorage.com';
+  const canonicalUri = '/' + c.bucket + '/' + encKey(key);
   const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
   const dateStamp = amzDate.slice(0, 8);
   const signed = { host, 'x-amz-content-sha256': EMPTY_SHA, 'x-amz-date': amzDate };
@@ -58,9 +79,9 @@ async function r2Get(key) {
   const canonicalRequest = ['GET', canonicalUri, '', canonicalHeaders, signedHeaders, EMPTY_SHA].join('\n');
   const scope = dateStamp + '/auto/s3/aws4_request';
   const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, sha256hex(canonicalRequest)].join('\n');
-  const kSigning = hmac(hmac(hmac(hmac('AWS4' + R2.secret, dateStamp), 'auto'), 's3'), 'aws4_request');
+  const kSigning = hmac(hmac(hmac(hmac('AWS4' + c.secret, dateStamp), 'auto'), 's3'), 'aws4_request');
   const signature = crypto.createHmac('sha256', kSigning).update(stringToSign).digest('hex');
-  const headers = Object.assign({}, signed, { 'Authorization': 'AWS4-HMAC-SHA256 Credential=' + R2.accessKey + '/' + scope + ', SignedHeaders=' + signedHeaders + ', Signature=' + signature });
+  const headers = Object.assign({}, signed, { 'Authorization': 'AWS4-HMAC-SHA256 Credential=' + c.accessKey + '/' + scope + ', SignedHeaders=' + signedHeaders + ', Signature=' + signature });
   const res = await get('https://' + host + canonicalUri, headers);
   return (res.status >= 200 && res.status < 300) ? res.buf : null;
 }
@@ -73,4 +94,7 @@ async function getBuffer(key) {
   return null;
 }
 
-module.exports = { getBuffer, configured: () => r2Configured() || supaConfigured() };
+/** Storage keys the desktop hub may push so the portal resolves blobs without manual env setup. */
+function storageConfigKeys() { return ['storage_backend', 'supabase_url', 'supabase_key', 'r2_account_id', 'r2_access_key', 'r2_secret', 'r2_bucket']; }
+
+module.exports = { getBuffer, configure, storageConfigKeys, configured: () => r2Configured() || supaConfigured() };

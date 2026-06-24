@@ -46,6 +46,7 @@ try {
 if (!store.epoch) store.epoch = crypto.randomUUID();
 if (!('branding' in store)) store.branding = null; // {name, short, logo, motto} pushed by the app
 if (!store.payConfig) store.payConfig = {}; // online-payment gateway config (keys + test mode) pushed by the desktop hub
+if (!store.storageConfig) store.storageConfig = {}; // object-storage creds (Supabase/R2) pushed by the desktop hub so offloaded docs/books resolve
 if (!store.deviceTokens) store.deviceTokens = {}; // fcmToken -> { kind, id, platform, ts } (native app push targets)
 
 let saveTimer = null;
@@ -117,6 +118,10 @@ async function cloudLoadAll() {
     // restore the online-payment gateway config (keys + test mode) the desktop pushed, so the cloud
     // portal/APK use the SAME settings — incl. sandbox/test mode — the admin configured on the desktop.
     const pc = await cloudGetMeta('payConfig'); if (pc) { try { const o = JSON.parse(pc); if (o && typeof o === 'object') store.payConfig = o; } catch (_) {} }
+    // restore the object-storage creds the desktop pushed so offloaded documents/e-books resolve to bytes
+    // (without this, a deployment that set up storage on the desktop but not in the hub env served
+    // "This document is unavailable" for every offloaded file).
+    const sc = await cloudGetMeta('storageConfig'); if (sc) { try { const o = JSON.parse(sc); if (o && typeof o === 'object') store.storageConfig = o; } catch (_) {} }
     // restore registered push tokens (Cloud Run's local FS is ephemeral — without this, a cold start
     // would forget every device and pushes would stop until each app re-registers on next open).
     const dt = await cloudGetMeta('deviceTokens'); if (dt) { try { const o = JSON.parse(dt); if (o && typeof o === 'object') store.deviceTokens = Object.assign(o, store.deviceTokens); } catch (_) {} }
@@ -166,6 +171,8 @@ async function cloudPullDelta() {
       const br = await cloudGetMeta('branding'); if (br) { try { const b = JSON.parse(br); if (b && (b.name || b.logo)) { store.branding = b; storeVersion = Date.now(); } } catch (_) {} }
       // same cadence: pick up a payment-config change (e.g. the admin flips on TEST MODE) without a restart
       const pc = await cloudGetMeta('payConfig'); if (pc) { try { const o = JSON.parse(pc); if (o && typeof o === 'object') store.payConfig = o; } catch (_) {} }
+      // and pick up an object-storage config change (e.g. the admin connects R2) so new offloaded docs resolve
+      const sc = await cloudGetMeta('storageConfig'); if (sc) { try { const o = JSON.parse(sc); if (o && typeof o === 'object') store.storageConfig = o; } catch (_) {} }
     }
   } catch (_) { /* transient — try again next tick */ }
 }
@@ -206,8 +213,21 @@ async function pushLiveSession(row) {
 // Small display helpers for push bodies (server.js has no access to the portal's money/label helpers).
 function titleCase(s) { return String(s || '').replace(/[_-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim() || 'Fee'; }
 function fmtMoney(amount, currency) { const n = Number(amount) || 0; return (currency ? currency + ' ' : '') + n.toLocaleString('en-US', { maximumFractionDigits: 2 }); }
+// Map an in-app notification's type to the app tab to open when its push is tapped.
+function segForNotifType(type, payload) {
+  try { const p = payload && JSON.parse(payload); if (p && p.clearance_id) return 'finalclr'; } catch (_) {}
+  return ({ fee: 'fees', payment: 'receipts', result: 'results', clearance: 'clearance', document: 'documents', exam: 'exam' })[type] || 'overview';
+}
 async function pushNewRecords(recs) {
   if (!pushReady || !fcm || !fcm.configured() || !recs || !recs.length) return;
+  // Students who get a SPECIFIC-entity push this batch (fee/document/result/clearance/…) — so the generic
+  // notifications catch-all below never double-pushes the same student in the same sync batch.
+  const covered = new Set();
+  for (const rec of recs) {
+    const row = rec.row; if (!row) continue;
+    if (['charges', 'results', 'grad_clearance_items', 'grad_clearances', 'malpractice_flags'].includes(rec.entity) && row.student_id) covered.add(row.student_id);
+    else if (rec.entity === 'portal_documents') for (const sid of studentsForDoc(row)) covered.add(sid);
+  }
   // Coalesce newly-billed fees per student, so a batch-bill (many charge rows at once) sends ONE
   // "you have new fees" push instead of a dozen — and the student still always hears about being billed.
   const feeByStudent = new Map();
@@ -261,9 +281,22 @@ async function pushNewRecords(recs) {
       }
     } catch (_) { /* best-effort */ }
   }
+  // Generic catch-all: any brand-new student-targeted in-app notification (receipts, exam clearance,
+  // messages, announcements…) becomes a device push too — unless that student already got a more
+  // specific push this batch. This is what guarantees a student is notified on their device.
+  for (const rec of recs) {
+    if (rec.entity !== 'notifications') continue;
+    const row = rec.row;
+    try {
+      if (!row || row.deleted || row.is_read || !row.target_user || covered.has(row.target_user)) continue;
+      const tokens = tokensForStudents([row.target_user]); if (!tokens.length) continue;
+      covered.add(row.target_user);
+      pruneStaleTokens(await fcm.sendToTokens(tokens, { title: row.title || 'Portal update', body: row.body || '' }, { seg: segForNotifType(row.type, row.payload) }));
+    } catch (_) { /* best-effort */ }
+  }
 }
 /** Records whose arrival should trigger a push (new, not-deleted documents/results/fees/clearance steps). */
-const PUSH_ENTITIES = ['portal_documents', 'results', 'live_sessions', 'malpractice_flags', 'online_exams', 'charges', 'grad_clearance_items', 'grad_clearances'];
+const PUSH_ENTITIES = ['portal_documents', 'results', 'live_sessions', 'malpractice_flags', 'online_exams', 'charges', 'grad_clearance_items', 'grad_clearances', 'notifications'];
 function collectPushable(entity, prev, row) {
   if (!PUSH_ENTITIES.includes(entity)) return false;
   if (!row || row.deleted) return false;
@@ -280,6 +313,9 @@ function collectPushable(entity, prev, row) {
     if (!row.student_id) return false;
     const was = prev && prev.row ? prev.row.status : null;
     return ['active', 'completed', 'denied'].includes(row.status) && row.status !== was;
+  }
+  if (entity === 'notifications') { // a brand-new student-targeted in-app notification (generic catch-all)
+    return !!row.target_user && !row.is_read && (!prev || !prev.row);
   }
   return !prev || !prev.row || prev.row.deleted; // genuinely new (or un-deleted)
 }
@@ -343,6 +379,10 @@ if (createPortal) {
   // test/sandbox flag — falling back to env vars when a value isn't set. Without this the cloud ignored
   // the admin's desktop settings (so e.g. TEST MODE never reached the portal/APK).
   try { const _gw = require('./payments-gateway'); if (_gw.configure) _gw.configure((k) => (store.payConfig && store.payConfig[k]) || ''); } catch (_) {}
+  // Same idea for object storage: resolve offloaded book/document bytes using the storage creds the
+  // desktop pushed (store.storageConfig), falling back to env. Fixes "This document is unavailable" when
+  // storage was configured on the desktop but not mirrored into the hub's environment.
+  try { const _bs = require('./blobstore'); if (_bs.configure) _bs.configure((k) => (store.storageConfig && store.storageConfig[k]) || ''); } catch (_) {}
   try {
     portal = createPortal({
       all: allEntity, one: oneEntity, getVersion: () => storeVersion, secret: SYNC_TOKEN || 'unibursar-portal',
@@ -616,6 +656,18 @@ const server = http.createServer(async (req, res) => {
     store.payConfig = cfg || {};
     storeVersion = Date.now(); save();
     cloudSetMeta('payConfig', JSON.stringify(store.payConfig));
+    return send(res, 200, { ok: true });
+  }
+  // the desktop hub pushes its object-storage credentials (Supabase Storage / Cloudflare R2) so the CLOUD
+  // portal + native app can resolve offloaded document/e-book bytes to download — without the admin having
+  // to mirror those creds into this server's environment. Token-protected: it carries storage secret keys.
+  if (p === '/storage-config' && req.method === 'POST') {
+    if (!tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized.' });
+    const body = await readBody(req);
+    const cfg = (body && typeof body.config === 'object' && body.config) ? body.config : (body && typeof body === 'object' ? body : {});
+    store.storageConfig = cfg || {};
+    storeVersion = Date.now(); save();
+    cloudSetMeta('storageConfig', JSON.stringify(store.storageConfig));
     return send(res, 200, { ok: true });
   }
 
