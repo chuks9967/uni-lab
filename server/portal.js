@@ -2081,6 +2081,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     if (provider === 'paypal') return query.token || ir;
     if (provider === 'razorpay') return query.razorpay_payment_link_id || ir;
     if (provider === 'mollie') return ir;
+    if (provider === 'momopay') return query.id || ir; // FedaPay redirects with ?id=<transactionId>&status=approved
     return query.reference || query.trxref || ir; // paystack + default
   }
   /** Periodic sweep: re-verify checkouts that never came back (closed tab / dropped webhook) and settle

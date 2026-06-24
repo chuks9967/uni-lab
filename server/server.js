@@ -45,6 +45,7 @@ try {
 } catch (_) { store = { epoch: crypto.randomUUID(), records: {} }; }
 if (!store.epoch) store.epoch = crypto.randomUUID();
 if (!('branding' in store)) store.branding = null; // {name, short, logo, motto} pushed by the app
+if (!store.payConfig) store.payConfig = {}; // online-payment gateway config (keys + test mode) pushed by the desktop hub
 if (!store.deviceTokens) store.deviceTokens = {}; // fcmToken -> { kind, id, platform, ts } (native app push targets)
 
 let saveTimer = null;
@@ -113,6 +114,9 @@ async function cloudLoadAll() {
   try {
     const ep = await cloudGetMeta('epoch'); if (ep) store.epoch = ep;
     const br = await cloudGetMeta('branding'); if (br) { try { store.branding = JSON.parse(br); } catch (_) {} }
+    // restore the online-payment gateway config (keys + test mode) the desktop pushed, so the cloud
+    // portal/APK use the SAME settings — incl. sandbox/test mode — the admin configured on the desktop.
+    const pc = await cloudGetMeta('payConfig'); if (pc) { try { const o = JSON.parse(pc); if (o && typeof o === 'object') store.payConfig = o; } catch (_) {} }
     // restore registered push tokens (Cloud Run's local FS is ephemeral — without this, a cold start
     // would forget every device and pushes would stop until each app re-registers on next open).
     const dt = await cloudGetMeta('deviceTokens'); if (dt) { try { const o = JSON.parse(dt); if (o && typeof o === 'object') store.deviceTokens = Object.assign(o, store.deviceTokens); } catch (_) {} }
@@ -160,6 +164,8 @@ async function cloudPullDelta() {
     // desktop pushed AFTER this server booted, without needing a restart.
     if ((brandingTick++ % 6) === 0) {
       const br = await cloudGetMeta('branding'); if (br) { try { const b = JSON.parse(br); if (b && (b.name || b.logo)) { store.branding = b; storeVersion = Date.now(); } } catch (_) {} }
+      // same cadence: pick up a payment-config change (e.g. the admin flips on TEST MODE) without a restart
+      const pc = await cloudGetMeta('payConfig'); if (pc) { try { const o = JSON.parse(pc); if (o && typeof o === 'object') store.payConfig = o; } catch (_) {} }
     }
   } catch (_) { /* transient — try again next tick */ }
 }
@@ -333,6 +339,10 @@ if (EXAM_RELAY) setInterval(() => { try { supaRest('DELETE', '/rest/v1/exam_live
 
 let portal = null;
 if (createPortal) {
+  // Make the online-payment gateway read the config the desktop pushed (store.payConfig) — keys AND the
+  // test/sandbox flag — falling back to env vars when a value isn't set. Without this the cloud ignored
+  // the admin's desktop settings (so e.g. TEST MODE never reached the portal/APK).
+  try { const _gw = require('./payments-gateway'); if (_gw.configure) _gw.configure((k) => (store.payConfig && store.payConfig[k]) || ''); } catch (_) {}
   try {
     portal = createPortal({
       all: allEntity, one: oneEntity, getVersion: () => storeVersion, secret: SYNC_TOKEN || 'unibursar-portal',
@@ -595,6 +605,19 @@ const server = http.createServer(async (req, res) => {
   }
   // a fresh client pulls the institution name/logo back into its own settings (they aren't synced rows)
   if (p === '/branding' && req.method === 'GET') return send(res, 200, store.branding || {});
+
+  // the desktop hub pushes its online-payment gateway config (provider keys + test/sandbox mode + bank)
+  // so the CLOUD portal AND the native app (which both talk to this server) honour the SAME settings the
+  // admin configured on the desktop. Token-protected: it carries merchant secret keys.
+  if (p === '/pay-config' && req.method === 'POST') {
+    if (!tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized.' });
+    const body = await readBody(req);
+    const cfg = (body && typeof body.config === 'object' && body.config) ? body.config : (body && typeof body === 'object' ? body : {});
+    store.payConfig = cfg || {};
+    storeVersion = Date.now(); save();
+    cloudSetMeta('payConfig', JSON.stringify(store.payConfig));
+    return send(res, 200, { ok: true });
+  }
 
   if (p === '/sync/pull' && req.method === 'GET') {
     const since = u.searchParams.get('since') || null; const out = [];
