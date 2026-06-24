@@ -2299,7 +2299,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const wait = loginBlocked(key);
       if (wait) return J(res, 200, { ok: false, error: `Too many failed attempts. Please wait about ${Math.ceil(wait / 60)} minute(s) and try again.` });
       const acc = findAccount(body.login);
-      if (!acc || !verifyPass(body.password, passField(acc.kind, acc.row))) { loginFailed(key); return J(res, 200, { ok: false, error: 'Invalid login or password. (Officers: sign in to the desktop app once to activate your portal access.)' }); }
+      if (!acc || !verifyPass(body.password, passField(acc.kind, acc.row))) { loginFailed(key); return J(res, 200, { ok: false, error: 'Incorrect login or password. Students/parents: tap “First time or forgot password?” below to set your password using the matric number + email/phone on your record. Officers: sign in to the desktop app once first.', canRecover: acc ? (acc.kind === 'student' || acc.kind === 'parent') : true }); }
       // officer MFA: a 6-digit authenticator code is required after the password when enrolled
       if (acc.kind === 'user' && acc.row.mfa_enabled) {
         if (!body.code) return J(res, 200, { ok: false, mfaRequired: true, error: 'Enter the 6-digit code from your authenticator app.' });
@@ -2318,6 +2318,42 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
         : (acc.kind === 'parent') ? (acc.row.parent_name || 'Parent/Guardian') : acc.row.full_name;
       const campusName = acc.kind === 'student' && acc.row.campus_id ? nameOf('campuses', acc.row.campus_id) : null;
       return J(res, 200, { ok: true, token, user: { role: acc.role, kind: acc.kind, name, campus: campusName } });
+    }
+
+    // ---- SELF-SERVICE first-time / forgot password (students + parents) ----
+    // A student/parent who never got (or lost) their emailed password can set one themselves by proving
+    // identity with the email/phone on their record — so nobody is locked out when SMTP isn't set up.
+    if (p === '/api/portal/recover' && method === 'POST') {
+      const body = await readBody();
+      if (inst().licensed === false) return J(res, 200, { ok: false, error: 'This institution’s software has not been activated. Please contact your administrator.' });
+      const key = loginKey(req, 'recover:' + (body.login || ''));
+      if (loginBlocked(key)) return J(res, 200, { ok: false, error: 'Too many attempts — please wait a few minutes and try again.' });
+      const login = String(body.login || '').trim().toLowerCase();
+      const verify = String(body.verify || '').trim().toLowerCase();
+      const newPassword = String(body.password || '');
+      const asParent = body.role === 'parent';
+      if (!login || !verify) return J(res, 200, { ok: false, error: 'Enter your matric number and the email or phone on your record.' });
+      if (newPassword.length < 5) return J(res, 200, { ok: false, error: 'Your new password must be at least 5 characters.' });
+      let stu = null;
+      for (const s of all('students')) { if (s.deleted) continue; if ([s.matric_no, s.portal_username, s.email, s.parent_portal_username, s.parent_email].some(v => (v || '').toLowerCase() === login)) { stu = s; break; } }
+      // GENERIC failure for BOTH "no such matric" and "contact mismatch" — never leak which matric numbers
+      // exist or which contact field is correct (anti-enumeration). Rate-limited above.
+      const fail = () => { loginFailed(key); return J(res, 200, { ok: false, error: 'We could not verify those details. Check your matric number and the exact email or phone the school has on your record, or contact the school office.' }); };
+      if (!stu) return fail();
+      // identity proof: the value they typed must match a contact field on file (student or parent set)
+      const known = (asParent ? [stu.parent_email, stu.parent_phone, stu.parent_whatsapp] : [stu.email, stu.phone, stu.whatsapp, stu.parent_email])
+        .map(v => (v || '').replace(/\s/g, '').toLowerCase()).filter(Boolean);
+      if (!known.includes(verify.replace(/\s/g, ''))) return fail();
+      if (typeof update !== 'function') return J(res, 200, { ok: false, error: 'Password reset is unavailable on this server — try again when online.' });
+      loginOk(key);
+      if (asParent) {
+        const username = stu.parent_portal_username || (stu.matric_no ? 'p-' + stu.matric_no : 'par-' + String(stu.id).slice(0, 8));
+        update('students', stu.id, { parent_portal_username: username, parent_portal_pass: hashPass(newPassword) });
+        return J(res, 200, { ok: true, username, role: 'parent' });
+      }
+      const username = stu.portal_username || stu.matric_no || stu.email;
+      update('students', stu.id, { portal_username: username, portal_pass: hashPass(newPassword) });
+      return J(res, 200, { ok: true, username, role: 'student' });
     }
 
     // ---- Online Admissions (public application portal, temporary-pass auth) ----
@@ -3437,7 +3473,7 @@ async function renderLogin(msg){
     +'<div class="field"><label>Password</label><input id="pw" type="password" autocomplete="current-password"></div>'
     +campusField
     +'<button class="btn" id="go">Sign In</button>'
-    +'<div class="hintbar">Your login is emailed to you after registration. Forgot it? Ask the bursary or registrar to resend your portal login.</div>'
+    +'<div class="hintbar">First time here, or forgot your password? <a href="#" id="recover" style="color:#1e3a8a;font-weight:700;text-decoration:none">Set your password →</a></div>'
     +'<div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(148,163,184,.3);text-align:center"><div class="sub" style="margin-bottom:8px">New here? Not yet a student?</div><a href="/apply" style="display:inline-block;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:9px;text-decoration:none;font-weight:700">🎓 Apply for Admission</a></div>'
     +'<div class="sub" style="margin-top:10px;text-align:center"><a href="/scan">🛡 Staff: open the Clearance Scanner →</a></div>'
     +'<div style="margin-top:12px;text-align:center">🌐 '+PI18N.picker('color:#1e293b')+'</div>'
@@ -3447,6 +3483,42 @@ async function renderLogin(msg){
   if(msg){const e=box.querySelector('.err');e.textContent=msg;e.style.display='block';}
   const go=async()=>{if(locked){const e=box.querySelector('.err');e.textContent='This institution\\'s software is not activated. Contact your administrator.';e.style.display='block';return;}const login=box.querySelector('#lg').value.trim();const password=box.querySelector('#pw').value;if(!login||!password)return;const cmpEl=box.querySelector('#cmp');const campus_id=cmpEl?cmpEl.value:undefined;const btn=box.querySelector('#go');btn.disabled=true;btn.textContent='Signing in…';const r=await api('/api/login',{method:'POST',body:JSON.stringify({login,password,campus_id})});btn.disabled=false;btn.textContent='Sign In';if(!r.ok){const e=box.querySelector('.err');e.textContent=r.error||'Login failed.';e.style.display='block';return;}TOKEN=r.token;localStorage.setItem('ubu_token',TOKEN);renderApp();};
   box.querySelector('#go').onclick=go;
+  var rec=box.querySelector('#recover');if(rec)rec.onclick=function(e){e.preventDefault();recoverPassword();};
+  box.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',function(e){if(e.key==='Enter')go();}));
+}
+
+// Self-service first-time / forgot-password for students & parents — proves identity with the email/phone
+// on record (no reliance on the welcome email being received), then sets a password and signs them in.
+async function recoverPassword(){
+  let b={};try{b=await(await fetch('/api/branding')).json();}catch(_){}
+  const logo=b.logo?'<img class="blogo" src="'+b.logo+'" alt="logo">':'<div class="blogo mono">'+eh((b.short||'UB').slice(0,3))+'</div>';
+  document.getElementById('app').innerHTML='';
+  const box=$('<div class="login"><div class="card lbox">'
+    +'<div class="brandhead">'+logo+'<div><div class="uname">'+eh(b.name||'University Portal')+'</div><div class="umotto">Set / reset your password</div></div></div>'
+    +'<div class="err"></div><div class="ok2" style="display:none;color:#166534;background:#dcfce7;border-radius:9px;padding:10px 12px;margin-bottom:10px;font-size:13px"></div>'
+    +'<div class="sub" style="margin-bottom:10px;font-size:12.5px">Prove it is you with the email or phone number the school has on file, then choose a new password.</div>'
+    +'<div class="field"><label>I am a</label><select id="who"><option value="student">Student</option><option value="parent">Parent / Guardian</option></select></div>'
+    +'<div class="field"><label>Matric number / username</label><input id="rlg" autofocus></div>'
+    +'<div class="field"><label>Email or phone on your record</label><input id="rvf" placeholder="email or phone the school has for you"></div>'
+    +'<div class="field"><label>New password</label><input id="rpw" type="password" autocomplete="new-password"></div>'
+    +'<button class="btn" id="rgo">Set my password</button>'
+    +'<div class="sub" style="margin-top:12px;text-align:center"><a href="#" id="rback">← Back to sign in</a></div>'
+    +'</div></div>');
+  document.getElementById('app').appendChild(box);
+  const go=async()=>{
+    const e=box.querySelector('.err');e.style.display='none';
+    const login=box.querySelector('#rlg').value.trim(),verify=box.querySelector('#rvf').value.trim(),password=box.querySelector('#rpw').value,role=box.querySelector('#who').value;
+    if(!login||!verify||!password){e.textContent='Please fill in all the fields.';e.style.display='block';return;}
+    const btn=box.querySelector('#rgo');btn.disabled=true;btn.textContent='Setting…';
+    const r=await api('/api/portal/recover',{method:'POST',body:JSON.stringify({login:login,verify:verify,password:password,role:role})});
+    btn.disabled=false;btn.textContent='Set my password';
+    if(!r.ok){e.textContent=r.error||'Could not set your password.';e.style.display='block';return;}
+    const ok=box.querySelector('.ok2');ok.textContent='✓ Done! Your username is '+r.username+'. Signing you in…';ok.style.display='block';
+    const lr=await api('/api/login',{method:'POST',body:JSON.stringify({login:r.username,password:password})});
+    if(lr.ok){TOKEN=lr.token;localStorage.setItem('ubu_token',TOKEN);setTimeout(renderApp,700);}else{setTimeout(function(){renderLogin('Password set — please sign in.');},1200);}
+  };
+  box.querySelector('#rgo').onclick=go;
+  box.querySelector('#rback').onclick=function(ev){ev.preventDefault();renderLogin();};
   box.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',function(e){if(e.key==='Enter')go();}));
 }
 
