@@ -276,9 +276,59 @@ const REGISTRY = {
     webhookAuthentic() { return true; }, // Mollie has no webhook signature; the id is opaque and we always API re-verify it
     async ping() { if (!this.keys().secret) return { ok: false, message: 'No API key.' }; const r = await httpReq({ host: 'api.mollie.com', method: 'GET', path: '/v2/methods', headers: { Authorization: 'Bearer ' + this.keys().secret } }); return r.status === 200 ? { ok: true, message: 'Mollie key is valid' + (/^test_/.test(this.keys().secret) ? ' (TEST key).' : '.') } : { ok: false, message: (r.json && r.json.detail) || ('Mollie rejected the key (HTTP ' + r.status + ').') }; },
   },
+
+  // ---- MoMoPay (West-Africa CFA mobile money: MTN MoMo · Moov Money · Celtiis — via FedaPay) ----
+  // ONE "MoMoPay" checkout backed by the FedaPay aggregator, the common Benin gateway that uniquely
+  // covers Celtiis Cash alongside MTN MoMo + Moov Money (and cards) for XOF. The student is redirected to
+  // FedaPay's hosted page to pick their operator + enter their mobile-money number; we VERIFY the
+  // transaction server-side exactly like every other provider (the app/browser never asserts payment).
+  // TEST MODE switches to FedaPay's sandbox host + checkout domain (use an sk_sandbox_… key).
+  momopay: {
+    id: 'momopay', label: 'MoMoPay — MTN · Moov · Celtiis (Mobile Money)', region: 'West Africa (CFA)',
+    fields: [
+      { key: 'secret', setting: 'momopay_secret', env: 'MOMOPAY_SECRET', label: 'FedaPay secret key', placeholder: 'sk_live_… (or sk_sandbox_… for test)', secret: true, required: true },
+      { key: 'webhook', setting: 'momopay_webhook_secret', env: 'MOMOPAY_WEBHOOK_SECRET', label: 'Webhook secret (optional)', placeholder: 'wh_…', secret: true, required: false },
+    ],
+    keys() { return { secret: cfg('MOMOPAY_SECRET', 'momopay_secret'), webhook: cfg('MOMOPAY_WEBHOOK_SECRET', 'momopay_webhook_secret') }; },
+    host() { return isTestMode() ? 'sandbox-api.fedapay.com' : 'api.fedapay.com'; },
+    checkoutHost() { return isTestMode() ? 'sandbox-checkout.fedapay.com' : 'checkout.fedapay.com'; },
+    configured() { return !!this.keys().secret; },
+    _tx(j) { return j ? (j['v1/transaction'] || j.transaction || j.data || j) : null; },
+    async init(o) {
+      const auth = 'Bearer ' + this.keys().secret;
+      const parts = String(o.name || 'Student').trim().split(/\s+/); const first = parts.shift() || 'Student';
+      const customer = { firstname: first, lastname: parts.join(' ') || first, email: o.email };
+      // FedaPay XOF/XAF are zero-decimal → send the whole-franc integer amount.
+      const created = await httpReq({ host: this.host(), method: 'POST', path: '/v1/transactions', headers: { Authorization: auth }, body: {
+        description: (o.title || 'School Fees').slice(0, 250), amount: Math.round(Number(o.amount) || 0),
+        currency: { iso: String(o.currency || 'XOF').toUpperCase() }, callback_url: o.callback_url, customer,
+      } });
+      const tx = this._tx(created.json); const id = tx && tx.id;
+      if (!id) return { ok: false, error: (created.json && (created.json.message || (created.json.errors && JSON.stringify(created.json.errors)))) || 'Could not start the MoMoPay payment.' };
+      const tok = await httpReq({ host: this.host(), method: 'POST', path: '/v1/transactions/' + encodeURIComponent(id) + '/token', headers: { Authorization: auth } });
+      const url = (tok.json && tok.json.url) || (tok.json && tok.json.token ? ('https://' + this.checkoutHost() + '/checkout/' + tok.json.token) : null);
+      return url ? { ok: true, url, reference: o.reference, provider_ref: String(id) } : { ok: false, error: (tok.json && tok.json.message) || 'Could not get the MoMoPay checkout link.' };
+    },
+    async verify(txId) {
+      const r = await httpReq({ host: this.host(), method: 'GET', path: '/v1/transactions/' + encodeURIComponent(txId), headers: { Authorization: 'Bearer ' + this.keys().secret } });
+      const d = this._tx(r.json);
+      if (d && (d.status === 'approved' || d.status === 'transferred')) {
+        const cur = (d.currency && (d.currency.iso || d.currency.code)) || '';
+        return { ok: true, amount: Number(d.amount) || 0, currency: String(cur).toUpperCase(), reference: String(d.id || txId), metadata: d.custom_metadata || {} };
+      }
+      return { ok: false };
+    },
+    webhookRef(body) { const o = this._tx(body) || (body && (body.entity || (body.data && body.data.object))) || body; return (o && o.id) || null; },
+    webhookAuthentic(headers, rawBody) {
+      const secret = this.keys().webhook; if (!secret) return true; // no secret set → rely on the mandatory API re-verify (a forged webhook can't settle)
+      const sig = headers['x-fedapay-signature']; if (!sig || !rawBody) return false;
+      try { const parts = {}; String(sig).split(',').forEach(p => { const i = p.indexOf('='); if (i > 0) parts[p.slice(0, i).trim()] = p.slice(i + 1).trim(); }); const payload = parts.t ? (parts.t + '.' + rawBody) : rawBody; const expect = crypto.createHmac('sha256', secret).update(payload).digest('hex'); return timingEqual(parts.s || parts.v1 || sig, expect); } catch (_) { return false; }
+    },
+    async ping() { if (!this.keys().secret) return { ok: false, message: 'Enter the FedaPay secret key.' }; const r = await httpReq({ host: this.host(), method: 'GET', path: '/v1/currencies', headers: { Authorization: 'Bearer ' + this.keys().secret } }); return r.status === 200 ? { ok: true, message: 'MoMoPay (FedaPay) key is valid' + (isTestMode() ? ' (SANDBOX).' : '.') } : { ok: false, message: (r.json && r.json.message) || ('FedaPay rejected the key (HTTP ' + r.status + ').') }; },
+  },
 };
 
-const PROVIDER_ORDER = ['paystack', 'flutterwave', 'stripe', 'paypal', 'razorpay', 'mollie'];
+const PROVIDER_ORDER = ['paystack', 'flutterwave', 'momopay', 'stripe', 'paypal', 'razorpay', 'mollie'];
 function timingEqual(a, b) { try { const x = Buffer.from(String(a)); const y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); } catch (_) { return false; } }
 
 // ===========================================================================
@@ -295,6 +345,13 @@ function registryMeta() {
   return PROVIDER_ORDER.map(id => { const p = REGISTRY[id]; return { id, label: p.label, region: p.region, configured: p.configured(), fields: p.fields.map(f => ({ key: f.key, setting: f.setting, label: f.label, placeholder: f.placeholder, secret: !!f.secret, required: !!f.required, set: !!cfg(f.env, f.setting) })) }; });
 }
 function configured(provider) { return !!(REGISTRY[provider] && REGISTRY[provider].configured()); }
+/** Every app-setting key this gateway reads (all providers' fields + the global flags) — so a hub can
+ *  collect and forward the whole payment config to a remote portal (e.g. desktop → cloud) in one shot. */
+function payConfigKeys() {
+  const keys = new Set(['payments_test_mode', 'fees_bank']);
+  for (const id of PROVIDER_ORDER) for (const f of (REGISTRY[id].fields || [])) if (f.setting) keys.add(f.setting);
+  return Array.from(keys);
+}
 async function init(provider, o = {}) {
   const p = REGISTRY[provider]; if (!p) return { ok: false, error: 'Unknown payment provider.' };
   if (!p.configured()) return { ok: false, error: REGISTRY[provider].label + ' is not configured.' };
@@ -313,7 +370,7 @@ function webhookAuthentic(provider, headers, rawBody) { const p = REGISTRY[provi
 async function ping(provider) { const p = REGISTRY[provider]; if (!p) return { ok: false, message: 'Unknown provider.' }; try { return await p.ping(); } catch (_) { return { ok: false, message: 'Could not reach the provider.' }; } }
 
 module.exports = {
-  providers, registryMeta, configured, init, verify, webhookRef, webhookAuthentic, ping, configure, isTestMode,
+  providers, registryMeta, configured, init, verify, webhookRef, webhookAuthentic, ping, configure, isTestMode, payConfigKeys,
   // pure helpers (unit-tested)
   toMinor, fromMinor, amountString, decimalsFor, formEncode, timingEqual, REGISTRY, PROVIDER_ORDER,
 };
