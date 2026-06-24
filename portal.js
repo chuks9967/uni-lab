@@ -2336,11 +2336,14 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       if (newPassword.length < 5) return J(res, 200, { ok: false, error: 'Your new password must be at least 5 characters.' });
       let stu = null;
       for (const s of all('students')) { if (s.deleted) continue; if ([s.matric_no, s.portal_username, s.email, s.parent_portal_username, s.parent_email].some(v => (v || '').toLowerCase() === login)) { stu = s; break; } }
-      if (!stu) { loginFailed(key); return J(res, 200, { ok: false, error: 'No student record matches that matric number / username.' }); }
+      // GENERIC failure for BOTH "no such matric" and "contact mismatch" — never leak which matric numbers
+      // exist or which contact field is correct (anti-enumeration). Rate-limited above.
+      const fail = () => { loginFailed(key); return J(res, 200, { ok: false, error: 'We could not verify those details. Check your matric number and the exact email or phone the school has on your record, or contact the school office.' }); };
+      if (!stu) return fail();
       // identity proof: the value they typed must match a contact field on file (student or parent set)
       const known = (asParent ? [stu.parent_email, stu.parent_phone, stu.parent_whatsapp] : [stu.email, stu.phone, stu.whatsapp, stu.parent_email])
         .map(v => (v || '').replace(/\s/g, '').toLowerCase()).filter(Boolean);
-      if (!known.includes(verify.replace(/\s/g, ''))) { loginFailed(key); return J(res, 200, { ok: false, error: 'That email/phone does not match your record. Please contact the school office to reset it.' }); }
+      if (!known.includes(verify.replace(/\s/g, ''))) return fail();
       if (typeof update !== 'function') return J(res, 200, { ok: false, error: 'Password reset is unavailable on this server — try again when online.' });
       loginOk(key);
       if (asParent) {
