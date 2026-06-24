@@ -340,6 +340,35 @@ function providers() {
   return PROVIDER_ORDER.filter(id => REGISTRY[id] && REGISTRY[id].configured())
     .map(id => ({ id, label: REGISTRY[id].label + (test ? ' · TEST MODE' : ''), region: REGISTRY[id].region, test }));
 }
+/** The admin's per-currency provider allow-list: { "USD":["paypal","stripe"], "NGN":["paystack"], … }.
+ *  Stored as one JSON app-setting (`currency_providers`) so it rides the same desktop→hub config push as
+ *  the merchant keys. A currency that is absent (or maps to an empty array) means "offer every configured
+ *  gateway" — fully backward-compatible with deployments that never assigned methods to a currency. */
+function currencyProviderMap() {
+  const raw = cfg('CURRENCY_PROVIDERS', 'currency_providers');
+  if (!raw) return {};
+  try { const o = JSON.parse(raw); if (!o || typeof o !== 'object') return {}; const out = {}; for (const k of Object.keys(o)) { if (Array.isArray(o[k])) out[String(k).toUpperCase()] = o[k].map(x => String(x).toLowerCase()); } return out; }
+  catch (_) { return {}; }
+}
+/** Allow-list of provider ids for a currency, or null when the currency has no assignment. */
+function allowFor(currency) {
+  const cur = String(currency || '').toUpperCase();
+  const map = currencyProviderMap();
+  const a = cur && Array.isArray(map[cur]) ? map[cur] : null;
+  return (a && a.length) ? a : null;
+}
+/** The configured providers a student may use to pay in `currency` — honouring the admin's assignment
+ *  (intersected with what is actually configured), or every configured gateway when none is assigned. */
+function providersForCurrency(currency) {
+  const list = providers();
+  const allow = allowFor(currency);
+  return allow ? list.filter(p => allow.includes(p.id)) : list;
+}
+/** Is `provider` an accepted online-payment method for `currency`? (enforced on /api/pay/init.) */
+function providerAllowedForCurrency(provider, currency) {
+  const allow = allowFor(currency);
+  return allow ? allow.includes(String(provider || '').toLowerCase()) : true;
+}
 /** Full registry metadata (every provider + its fields + configured/required) for the admin config UI. */
 function registryMeta() {
   return PROVIDER_ORDER.map(id => { const p = REGISTRY[id]; return { id, label: p.label, region: p.region, configured: p.configured(), fields: p.fields.map(f => ({ key: f.key, setting: f.setting, label: f.label, placeholder: f.placeholder, secret: !!f.secret, required: !!f.required, set: !!cfg(f.env, f.setting) })) }; });
@@ -348,7 +377,7 @@ function configured(provider) { return !!(REGISTRY[provider] && REGISTRY[provide
 /** Every app-setting key this gateway reads (all providers' fields + the global flags) — so a hub can
  *  collect and forward the whole payment config to a remote portal (e.g. desktop → cloud) in one shot. */
 function payConfigKeys() {
-  const keys = new Set(['payments_test_mode', 'fees_bank']);
+  const keys = new Set(['payments_test_mode', 'fees_bank', 'currency_providers']);
   for (const id of PROVIDER_ORDER) for (const f of (REGISTRY[id].fields || [])) if (f.setting) keys.add(f.setting);
   return Array.from(keys);
 }
@@ -371,6 +400,8 @@ async function ping(provider) { const p = REGISTRY[provider]; if (!p) return { o
 
 module.exports = {
   providers, registryMeta, configured, init, verify, webhookRef, webhookAuthentic, ping, configure, isTestMode, payConfigKeys,
+  // per-currency accepted methods
+  providersForCurrency, providerAllowedForCurrency, currencyProviderMap,
   // pure helpers (unit-tested)
   toMinor, fromMinor, amountString, decimalsFor, formEncode, timingEqual, REGISTRY, PROVIDER_ORDER,
 };
