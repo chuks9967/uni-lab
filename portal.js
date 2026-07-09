@@ -127,6 +127,21 @@ module.exports = function createPortal(deps) {
     if (frameRelay) { try { const b = await frameRelay.getBytes(examId, sid, kind); if (b && b.data) return b; } catch (_) {} }
     return null;
   }
+  // GC the per-exam in-memory proctoring maps. Each holds up to 20 base64 frames × N students; without
+  // this they accumulate for EVERY exam ever run and never free — a slow memory leak on a long-running hub
+  // (a real low-RAM / production concern). Runs on the 180s reconcile cycle; drops anything idle > 3h.
+  const FRAME_TTL_MS = 3 * 60 * 60 * 1000;
+  function gcExamFrames() {
+    const now = Date.now();
+    for (const examId in examFrames) {
+      const studs = examFrames[examId]; let newest = 0;
+      for (const sid in studs) { const tts = (studs[sid] && studs[sid].ts) || 0; if (tts > newest) newest = tts; }
+      if (!newest || now - newest > FRAME_TTL_MS) delete examFrames[examId];
+    }
+    for (const k in lastFrameTs) if (now - lastFrameTs[k] > FRAME_TTL_MS) delete lastFrameTs[k];
+    for (const k in lastRelayTs) if (now - lastRelayTs[k] > FRAME_TTL_MS) delete lastRelayTs[k];
+    for (const k in frameClient) { const fc = frameClient[k]; if (!fc || now - (fc.seen || 0) > FRAME_TTL_MS) delete frameClient[k]; }
+  }
 
   // ---- login brute-force throttle (in-memory; keyed per login+IP) ----
   // The portal is network-facing and its HMAC tokens are stateless (no server session store to lean on),
@@ -205,6 +220,16 @@ module.exports = function createPortal(deps) {
   function faceFile(rel) { for (const root of faceRoots) { const fp = path.join(root, rel); try { if (fs.existsSync(fp)) return fp; } catch (_) {} } return null; }
   function winState(now, start, end) { const n = now || Date.now(); const s = start ? Date.parse(start) : null, e = end ? Date.parse(end) : null; if (s && n < s) return 'upcoming'; if (e && n > e) return 'closed'; return 'open'; }
   function seededShuffle(seed, arr) { const a = (arr || []).slice(); let s = 0; const str = String(seed || ''); for (let i = 0; i < str.length; i++) s = (s * 31 + str.charCodeAt(i)) >>> 0; s = s || 1; const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+  // Combine saved answers with an incoming autosave/submit. When the client sends its COMPLETE current set
+  // (`full:true`) we REPLACE — so "Clear response" actually removes the answer server-side (a plain merge
+  // can never delete a key, so a cleared question silently stayed answered and got graded). Legacy clients
+  // without the flag keep the safe delta-merge so a partial save never wipes existing answers.
+  function mergeExamAnswers(at, body) {
+    const incoming = (body && body.answers && typeof body.answers === 'object' && !Array.isArray(body.answers)) ? body.answers : {};
+    if (body && body.full === true) return incoming;
+    let ans = {}; try { ans = JSON.parse((at && at.answers) || '{}'); } catch (_) {}
+    Object.assign(ans, incoming); return ans;
+  }
   // the public base URL of THIS request (https://host) — used to print absolute,
   // scannable verification URLs in the QR on receipts/payslips. Set per request.
   let docBase = '';
@@ -300,8 +325,7 @@ module.exports = function createPortal(deps) {
     // Merge LIVE-NOW sessions a host just started (≤3h): mark matching allocation classes live, and add
     // any cohort/ad-hoc session whose room isn't an allocation class — so a class a lecturer started
     // REFLECTS on the student app immediately and is joinable, even without a course allocation.
-    const liveCut = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
-    const liveSessions = all('live_sessions').filter(v => !v.deleted && v.active && v.department_id === s.department_id && v.level_id === s.level_id && String(v.started_at || '') >= liveCut);
+    const liveSessions = all('live_sessions').filter(v => v.department_id === s.department_id && v.level_id === s.level_id && isSessionLive(v));
     const liveRooms = new Set(liveSessions.map(v => v.room));
     for (const c of out) if (liveRooms.has(c.room)) { c.live = true; c.when = 'Live now'; }
     for (const v of liveSessions) {
@@ -386,8 +410,8 @@ module.exports = function createPortal(deps) {
   function lcTok(){try{return new URLSearchParams(location.search).get('t')||localStorage.getItem('ubu_token')||'';}catch(e){return '';}}
   // The host ENDS the class for the whole cohort when they leave/close, so it stops on the students' APK
   // too. sendBeacon survives the page unload; the token comes from ?t= (native app) or localStorage (web).
-  var lcEndSent=false;
-  function lcEndClass(){if(lcEndSent||!isHost||!LC_ROOM)return;lcEndSent=true;try{navigator.sendBeacon('/api/class-end?t='+encodeURIComponent(lcTok())+'&room='+encodeURIComponent(LC_ROOM));}catch(e){}}
+  var lcEndSent=false,lcHbT=null;
+  function lcEndClass(){if(lcEndSent||!isHost||!LC_ROOM)return;lcEndSent=true;try{clearInterval(lcHbT);}catch(e){}try{navigator.sendBeacon('/api/class-end?t='+encodeURIComponent(lcTok())+'&room='+encodeURIComponent(LC_ROOM));}catch(e){}}
   function fail(){var e=document.getElementById('err');if(e)e.style.display='block';var m=document.getElementById('meet');if(m)m.style.display='none';}
   if(typeof JitsiMeetExternalAPI!=='function'){fail();return;}
   try{
@@ -409,7 +433,13 @@ module.exports = function createPortal(deps) {
       api.addEventListener('videoConferenceJoined',function(){
         try{api.executeCommand('subject',LC_SUBJ);}catch(e){}
         try{api.executeCommand('toggleLobby',true);}catch(e){}
-        if(LC_ROOM){try{fetch('/api/class-start?t='+encodeURIComponent(lcTok())+'&room='+encodeURIComponent(LC_ROOM)+'&subject='+encodeURIComponent(LC_SUBJ),{method:'POST'});}catch(e){}}
+        if(LC_ROOM){
+          try{fetch('/api/class-start?t='+encodeURIComponent(lcTok())+'&room='+encodeURIComponent(LC_ROOM)+'&subject='+encodeURIComponent(LC_SUBJ),{method:'POST'});}catch(e){}
+          // HEARTBEAT: keep the session alive every 30s so "Live now" clears within ~2min of the host
+          // leaving even if the end-beacon is missed (crash / tab killed). hb=1 only refreshes; never re-notifies.
+          try{clearInterval(lcHbT);}catch(e){}
+          lcHbT=setInterval(function(){try{fetch('/api/class-start?t='+encodeURIComponent(lcTok())+'&room='+encodeURIComponent(LC_ROOM)+'&hb=1',{method:'POST'});}catch(e){}},30000);
+        }
       });
     } else {
       // A student knocks; show a waiting message until the lecturer admits them.
@@ -461,9 +491,8 @@ module.exports = function createPortal(deps) {
       add('timetable', '🗓', 'Timetable published', t.title || 'A new timetable is available', t.published_at, 'timetable', '/doc/timetable/' + t.id);
     for (const a of all('allocation_sets').filter(a => !a.deleted && a.status === 'published' && a.department_id === s.department_id && a.level_id === s.level_id))
       add('allocation', '👩‍🏫', 'Course allocation published', a.title || 'Lecturers have been assigned to your courses', a.published_at, 'liveclasses', null);
-    // a class that went live in the last 3 hours — surfaces in Updates with a tap-through to Live Classes
-    const liveCut = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
-    for (const v of all('live_sessions').filter(v => !v.deleted && v.active && v.department_id === s.department_id && v.level_id === s.level_id && String(v.started_at || '') >= liveCut))
+    // a class that is live right now — surfaces in Updates with a tap-through to Live Classes
+    for (const v of all('live_sessions').filter(v => v.department_id === s.department_id && v.level_id === s.level_id && isSessionLive(v)))
       add('liveclass', '🔴', 'Live class started', (v.subject || v.course_code || 'A class') + ' is live now — open Live Classes to join', v.started_at, 'liveclasses', null);
     for (const v of all('exam_validations').filter(v => v.student_id === s.id))
       add('clearance', '✅', 'Examination clearance update', (v.status === 'valid' ? 'You have been cleared for exams' : 'Your clearance status changed') + (v.reason ? ' — ' + v.reason : ''), v.created_at, 'clearance', null);
@@ -473,6 +502,22 @@ module.exports = function createPortal(deps) {
       add('surveillance', '🛡️', 'Exam conduct notice', (MALPRACTICE_LABELS[f.type] || 'A conduct alert was recorded') + ' — tap to see the evidence and appeal if it was a mistake', f.occurred_at || f.created_at, 'surveillance', null);
     for (const e of all('online_exams').filter(e => examVisibleTo(e, s)))
       add('exam', '📝', 'Online exam: ' + (e.title || e.course_code || 'Exam'), (e.start_at ? 'Scheduled ' + fmtDate(e.start_at) : 'Open now') + ' — tap to open it in the Exams tab', e.published_at || e.created_at, 'exam', null);
+    // 🎫 ticket progress (missing results / payments not reflecting) — every timeline event surfaces
+    // here so the student follows the fix in Updates even without device push.
+    {
+      const tnoOf = (rid, pfx) => pfx + '-' + String(rid || '').replace(/-/g, '').slice(-6).toUpperCase();
+      const myReq = new Map(); // request_id → {pfx, label}
+      for (const r of all('result_fix_requests')) if (!r.deleted && r.student_id === s.id) myReq.set(r.id, { pfx: 'RT', label: r.course_code || 'result' });
+      for (const r of all('payment_fix_requests')) if (!r.deleted && r.student_id === s.id) myReq.set(r.id, { pfx: 'PT', label: 'payment' });
+      if (myReq.size) {
+        const TICON = { open: '🎫', auto_fixed: '✅', recorded: '✅', resolved: '✅', not_found: '👤', rejected: '🎫', not_uploaded: '⏳' };
+        for (const e of all('ticket_events')) {
+          if (e.deleted || !myReq.has(e.request_id)) continue;
+          const m = myReq.get(e.request_id);
+          out.push({ id: 'ticket:' + e.id, type: 'ticket', icon: TICON[e.status] || '🎫', title: `Ticket ${tnoOf(e.request_id, m.pfx)} (${m.label})`, text: e.message || e.status || 'Updated', date: e.created_at, seg: 'results', doc: null });
+        }
+      }
+    }
     // Graduation FINAL CLEARANCE — request, every completed step, and the outcome (also pushed to the device).
     const fcl = all('grad_clearances').filter(c => !c.deleted && c.student_id === s.id).sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))[0];
     if (fcl) {
@@ -1011,7 +1056,7 @@ var EX=(function(){
   function persistLocal(){try{localStorage.setItem(lsKey(),JSON.stringify({a:answers,m:marked,t:Date.now()}));}catch(_){}}
   function loadLocal(){try{var raw=localStorage.getItem(lsKey());return raw?JSON.parse(raw):null;}catch(_){return null;}}
   function scheduleSave(){persistLocal();markSaved('Saving…');if(saveT)return;saveT=setTimeout(function(){saveT=null;saveAnswers();},1500);}
-  function saveAnswers(){persistLocal();if(!attemptId)return;markSaved('Saving…');api('/api/exam/answer',{attempt_id:attemptId,answers:answers}).then(function(r){markSaved(r&&r.ok?'Saved ✓':'Saved on device','ok');}).catch(function(){markSaved('Offline — saved on device','warn');setConn();});}
+  function saveAnswers(){persistLocal();if(!attemptId)return;markSaved('Saving…');api('/api/exam/answer',{attempt_id:attemptId,answers:answers,full:true}).then(function(r){if(r&&r.expired){return submit(true);}markSaved(r&&r.ok?'Saved ✓':'Saved on device','ok');}).catch(function(){markSaved('Offline — saved on device','warn');setConn();});}
   // ---- clock ----
   function startClock(){tick();clockT=setInterval(tick,1000);}
   function tick(){var ms=endsAt-Date.now();if(ms<=0){ms=0;qs('clock').textContent='00:00';return submit(true);}var s=Math.floor(ms/1000),m=Math.floor(s/60);qs('clock').textContent=(m<10?'0':'')+m+':'+((s%60)<10?'0':'')+(s%60);if(ms<60000)qs('clock').classList.add('low');}
@@ -1053,7 +1098,7 @@ var EX=(function(){
   function submit(auto){
     if(!attemptId)return;if(!auto&&!confirm('Submit your exam now? You will not be able to change your answers.'))return;
     started=false;var was=attemptId;attemptId=null;
-    api('/api/exam/submit',{attempt_id:was,answers:answers,auto:!!auto}).then(function(){}).catch(function(){});
+    api('/api/exam/submit',{attempt_id:was,answers:answers,auto:!!auto,full:true}).then(function(){}).catch(function(){});
     stopAll();show('done');
   }
   function stopAll(){try{clearInterval(clockT);}catch(_){}try{clearTimeout(proctorT);}catch(_){}try{if(document.fullscreenElement)document.exitFullscreen();}catch(_){}try{if(stream)stream.getTracks().forEach(function(t){t.stop();});}catch(_){}}
@@ -1090,15 +1135,60 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     const rows = Object.values(ddMap)
       .map(r => { const gp = Number(r.grade_point) || 0, cu = Number(r.credit_unit) || 0; return { course_code: r.course_code, course_title: r.course_title, credit_unit: cu, test_score: r.test_score, exam_score: r.exam_score, score: r.score, grade: r.grade, grade_point: gp, co: gp * cu, session_id: r.session_id, semester_id: r.semester_id, session: nameOf('academic_sessions', r.session_id), semester: nameOf('semesters', r.semester_id), date: r.created_at }; })
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
-    const gpaOf = (list) => { let qp = 0, u = 0; for (const s of list) { qp += s.grade_point * s.credit_unit; u += s.credit_unit; } return { gpa: u ? Math.round((qp / u) * 100) / 100 : 0, units: u }; };
+    // a blank/ungraded course (grade null — student did not sit, or the mark is not yet recorded) is
+    // EXCLUDED from GPA/CGPA; counting its units at zero points would silently penalise it as an F.
+    const graded = (s) => s && s.grade != null && String(s.grade).trim() !== '';
+    const gpaOf = (list) => { let qp = 0, u = 0; for (const s of list) { if (!graded(s)) continue; qp += s.grade_point * s.credit_unit; u += s.credit_unit; } return { gpa: u ? Math.round((qp / u) * 100) / 100 : 0, units: u }; };
     const groups = {};
     for (const r of rows) { const k = `${r.session_id || ''}|${r.semester_id || ''}`; (groups[k] = groups[k] || { session: r.session, semester: r.semester, session_id: r.session_id, semester_id: r.semester_id, list: [] }).list.push(r); }
     // chronological (ascending) so we can carry a running CGPA per semester
     const ordered = Object.values(groups).sort((a, b) => String((a.list[0] || {}).date).localeCompare(String((b.list[0] || {}).date)));
     let cumQp = 0, cumU = 0;
-    const semesters = ordered.map(g => { const b = gpaOf(g.list); cumQp += g.list.reduce((x, c) => x + c.grade_point * c.credit_unit, 0); cumU += b.units; return { session: g.session, semester: g.semester, session_id: g.session_id, semester_id: g.semester_id, courses: g.list, ...b, cgpa: cumU ? Math.round((cumQp / cumU) * 100) / 100 : 0 }; });
+    const semesters = ordered.map(g => { const b = gpaOf(g.list); cumQp += g.list.reduce((x, c) => x + (graded(c) ? c.grade_point * c.credit_unit : 0), 0); cumU += b.units; return { session: g.session, semester: g.semester, session_id: g.session_id, semester_id: g.semester_id, courses: g.list, ...b, cgpa: cumU ? Math.round((cumQp / cumU) * 100) / 100 : 0 }; });
     const overall = gpaOf(rows);
     return { courses: rows, semesters, cgpa: overall.gpa, totalUnits: overall.units };
+  }
+  // The courses a student is REGISTERED to offer (auto-linked from Academic Planning) + which of those
+  // still have no released result (awaiting). Lets the student see their course list and track which
+  // results are still to come. Borrowed/dropped rows are excluded from "awaiting".
+  function registeredCoursesFor(sid) {
+    const codeK = (s) => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const regs = all('course_registrations').filter(r => r.student_id === sid && !r.deleted && r.status === 'registered');
+    if (!regs.length) return { courses: [], awaiting: [] };
+    const scores = all('student_scores').filter(r => r.student_id === sid && !r.deleted);
+    const releasedByCode = {}; const unreleased = new Set();
+    for (const s of scores) { const k = codeK(s.course_code); if (Number(s.released) !== 0) releasedByCode[k] = s; else if (s.batch_id !== 'autogen') unreleased.add(k); }
+    // per-course status so the student can SEE which results are published, recorded, uploaded-but-not-
+    // yet-linked, or simply not uploaded — and report anything wrong. Batch→course code via the courses
+    // table; an entry LINKED to me = recorded; any batch for the course = uploaded.
+    const courseCodeById = new Map(all('courses').map(c => [c.id, codeK(c.code)]));
+    const uploadedCodes = new Set(); const publishedCodes = new Set();
+    for (const b of all('result_batches')) { if (b.deleted) continue; const cc = courseCodeById.get(b.course_id); if (cc) { uploadedCodes.add(cc); if (b.status === 'published') publishedCodes.add(cc); } }
+    const myLinkedCodes = new Set();
+    // resolve my linked entries → their course code (via batch → course)
+    const batchCode = new Map(all('result_batches').map(b => [b.id, courseCodeById.get(b.course_id)]));
+    for (const e of all('result_entries')) { if (e.deleted || e.student_id !== sid) continue; const cc = batchCode.get(e.batch_id); if (cc) myLinkedCodes.add(cc); }
+    const tnoOf = (id, pfx) => (pfx || 'RT') + '-' + String(id || '').replace(/-/g, '').slice(-6).toUpperCase();
+    const reqByCode = {};
+    for (const r of all('result_fix_requests')) { if (r.deleted || r.student_id !== sid) continue; const k = codeK(r.course_code); if (!reqByCode[k] || String(r.updated_at) > String(reqByCode[k].updated_at)) reqByCode[k] = r; }
+    const byCode = {};
+    for (const r of regs) { const k = codeK(r.course_code) || r.course_id; if (!k || byCode[k]) continue; byCode[k] = r; }
+    const courses = Object.values(byCode).map(r => {
+      const ck = codeK(r.course_code);
+      let status;
+      if (releasedByCode[ck]) status = 'published';
+      else if (myLinkedCodes.has(ck) || unreleased.has(ck)) status = 'recorded';
+      // the course's sheet was uploaded — if that sheet is already PUBLISHED and this student is not
+      // on it, their row is definitively MISSING (absent / not written / misread), not "processing"
+      else if (uploadedCodes.has(ck)) status = publishedCodes.has(ck) ? 'missing' : 'uploaded';
+      else status = 'not_uploaded';
+      const rq = reqByCode[ck];
+      const pub = releasedByCode[ck];
+      return { course_code: r.course_code, course_title: r.course_title, credit_unit: Number(r.credit_unit) || 0, kind: r.kind, status, hasResult: status === 'published', score: pub ? pub.score : null, grade: pub ? pub.grade : null, request: rq ? { status: rq.status, resolution: rq.resolution, kind: rq.kind, ticket_no: tnoOf(rq.id, 'RT') } : null };
+    }).sort((a, b) => String(a.course_code).localeCompare(String(b.course_code)));
+    // "awaiting" = a REQUIRED course (core/carry-over) with no released result yet
+    const awaiting = courses.filter(c => (c.kind === 'core' || c.kind === 'carryover') && !c.hasResult);
+    return { courses, awaiting };
   }
   const ROLE_OFFICE = { registrar: 'Office of the Registrar', accountant: 'Office of the Bursar', dean: 'Office of the Faculty Head', admin: 'Administration', student_affairs: 'Office of Student Affairs', hod: 'Office of the Head of Department' };
   // an HOD-issued receipt names the department; falls back to the plain office label
@@ -1192,6 +1282,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       validations,
       results: all('results').filter(r => r.student_id === s.id).map(r => ({ id: r.id, title: r.title, level: nameOf('levels', r.level_id), semester: nameOf('semesters', r.semester_id), session: nameOf('academic_sessions', r.session_id), gpa: r.gpa, remark: r.remark, mime: r.mime, date: r.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       scores: scoresFor(s.id),
+      registeredCourses: registeredCoursesFor(s.id),
       timetables: myTimetables,
       allocations: myAllocations,
       liveClasses: liveClassesForStudent(s),
@@ -2097,6 +2188,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
    *  the ones that actually paid; give up on very old ones. Safe to call on an interval. Idempotent. */
   async function reconcileIntents(opts) {
     opts = opts || {};
+    try { gcExamFrames(); } catch (_) {}   // free idle proctoring frames every cycle (prevents a slow leak)
     if (!gateway || typeof all !== 'function') return { checked: 0, settled: 0 };
     const now = Date.now();
     const minAge = (opts.minAgeMin != null ? opts.minAgeMin : 2) * 60000;   // let callback/webhook try first
@@ -2188,17 +2280,26 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
   // submitted (the student closed the app/lost connection at the buzzer). Without this its autosaved
   // answers would stay 'in_progress' forever — never graded — unless an officer manually ends the
   // sitting. Marks it 'auto_submitted' (keeping the saved answers) so it enters the grading queue.
+  // Authoritative end-of-time for ONE attempt (epoch ms): started_at + (duration + per-student extension),
+  // capped by the exam's hard window end. SINGLE SOURCE OF TRUTH for the clock — the client countdown is
+  // only a mirror, so a tampered device clock can't buy extra time. Returns 0 if it can't be computed.
+  function attemptDeadlineMs(e, at) {
+    if (!e || !at) return 0;
+    let st = {}; try { st = JSON.parse(e.settings || '{}'); } catch (_) {}
+    const startedMs = Date.parse(at.started_at || at.created_at || '') || 0; if (!startedMs) return 0;
+    const extraMin = (st.extensions && Number(st.extensions[at.student_id])) || 0;
+    const durEnd = startedMs + ((Number(e.duration_min) || 60) + extraMin) * 60000;
+    const winEnd = e.end_at ? Date.parse(e.end_at) + extraMin * 60000 : durEnd;
+    return Math.min(durEnd, winEnd);
+  }
+  const DEADLINE_GRACE_MS = 10000;   // tolerate clock skew / an in-flight autosave at the buzzer
   function autoCloseExpiredAttempts(e) {
     if (!e || !e.id || typeof update !== 'function') return 0;
-    let st = {}; try { st = JSON.parse(e.settings || '{}'); } catch (_) {}
     const now = Date.now(); let closed = 0;
     for (const a of all('exam_attempts')) {
       if (a.deleted || a.exam_id !== e.id || a.status !== 'in_progress') continue;
-      const startedMs = Date.parse(a.started_at || a.created_at || '') || 0; if (!startedMs) continue;
-      const extraMin = (st.extensions && Number(st.extensions[a.student_id])) || 0;
-      const durEnd = startedMs + ((Number(e.duration_min) || 60) + extraMin) * 60000;
-      const winEnd = e.end_at ? Date.parse(e.end_at) + extraMin * 60000 : durEnd;
-      if (now > Math.min(durEnd, winEnd) + 10000) {   // +10s grace for clock skew / in-flight autosave
+      const deadline = attemptDeadlineMs(e, a); if (!deadline) continue;
+      if (now > deadline + DEADLINE_GRACE_MS) {
         update('exam_attempts', a.id, { status: 'auto_submitted', submitted_at: new Date().toISOString() });
         closed++;
       }
@@ -2209,11 +2310,25 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
   // so the live_sessions row stays active=1 forever. Mark any active session older than the live window
   // (3h) inactive at the SOURCE, so the lecturer's desktop, the sync state and pushes never treat a long-
   // abandoned class as still live. Idempotent.
+  const LIVE_WINDOW_MS = 3 * 60 * 60 * 1000;   // legacy fallback for a host that doesn't heartbeat
+  const HB_STALE_MS = 110 * 1000;              // a heartbeating host is "gone" ~110s after its last beat (≈3 missed)
+  // Is a live_sessions row REALLY live right now? A host that sends heartbeats (the portal /class page pings
+  // every ~30s) is judged by its LAST heartbeat, so "Live now" clears within ~2min of the host leaving even
+  // when the best-effort end-beacon was missed (crash / tab killed / phone died) — the live-class analog of
+  // the exam's server-authoritative timeout. A session with no heartbeat (desktop-hosted / an older host)
+  // keeps the legacy 3h window, so nothing regresses.
+  function isSessionLive(v, now) {
+    if (!v || v.deleted || !v.active) return false;
+    now = now || Date.now();
+    if (v.heartbeat_at) return (now - (Date.parse(v.heartbeat_at) || 0)) < HB_STALE_MS;
+    return (now - (Date.parse(v.started_at || '') || 0)) < LIVE_WINDOW_MS;
+  }
   function sweepStaleLive() {
     if (typeof update !== 'function') return 0;
-    const cap = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
-    let n = 0;
-    for (const v of all('live_sessions')) { if (!v.deleted && v.active && String(v.started_at || '') < cap) { update('live_sessions', v.id, { active: 0 }); n++; } }
+    const now = Date.now(); let n = 0;
+    // end any session that is no longer live AT THE SOURCE, so active=0 syncs to the desktop + APK and the
+    // students' /class page auto-leaves. Covers both a heartbeat that stopped and the legacy 3h cap.
+    for (const v of all('live_sessions')) { if (!v.deleted && v.active && !isSessionLive(v, now)) { update('live_sessions', v.id, { active: 0 }); n++; } }
     return n;
   }
 
@@ -2301,12 +2416,11 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     // class a student opened with no host session is never force-closed. (Room id is a secret capability.)
     if (p === '/api/class-live' && method === 'GET') {
       const room = u.searchParams.get('room') || '';
-      sweepStaleLive();   // end any long-abandoned (>3h) live session at the source
+      sweepStaleLive();   // end any abandoned (heartbeat stopped, or >3h) live session at the source
       const now = Date.now();
-      const liveCut = new Date(now - 3 * 60 * 60 * 1000).toISOString();
       const recentCut = new Date(now - 12 * 60 * 60 * 1000).toISOString();
       const rows = all('live_sessions').filter(v => !v.deleted && v.room === room && String(v.started_at || '') >= recentCut);
-      const live = rows.some(v => v.active && String(v.started_at || '') >= liveCut);
+      const live = rows.some(v => isSessionLive(v, now));
       const ended = !live && rows.length > 0;
       return J(res, 200, { ok: true, live, ended });
     }
@@ -2662,6 +2776,34 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       return H(res, 200, payResultPage(okPaid, paidText));
     }
 
+    // 📱 PAY STATUS (native app poll) → after the checkout WebView closes, the app polls this with its
+    // reference to CONFIRM the payment reliably: it returns the settled receipt if one exists, else
+    // actively RE-VERIFIES the intent against the gateway (so a payment settles even if the student
+    // closed the WebView before the redirect, or the webhook is slow). Student-scoped + idempotent.
+    if (p === '/api/pay/status' && method === 'GET') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student.' });
+      const s = accountById('student', t.id); if (!s) return J(res, 401, { ok: false });
+      const reference = u.searchParams.get('reference') || '';
+      const intent = intentByReference(reference);
+      if (!intent || intent.student_id !== s.id) return J(res, 200, { ok: true, status: 'unknown' });
+      const receiptFor = (pid) => { const pm = pid ? one('payments', pid) : null; return pm && !pm.deleted ? { id: pm.id, receipt_no: pm.receipt_no, amount: pm.amount, currency: pm.currency, category: pm.category } : null; };
+      // already settled → return the receipt straight away
+      if (intent.payment_id) { const rc = receiptFor(intent.payment_id); if (rc) return J(res, 200, { ok: true, status: 'paid', receipt: rc }); }
+      // not settled yet → actively verify with the provider (the same source of truth the callback uses)
+      const provider = pickProvider(intent.provider);
+      if (provider && gateway) {
+        const ref = resolveVerifyRef(provider, {}, intent);
+        try {
+          const v = await gateway.verify(provider, ref);
+          if (v && v.ok) {
+            const out = await settlePayment(provider, v, intent);
+            if (out && out.ok) { const fresh = intentByReference(reference); const rc = receiptFor(fresh && fresh.payment_id); return J(res, 200, { ok: true, status: 'paid', receipt: rc || (out.payment ? { id: out.payment.id, receipt_no: out.payment.receipt_no, amount: out.payment.amount, currency: out.payment.currency } : null) }); }
+          }
+        } catch (_) { /* provider unreachable — report pending, the webhook/sweep will settle it */ }
+      }
+      return J(res, 200, { ok: true, status: String(intent.status) === 'paid' ? 'paid' : 'pending', reference });
+    }
+
     // webhook → the provider's server-to-server notification (the robust confirmation path: it fires even
     // if the student closes the WebView before the redirect). We re-verify via the gateway API before
     // settling, so a forged/replayed webhook can never create or duplicate a payment. Always ack 200.
@@ -2712,6 +2854,86 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const nm = `${s.first_name || ''} ${s.last_name || ''}`.trim();
       for (const role of ['registrar', 'admin', 'ict']) create('notifications', { id: crypto.randomUUID(), target_user: null, target_role: role, title: 'New transcript request 📜', body: `${nm} requested an official ${kind}.`, type: 'system', payload: JSON.stringify({ request_id: id }), is_read: 0, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
       return J(res, 200, { ok: true, request: { id, kind, status: 'pending', date: now } });
+    }
+
+    // 🔎 A student reports a MISSING result or a WRONG score for a registered course. Creates a synced
+    // result_fix_requests row (reverse-syncs to the desktop) where the AI locates the uploaded row and
+    // auto-links it (or flags it for a human). Notifies the registrar/ICT.
+    if (p === '/api/result-issue' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student to report a result.' });
+      const s = accountById('student', t.id); if (!s) return J(res, 401, { ok: false });
+      if (typeof create !== 'function') return J(res, 200, { ok: false, error: 'Result reports are not available on this server.' });
+      const body = await readBody();
+      const ck = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const code = String(body.course_code || '').trim();
+      if (!code) return J(res, 200, { ok: false, error: 'Pick the course you are reporting.' });
+      // must be a course the student actually registered (never let a student conjure a random course)
+      const reg = all('course_registrations').find(r => r.student_id === s.id && !r.deleted && r.status === 'registered' && ck(r.course_code) === ck(code));
+      if (!reg) return J(res, 200, { ok: false, error: 'That course is not on your registered course list for this semester.' });
+      const kind = String(body.kind || 'missing') === 'wrong_score' ? 'wrong_score' : 'missing';
+      const now = new Date().toISOString();
+      const tnoOf = (rid, pfx) => (pfx || 'RT') + '-' + String(rid || '').replace(/-/g, '').slice(-6).toUpperCase();
+      const open = all('result_fix_requests').find(r => r.student_id === s.id && !r.deleted && ck(r.course_code) === ck(code) && (r.status === 'open' || r.status === 'not_found' || r.status === 'not_uploaded'));
+      let id;
+      if (open) { id = open.id; update('result_fix_requests', open.id, { kind, note: String(body.note || '').slice(0, 400), status: 'open', updated_at: now }); }
+      else {
+        id = crypto.randomUUID();
+        create('result_fix_requests', { id, student_id: s.id, course_code: code, course_title: reg.course_title || '', session_id: s.current_session_id || null, semester_id: null, kind, note: String(body.note || '').slice(0, 400), status: 'open', confidence: 0, created_at: now, updated_at: now, resolved_at: null, resolved_by: null, deleted: 0, origin_node: 'portal' });
+      }
+      // 🎫 the ticket timeline starts HERE (visible on the portal instantly); the desktop AI adds the
+      // "checked" step within minutes of sync and emails the student at every transition.
+      create('ticket_events', { id: crypto.randomUUID(), kind: 'result', request_id: id, status: 'open', message: `Ticket opened for ${code} (${kind === 'wrong_score' ? 'wrong score' : 'missing result'}). The AI will check the uploaded sheets shortly.`, actor: 'portal', created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+      const nm = `${s.first_name || ''} ${s.last_name || ''}`.trim();
+      for (const role of ['registrar', 'ict', 'admin']) create('notifications', { id: crypto.randomUUID(), target_user: null, target_role: role, title: `🎫 ${tnoOf(id)} — result issue`, body: `${nm} reported a ${kind === 'wrong_score' ? 'wrong score' : 'missing result'} for ${code}.`, type: 'result', payload: JSON.stringify({ request_id: id, student_id: s.id, course: code, ticket: tnoOf(id) }), is_read: 0, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+      return J(res, 200, { ok: true, ticket_no: tnoOf(id), message: `Ticket ${tnoOf(id)} opened. The AI is locating your ${code} result — you will be emailed at every update, and you can follow it under “My tickets” below.` });
+    }
+
+    // 🎫 the student's TICKETS (result + payment) with their full timelines — the portal/APK "My
+    // tickets" view. Read from the synced tables, so desktop AI/staff updates appear on next sync.
+    if (p === '/api/my-tickets' && method === 'GET') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student.' });
+      const s = accountById('student', t.id); if (!s) return J(res, 401, { ok: false });
+      const tnoOf = (rid, pfx) => (pfx || 'RT') + '-' + String(rid || '').replace(/-/g, '').slice(-6).toUpperCase();
+      const evByReq = {};
+      for (const e of all('ticket_events')) { if (e.deleted) continue; const k = e.kind + '|' + e.request_id; (evByReq[k] = evByReq[k] || []).push({ status: e.status, message: e.message, at: e.created_at }); }
+      const sortEv = (a, b) => String(a.at).localeCompare(String(b.at));
+      const tickets = [];
+      for (const r of all('result_fix_requests')) {
+        if (r.deleted || r.student_id !== s.id) continue;
+        tickets.push({ kind: 'result', id: r.id, ticket_no: tnoOf(r.id, 'RT'), title: `${r.course_code} — ${r.kind === 'wrong_score' ? 'wrong score' : 'missing result'}`, status: r.status, resolution: r.resolution || '', created_at: r.created_at, updated_at: r.updated_at, events: (evByReq['result|' + r.id] || []).sort(sortEv) });
+      }
+      for (const r of all('payment_fix_requests')) {
+        if (r.deleted || r.student_id !== s.id) continue;
+        tickets.push({ kind: 'payment', id: r.id, ticket_no: tnoOf(r.id, 'PT'), title: `Payment ${String(r.currency || 'NGN').toUpperCase()} ${Number(r.amount || 0).toLocaleString()}${r.reference ? ' · ref ' + r.reference : ''}`, status: r.status, resolution: r.resolution || '', created_at: r.created_at, updated_at: r.updated_at, events: (evByReq['payment|' + r.id] || []).sort(sortEv) });
+      }
+      tickets.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
+      return J(res, 200, { ok: true, tickets });
+    }
+
+    // 💳 A student reports a PAYMENT that is not reflecting on their app/portal. Creates a synced
+    // payment_fix_requests row; the desktop AI traces it (ledger → gateway intents → live verify) and
+    // either credits it automatically or escalates to the bursary — emailing the student throughout.
+    if (p === '/api/payment-issue' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student to report a payment.' });
+      const s = accountById('student', t.id); if (!s) return J(res, 401, { ok: false });
+      if (typeof create !== 'function') return J(res, 200, { ok: false, error: 'Payment reports are not available on this server.' });
+      const body = await readBody();
+      const amount = Math.round((Number(body.amount) || 0) * 100) / 100;
+      if (!(amount > 0)) return J(res, 200, { ok: false, error: 'Enter the amount you paid.' });
+      const now = new Date().toISOString();
+      const tnoOf = (rid) => 'PT-' + String(rid || '').replace(/-/g, '').slice(-6).toUpperCase();
+      // one open payment ticket per student at a time (a re-file updates the claim, keeping one thread)
+      const open = all('payment_fix_requests').find(r => !r.deleted && r.student_id === s.id && (r.status === 'open' || r.status === 'not_found'));
+      let id;
+      if (open) { id = open.id; update('payment_fix_requests', open.id, { amount, currency: String(body.currency || 'NGN').toUpperCase().slice(0, 6), reference: String(body.reference || '').slice(0, 80), method: String(body.method || '').slice(0, 40), paid_at: body.paid_at || null, note: String(body.note || '').slice(0, 400), status: 'open', updated_at: now }); }
+      else {
+        id = crypto.randomUUID();
+        create('payment_fix_requests', { id, student_id: s.id, amount, currency: String(body.currency || 'NGN').toUpperCase().slice(0, 6), reference: String(body.reference || '').slice(0, 80), method: String(body.method || '').slice(0, 40), paid_at: body.paid_at || null, note: String(body.note || '').slice(0, 400), status: 'open', resolution: null, matched_payment_id: null, created_at: now, updated_at: now, resolved_at: null, resolved_by: null, deleted: 0, origin_node: 'portal' });
+      }
+      create('ticket_events', { id: crypto.randomUUID(), kind: 'payment', request_id: id, status: 'open', message: `Ticket opened — ${String(body.currency || 'NGN').toUpperCase()} ${amount.toLocaleString()} reported as paid but not reflecting. The AI will trace it shortly.`, actor: 'portal', created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+      const nm = `${s.first_name || ''} ${s.last_name || ''}`.trim();
+      for (const role of ['accountant', 'admin']) create('notifications', { id: crypto.randomUUID(), target_user: null, target_role: role, title: `🎫 ${tnoOf(id)} — payment not reflecting`, body: `${nm}: ${String(body.currency || 'NGN').toUpperCase()} ${amount.toLocaleString()}${body.reference ? ' · ref ' + body.reference : ''}.`, type: 'payment', payload: JSON.stringify({ request_id: id, student_id: s.id, ticket: tnoOf(id) }), is_read: 0, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+      return J(res, 200, { ok: true, ticket_no: tnoOf(id), message: `Ticket ${tnoOf(id)} opened. The system is tracing your payment — you will be emailed at every update, and you can follow it under “My tickets”.` });
     }
 
     // ---- Graduation FINAL CLEARANCE (student request + live progress tracking + project upload) ----
@@ -2845,11 +3067,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       if (!at && st.late_grace_min && e.start_at && Date.now() > Date.parse(e.start_at) + st.late_grace_min * 60000)
         return J(res, 200, { ok: false, error: 'The entry window for this exam has closed (late-entry grace passed).' });
       if (!at) { const id = 'att-' + Math.random().toString(16).slice(2) + Date.now().toString(16); at = { id, exam_id: e.id, student_id: t.id, status: 'in_progress', started_at: now, answers: '{}', live_requested: 0, created_at: now, updated_at: now, deleted: 0 }; create('exam_attempts', at); }
-      const startedMs = Date.parse(at.started_at || now);
-      const extraMin = (st.extensions && Number(st.extensions[t.id])) || 0;   // per-student accommodation
-      const durEnd = startedMs + ((Number(e.duration_min) || 60) + extraMin) * 60000;
-      const winEnd = e.end_at ? Date.parse(e.end_at) + extraMin * 60000 : durEnd;
-      const endsAt = new Date(Math.min(durEnd, winEnd)).toISOString();
+      const endsAt = new Date(attemptDeadlineMs(e, at)).toISOString();   // server-authoritative deadline
       let qs = all('exam_questions').filter(q => !q.deleted && q.exam_id === e.id)
         .map(q => ({ id: q.id, seq: q.seq, type: q.type, text: q.text, options: (function () { try { return JSON.parse(q.options || '[]'); } catch (_) { return []; } })(), marks: q.marks, image: q.image || null, language: q.language || null }));
       if (st.pick && st.pick > 0 && st.pick < qs.length) qs = seededShuffle(e.id + ':pick:' + t.id, qs).slice(0, st.pick);   // each student gets a random N-of-total subset
@@ -2863,7 +3081,11 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const body = await readBody(); const at = body.attempt_id ? one('exam_attempts', body.attempt_id) : null;
       if (!at || at.student_id !== t.id) return J(res, 404, { ok: false });
       if (at.status !== 'in_progress') return J(res, 200, { ok: false, error: 'This attempt is closed.' });
-      if (typeof update === 'function') { let ans = {}; try { ans = JSON.parse(at.answers || '{}'); } catch (_) {} Object.assign(ans, body.answers || {}); update('exam_attempts', at.id, { answers: JSON.stringify(ans) }); }
+      // SERVER is authoritative on time: once the deadline passes (+grace) no NEW answers are accepted and
+      // the attempt is finalised, so a tampered client clock can never keep editing after time is up.
+      const e = one('online_exams', at.exam_id);
+      if (e && e.id) { const dl = attemptDeadlineMs(e, at); if (dl && Date.now() > dl + DEADLINE_GRACE_MS) { if (typeof update === 'function') update('exam_attempts', at.id, { status: 'auto_submitted', submitted_at: new Date().toISOString() }); return J(res, 200, { ok: false, expired: true, error: 'Time is up — your exam has been submitted automatically.' }); } }
+      if (typeof update === 'function') update('exam_attempts', at.id, { answers: JSON.stringify(mergeExamAnswers(at, body)) });
       return J(res, 200, { ok: true });
     }
     // Student: submit (final / auto). Grading is done on the desktop, not here.
@@ -2873,7 +3095,12 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       if (!at || at.student_id !== t.id) return J(res, 404, { ok: false });
       // a voided (forfeited) attempt is final — never let a late submit resurrect it with a score
       if (at.status === 'voided') return J(res, 200, { ok: false, error: 'This exam was ended.' });
-      if (typeof update === 'function') { let ans = {}; try { ans = JSON.parse(at.answers || '{}'); } catch (_) {} Object.assign(ans, body.answers || {}); update('exam_attempts', at.id, { answers: JSON.stringify(ans), status: body.auto ? 'auto_submitted' : 'submitted', submitted_at: new Date().toISOString() }); }
+      // already submitted/graded — idempotent ack so a retry/double-tap doesn't error or re-open it
+      if (at.status !== 'in_progress') return J(res, 200, { ok: true, already: true });
+      // a submit arriving past the deadline is recorded as an auto-submit (time ran out before it landed)
+      const e = one('online_exams', at.exam_id);
+      const late = !!(e && e.id && (function () { const dl = attemptDeadlineMs(e, at); return dl && Date.now() > dl + DEADLINE_GRACE_MS; })());
+      if (typeof update === 'function') update('exam_attempts', at.id, { answers: JSON.stringify(mergeExamAnswers(at, body)), status: (body.auto || late) ? 'auto_submitted' : 'submitted', submitted_at: new Date().toISOString() });
       return J(res, 200, { ok: true });
     }
     // Student: upload a proctor frame (camera JPEG + mic level). Returns whether the officer wants live A/V.
@@ -2906,7 +3133,9 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const cur = efGet(examId, t.id);
       const relayFields = { ts: now };
       const jpeg = String(body.image_base64 || '').replace(/^data:[^;]+;base64,/, '');
-      if (jpeg) { cur.jpeg = jpeg; cur.ts = now; cur.ring = (cur.ring || []).concat([jpeg]).slice(-20); relayFields.jpeg = jpeg; if (body.kyc) { cur.kyc = jpeg; relayFields.kyc = jpeg; } }
+      // Cap the stored frame (a real webcam JPEG is well under this; bigger ⇒ malformed/abusive). Without
+      // this an oversized base64 image ×20-frame ring ×N students could exhaust the portal's memory.
+      if (jpeg && jpeg.length <= 1500000) { cur.jpeg = jpeg; cur.ts = now; cur.ring = (cur.ring || []).concat([jpeg]).slice(-20); relayFields.jpeg = jpeg; if (body.kyc) { cur.kyc = jpeg; relayFields.kyc = jpeg; } }
       if (body.audioLevel != null) { cur.audioLevel = Number(body.audioLevel) || 0; cur.ts = now; relayFields.audioLevel = cur.audioLevel; }
       // a short captured audio clip (webm/opus) so the officer can actually HEAR the student, not just see a level bar
       const aud = String(body.audio_base64 || '').replace(/^data:[^;]+;base64,/, '');
@@ -3007,7 +3236,9 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
           lastSeen: f ? f.ts : 0, online: !!(f && f.ts && now - f.ts < 8000) };
       }).sort((x, y) => (y.online - x.online) || String(x.name).localeCompare(String(y.name)));
       const onlineN = rows.filter(r => r.online).length;
-      return J(res, 200, { ok: true, room: 'exam-' + examId, status: e.status, students: rows, onlineCount: onlineN, frameCount: rows.filter(r => r.hasFrame).length, instanceId: INSTANCE_ID, relay: !!frameRelay });
+      // `relay` = a shared cross-instance relay is wired; `relayError` = it's wired but FAILING (e.g. the
+      // exam_live table isn't created) — so the monitor never falsely claims "relay on" while it's broken.
+      return J(res, 200, { ok: true, room: 'exam-' + examId, status: e.status, students: rows, onlineCount: onlineN, frameCount: rows.filter(r => r.hasFrame).length, instanceId: INSTANCE_ID, relay: !!frameRelay, relayError: (frameRelay && frameRelay.lastError) || '' });
     }
     // Officer: latest frame JPEG for a student tile in the live grid. (Pulls from the shared relay if the
     // student's frame landed on another instance.)
@@ -3259,20 +3490,26 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       if (t.k !== 'staff' && t.k !== 'user') return J(res, 403, { ok: false, error: 'Only teaching staff can start a class.' });
       const room = u.searchParams.get('room') || '';
       if (!room) return J(res, 200, { ok: false, error: 'No room specified.' });
+      const isHb = !!u.searchParams.get('hb');   // a periodic keep-alive from the host page, not a fresh start
       const sc = scopeForRoom(room);
       if (!sc || !sc.department_id || !sc.level_id) return J(res, 200, { ok: true, started: false }); // ad-hoc room: nobody to notify
       const now = new Date().toISOString();
       const recentCut = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
       const existing = all('live_sessions').find(v => v.room === room && !v.deleted && String(v.started_at || '') >= recentCut);
       if (existing) { // re-host within the window (or the desktop already started it) → refresh, don't duplicate
-        if (typeof update === 'function') update('live_sessions', existing.id, { active: 1, started_at: now });
+        // a heartbeat only refreshes the keep-alive (keeps the original start time + no re-notify); a genuine
+        // (re)start also bumps started_at + re-activates.
+        if (typeof update === 'function') update('live_sessions', existing.id, isHb ? { active: 1, heartbeat_at: now } : { active: 1, started_at: now, heartbeat_at: now });
         return J(res, 200, { ok: true, started: true, id: existing.id });
       }
+      // a heartbeat for a session that no longer exists (already ended/swept) must NOT resurrect it or
+      // re-push a "class is live" notification — only a real start creates a session.
+      if (isHb) return J(res, 200, { ok: true, started: false });
       if (typeof create !== 'function') return J(res, 200, { ok: true, started: false }); // LAN portal w/o create hook
       const id = crypto.randomUUID();
       const row = { id, room, subject: u.searchParams.get('subject') || sc.subject, course_code: sc.course_code, course_title: sc.course_title,
         department_id: sc.department_id, level_id: sc.level_id, session_id: sc.session_id || null, started_by: t.id,
-        started_at: now, active: 1, deleted: 0, created_at: now, updated_at: now, origin_node: 'portal' };
+        started_at: now, heartbeat_at: now, active: 1, deleted: 0, created_at: now, updated_at: now, origin_node: 'portal' };
       create('live_sessions', row);
       // notify the cohort (FCM push) — ONLY for this genuinely-new session, mirroring the desktop host
       try { if (typeof onLiveStart === 'function') onLiveStart(row); } catch (_) {}
@@ -3489,6 +3726,53 @@ html[dir=rtl] input,html[dir=rtl] textarea,html[dir=rtl] select{text-align:right
 html[dir=rtl] .bal{margin-left:0;margin-right:8px}
 html[dir=rtl] .tscroll th,html[dir=rtl] .tscroll td{text-align:right}
 html[dir=rtl] .tscroll th.r,html[dir=rtl] .tscroll td.r{text-align:left}
+/* ============================================================================
+   ✨ 2026 UI UPGRADE — native-app polish for the web portal + the Capacitor APK.
+   Additive only (no DOM/JS changes): press feedback, smoother motion, safe-area
+   insets for notched phones, refined depth + typography. ==================== */
+:root{--radius:16px;--shadow-sm:0 2px 8px rgba(15,23,42,.06);--shadow-md:0 10px 30px rgba(15,23,42,.09);--ease:cubic-bezier(.22,1,.36,1)}
+body{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+/* honour the phone's notch / home-indicator when the APK runs full-bleed */
+.top{padding-top:calc(12px + env(safe-area-inset-top))}
+.shell,.wrap{padding-bottom:calc(24px + env(safe-area-inset-bottom))}
+/* every card/panel/kpi lifts on a consistent, softer shadow and animates in */
+.panel,.kpi,.hero,.fcprog{box-shadow:var(--shadow-sm);transition:box-shadow .25s var(--ease),transform .25s var(--ease)}
+.panel:hover,.kpi:hover,.hero:hover{box-shadow:var(--shadow-md)}
+.seg.on>*{animation:portalIn .34s var(--ease) both}
+@keyframes portalIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.seg.on>*{animation:none}}
+/* tactile press feedback everywhere a finger lands (the native-app "tap" feel) */
+.btn,.nav a,.qa button,button,.chip,.lib-card{transition:transform .12s var(--ease),background .18s,box-shadow .18s,color .18s}
+.btn:active,.qa button:active,button:active{transform:scale(.96)}
+.nav a:active{transform:scale(.94)}
+.btn{box-shadow:0 6px 16px rgba(37,99,235,.24)}
+.btn.ghost{box-shadow:var(--shadow-sm)}
+.btn.sm{box-shadow:none}
+/* KPI cards get an accent spine + tighter numerals */
+.kpi{position:relative;overflow:hidden}
+.kpi::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:linear-gradient(180deg,#2563eb,#4338ca)}
+.kpi .v{font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+/* the sticky section tabs read as a floating pill bar; the active tab lifts */
+.nav{backdrop-filter:saturate(1.2) blur(6px);box-shadow:var(--shadow-sm)}
+.nav a.active{box-shadow:0 6px 16px rgba(var(--brand-rgb,37,99,235),.32)}
+/* rows highlight on touch so a tap target is obvious on a phone */
+tbody tr{transition:background .15s}
+tbody tr:active{background:rgba(var(--brand-rgb,37,99,235),.06)}
+/* the profile hero gets a subtle depth pattern + crisper avatar ring */
+.phead{position:relative;overflow:hidden}
+.phead::after{content:"";position:absolute;inset:0;background:radial-gradient(600px 200px at 90% -20%,rgba(255,255,255,.14),transparent);pointer-events:none}
+/* pills/badges a touch rounder + bolder for legibility at arm's length */
+.badge,.chip{font-weight:800;letter-spacing:.2px}
+/* inputs feel modern: soft focus ring in the brand colour */
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--brand);box-shadow:0 0 0 3px rgba(var(--brand-rgb,37,99,235),.16)}
+/* phone: bigger tap targets, comfortable spacing, snappier sticky tabs */
+@media(max-width:600px){
+  .btn{padding:13px 16px;font-size:14.5px}
+  .nav{top:calc(6px + env(safe-area-inset-top))}
+  .nav a{padding:10px 13px;border-radius:12px}
+  .sectitle{font-size:19px}
+  .panel{border-radius:14px}
+}
 </style></head>
 <body>
 <div id="app"></div>
@@ -3694,6 +3978,69 @@ async function reqTranscript(kind){
   try{var r=await api('/api/transcript-request',{method:'POST',body:JSON.stringify({kind:kind,purpose:purpose})});
     if(r&&r.ok){alert('Request submitted. The Registry will process it, email you a signed copy and place it here for download.');renderApp();}
     else{alert((r&&r.error)||'Could not submit the request.');}}catch(e){alert('Could not submit the request right now.');}
+}
+// Report a MISSING result or a WRONG score for a registered course. The desktop AI then locates the
+// uploaded row and auto-links it (or hands it to a staff member) — the outcome shows back here.
+async function reportResult(codeEnc,kind){
+  var code=decodeURIComponent(codeEnc);
+  var note=prompt((kind==='wrong_score'?'Report a WRONG score for ':'Report a MISSING result for ')+code+'.\\n\\n'+(kind==='wrong_score'?'What score did you expect? (optional)':'Add a note for staff (optional):'),'');
+  if(note===null)return;
+  try{var r=await api('/api/result-issue',{method:'POST',body:JSON.stringify({course_code:code,kind:kind,note:note})});
+    if(r&&r.ok){alert(r.message||'Reported. We will locate your result and update it here.');renderApp();}
+    else{alert((r&&r.error)||'Could not report this right now.');}}catch(e){alert('Could not report this right now.');}
+}
+// 🎫 MY TICKETS — every result/payment report with its live timeline (result section, lazy-loaded).
+async function loadTickets(){
+  var box=document.getElementById('tixBody'); if(!box)return; if(box.getAttribute('data-busy'))return; box.setAttribute('data-busy','1');
+  var r; try{ r=await api('/api/my-tickets'); }catch(e){ r=null; }
+  box.removeAttribute('data-busy');
+  if(!r||!r.ok){ box.innerHTML='<div class="empty">Tickets are unavailable right now.</div>'; return; }
+  var tix=r.tickets||[];
+  if(!tix.length){ box.innerHTML='<div class="empty">No tickets yet. Report a missing result (above) or a payment that didn’t reflect (My Fees) and follow it here.</div>'; return; }
+  var stBadge=function(s){var m={open:['⏳ Being checked','muted'],auto_fixed:['✓ Fixed automatically','pos'],recorded:['✓ Recorded','pos'],not_uploaded:['⏳ Awaiting upload','muted'],not_found:['👤 With a staff member','neg'],resolved:['✓ Resolved','pos'],rejected:['Closed','muted']}[s]||[s,'muted'];return '<span class="'+m[1]+'" style="font-weight:800">'+m[0]+'</span>';};
+  box.innerHTML=tix.map(function(t){
+    var tl=(t.events||[]).map(function(e){return '<div style="display:flex;gap:8px;font-size:12px;margin:4px 0"><span class="muted" style="white-space:nowrap">'+String(e.at||'').slice(0,16).replace('T',' ')+'</span><span>'+eh(e.message||e.status)+'</span></div>';}).join('');
+    return '<div style="border:1px solid #e2e8f0;border-radius:10px;padding:10px 13px;margin-bottom:9px">'
+      +'<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center"><div><b>'+eh(t.ticket_no)+'</b> · '+eh(t.title)+'</div>'+stBadge(t.status)+'</div>'
+      +(t.resolution?('<div style="font-size:12.5px;color:#334155;margin-top:4px">'+eh(t.resolution)+'</div>'):'')
+      +(tl?('<details style="margin-top:6px"><summary style="cursor:pointer;font-size:12px;color:#2563eb">Timeline ('+(t.events||[]).length+')</summary>'+tl+'</details>'):'')
+      +'</div>';
+  }).join('');
+}
+// 💳 report a payment that is NOT reflecting — files a ticket the AI traces (ledger → gateway),
+// with email updates at every step.
+async function reportPayment(currency){
+  var ov=document.createElement('div');
+  ov.style.cssText='position:fixed;inset:0;z-index:9500;background:rgba(2,6,23,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+  ov.innerHTML='<div style="background:#fff;border-radius:16px;max-width:430px;width:100%;padding:20px;box-shadow:0 24px 60px rgba(2,6,23,.4)">'
+    +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><h3 style="margin:0">💬 Payment not showing?</h3><span id="pfX" style="cursor:pointer;font-size:22px;color:#64748b">×</span></div>'
+    +'<div class="muted" style="font-size:12.5px;margin-bottom:12px">Tell us about the payment and the system will trace it through the ledger and the payment gateway — you’ll get an email at every update.</div>'
+    +'<label style="font-size:12px;color:#64748b">Amount paid ('+eh(currency||'NGN')+') *</label>'
+    +'<input id="pfAmt" type="number" min="1" step="0.01" style="width:100%;border:1px solid #cbd5e1;border-radius:10px;padding:10px;margin:4px 0 10px;box-sizing:border-box">'
+    +'<label style="font-size:12px;color:#64748b">Payment reference / teller no. (from your bank alert or receipt — optional but speeds things up)</label>'
+    +'<input id="pfRef" style="width:100%;border:1px solid #cbd5e1;border-radius:10px;padding:10px;margin:4px 0 10px;box-sizing:border-box">'
+    +'<label style="font-size:12px;color:#64748b">When did you pay?</label>'
+    +'<input id="pfDate" type="date" style="width:100%;border:1px solid #cbd5e1;border-radius:10px;padding:10px;margin:4px 0 10px;box-sizing:border-box">'
+    +'<label style="font-size:12px;color:#64748b">How did you pay? (card online, bank transfer, POS, cash at the bank…)</label>'
+    +'<input id="pfHow" style="width:100%;border:1px solid #cbd5e1;border-radius:10px;padding:10px;margin:4px 0 10px;box-sizing:border-box">'
+    +'<label style="font-size:12px;color:#64748b">Anything else? (optional)</label>'
+    +'<textarea id="pfNote" rows="2" style="width:100%;border:1px solid #cbd5e1;border-radius:10px;padding:10px;margin:4px 0 10px;box-sizing:border-box"></textarea>'
+    +'<div id="pfErr" style="color:#b91c1c;font-size:13px;margin-top:2px"></div>'
+    +'<button id="pfGo" class="btn full" style="margin-top:8px">Open ticket</button></div>';
+  document.body.appendChild(ov);
+  function close(){try{document.body.removeChild(ov);}catch(_){}}
+  ov.querySelector('#pfX').onclick=close;
+  ov.addEventListener('click',function(e){if(e.target===ov)close();});
+  ov.querySelector('#pfGo').onclick=async function(){
+    var amt=parseFloat(ov.querySelector('#pfAmt').value||'0');
+    var ee=ov.querySelector('#pfErr');ee.textContent='';
+    if(!(amt>0)){ee.textContent='Enter the amount you paid.';return;}
+    var go=ov.querySelector('#pfGo');go.disabled=true;go.textContent='Opening ticket…';
+    var r;try{r=await api('/api/payment-issue',{method:'POST',body:JSON.stringify({amount:amt,currency:currency||'NGN',reference:ov.querySelector('#pfRef').value,paid_at:ov.querySelector('#pfDate').value||null,method:ov.querySelector('#pfHow').value,note:ov.querySelector('#pfNote').value})});}catch(e){r={ok:false,error:'Network error.'};}
+    go.disabled=false;go.textContent='Open ticket';
+    if(!r||!r.ok){ee.textContent=(r&&r.error)||'Could not open the ticket.';return;}
+    close();alert(r.message||'Ticket opened — you will be emailed at every update.');renderApp();
+  };
 }
 // Pay an outstanding fee online: pick a gateway + amount, then hand off to the provider's secure checkout.
 // On return the /api/pay/callback verifies the payment server-side, issues the receipt and emails it.
@@ -3926,6 +4273,7 @@ function studentView(w,d){
   // FEES
   html+=seg('fees',
     '<h2 class="sectitle">💳 Fees &amp; Payments</h2>'
+    +'<div class="exbar" style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center"><span>Paid something that isn’t showing here yet? Open a ticket and the system will trace it through the ledger and the payment gateway — you get an email at every update.</span><button class="btn sm" onclick="reportPayment(\\''+eh((d.outstanding&&d.outstanding[0]&&d.outstanding[0].currency)||'NGN')+'\\')">💬 Payment not showing?</button></div>'
     +'<div class="panel"><h3>Outstanding Fees</h3><div class="muted" style="font-size:12px;margin-bottom:8px">Tap <b>Pay online</b> on any fee to pay securely by card, bank or USSD — your receipt is issued instantly and emailed to you.</div>'+tbl([{t:'Fee Category',f:function(r){return cap(r.category);}},{t:'Currency',f:function(r){return r.currency;}},{t:'Billed',r:1,f:function(r){return money(r.billed,r.currency);}},{t:'Paid',r:1,f:function(r){return money(r.paid,r.currency);}},{t:'Outstanding',r:1,f:function(r){return '<span class=neg>'+money(r.outstanding,r.currency)+'</span>';}},{t:'',r:1,f:function(r){return Number(r.outstanding)>0?'<button class="btn sm" onclick="payFee(\\''+encodeURIComponent(r.category)+'\\',\\''+eh(r.currency)+'\\','+Number(r.outstanding)+')">💳 Pay online</button>':'<span class="muted">Paid</span>';}}],d.outstanding,'You owe nothing. 🎉')+'</div>'
     +'<div class="panel"><h3>All Fees &amp; Charges</h3>'+tbl([{t:'Date',f:function(r){return fmt(r.date);}},{t:'Description',f:function(r){return (eh(r.description)||cap(r.category))+' '+(r.rollover?'<span class="badge" style="background:#fef3c7;color:#92400e">Rollover'+(r.rolled_from?' · '+eh(r.rolled_from):'')+'</span>':'<span class="badge" style="background:#dbeafe;color:#1e40af">Current</span>');}},{t:'Category',f:function(r){return cap(r.category);}},{t:'Set By',f:function(r){return eh(r.by||'—');}},{t:'Amount',r:1,f:function(r){return money(r.amount,r.currency);}}],d.charges,'No charges yet.')+'</div>'
     +((d.invoices&&d.invoices.length)?('<div class="panel"><h3>Fee Invoices</h3><div class="muted" style="font-size:12px;margin-bottom:6px">Download the invoice PDF from your <b>Documents</b> tab.</div>'+tbl([{t:'Invoice',f:function(r){return eh(r.invoice_no);}},{t:'Amount',r:1,f:function(r){return money(r.amount,r.currency);}},{t:'Due',f:function(r){return eh(r.due_date||'—');}},{t:'Status',f:function(r){return '<span class="badge">'+cap(r.status)+'</span>';}}],d.invoices,'No invoices.')+'</div>'):''));
@@ -4063,8 +4411,41 @@ function studentView(w,d){
   ):(d.resultsWithheld
     ?'<div class="exbar warn">⚠ Some or all of your results for this period are currently <b>withheld</b> by the Examinations Board (e.g. pending board approval or an outstanding obligation). Please contact the Registry. They will appear here once released.</div>'
     :'<div class="empty">No results published yet. They will appear here once your results are released.</div>');
+  // MY COURSES — the courses the student is registered to offer this session (auto-linked from
+  // Academic Planning) and which of them are still awaiting a result.
+  var rc=d.registeredCourses||{courses:[],awaiting:[]};
+  var kindTag=function(k){return k==='carryover'?' <span class="neg" style="font-weight:800">carry-over</span>':(k==='borrowed'?' <span class="muted">borrowed</span>':(k==='elective'?' <span class="muted">elective</span>':''));};
+  var statusBadge=function(s){var m={published:['✓ Published','pos'],recorded:['⏳ Recorded — pending release','muted'],uploaded:['⚙ Uploaded — processing','muted'],missing:['⚠ Missing — not on the uploaded sheet','neg'],not_uploaded:['✖ Not uploaded yet','neg']}[s]||['—','muted'];return '<span class="'+m[1]+'" style="font-weight:800">'+m[0]+'</span>';};
+  var reqLine=function(rq){if(!rq)return '';var m={open:'🔎 Reported — the system is locating your result…',auto_fixed:'✓ Found and linked — it will show once released',recorded:'✓ Recorded',not_found:'👤 With a staff member for a manual check',not_uploaded:'⏳ Results not uploaded yet',resolved:'✓ Resolved',rejected:'Reviewed and closed'}[rq.status]||rq.status;return '<div class="muted" style="font-size:11px;margin-top:3px">'+(rq.ticket_no?('<b>'+eh(rq.ticket_no)+'</b> · '):'')+eh(m)+(rq.resolution?(' — '+eh(rq.resolution)):'')+'</div>';};
+  var reportBtn=function(r){
+    if(r.request&&(r.request.status==='open'))return '<span class="muted" style="font-size:11.5px">⏳ Reported</span>';
+    if(r.status==='published')return '<button class="btn sm ghost" onclick="reportResult(\\''+encodeURIComponent(r.course_code)+'\\',\\'wrong_score\\')">⚠ Wrong score?</button>';
+    return '<button class="btn sm" onclick="reportResult(\\''+encodeURIComponent(r.course_code)+'\\',\\'missing\\')">🔎 Report missing</button>';
+  };
+  var notUp=(rc.courses||[]).filter(function(c){return c.status==='not_uploaded';});
+  var missn=(rc.courses||[]).filter(function(c){return c.status==='missing';});
+  var coursesHtml=(rc.courses&&rc.courses.length)?(
+    '<div class="panel"><h3>My Courses This Semester</h3>'
+    +'<div class="muted" style="font-size:12.5px;margin-bottom:8px">Every course you are registered to offer, with its result status. <b>✓ Published</b> = released to you · <b>Recorded</b> = your score is captured, awaiting release · <b>Uploaded — processing</b> = the sheet is in and your row is being matched · <b>⚠ Missing</b> = the sheet was uploaded and processed but YOUR row is not on it (absent, exam/test not written, or misread — report it!) · <b>Not uploaded yet</b> = the lecturer’s sheet has not arrived. Tap <b>Report</b> and the AI will find and fix it automatically, or hand it to a staff member — you get an email at every step of your ticket.</div>'
+    +(notUp.length?('<div class="exbar warn">✖ Results not yet uploaded for '+notUp.length+' course(s): <b>'+notUp.map(function(c){return eh(c.course_code);}).join(', ')+'</b> — you’ll see them here the moment they are.</div>'):'')
+    +(missn.length?('<div class="exbar warn">⚠ The uploaded results for <b>'+missn.map(function(c){return eh(c.course_code);}).join(', ')+'</b> do NOT include a score for you (absent, exam/test not written, or your row was misread). If you sat the paper, tap <b>Report missing</b> so the AI + exams office can trace your script.</div>'):'')
+    +tbl([
+      {t:'Code',f:function(r){return '<span class="mono" style="font-weight:700">'+eh(r.course_code||'—')+'</span>'+kindTag(r.kind);}},
+      {t:'Title',f:function(r){return eh(r.course_title||'—')+reqLine(r.request);}},
+      {t:'CH',r:1,f:function(r){return String(r.credit_unit||0);}},
+      {t:'Status',f:function(r){return statusBadge(r.status)+(r.status==='published'&&r.grade?(' <span class="muted">('+eh(r.grade)+')</span>'):'');}},
+      {t:'',r:1,f:function(r){return reportBtn(r);}}
+    ],rc.courses,'No registered courses yet.')
+    +'</div>'
+  ):'';
+  // 🎫 MY TICKETS — every result/payment report with its live timeline (lazy-loaded)
+  var ticketsHtml='<div class="panel"><h3>🎫 My Tickets</h3>'
+    +'<div class="muted" style="font-size:12.5px;margin-bottom:8px">Every issue you have reported — missing results and payments that didn’t reflect — with its live timeline. You also get an email at every update.</div>'
+    +'<div id="tixBody"><div class="empty">Loading…</div></div></div>';
   html+=seg('results',
     '<h2 class="sectitle">📑 My Results</h2>'
+    +coursesHtml
+    +ticketsHtml
     +resultsHtml
     +'<div class="panel"><h3>Other Result Documents</h3>'+tbl([{t:'Level',f:function(r){return eh(r.level||'—');}},{t:'Semester',f:function(r){return eh(r.semester||'—');}},{t:'Session',f:function(r){return eh(r.session||'—');}},{t:'Title',f:function(r){return eh(r.title||'Result');}},{t:'',r:1,f:function(r){return '<button class="btn sm" onclick="doc(\\'/doc/result/'+r.id+'\\')">Download</button>';}}],d.results,'No other result documents.')+'</div>');
   // CLEARANCE
@@ -4136,6 +4517,7 @@ function studentView(w,d){
     Array.prototype.forEach.call(navEl.querySelectorAll('a'),function(a){a.classList.toggle('active',a.getAttribute('data-seg')===s);});
     window.__seg=s;
     if(s==='finalclr'){ try{ loadFinalClearance(); }catch(_){} }
+    if(s==='results'){ try{ loadTickets(); }catch(_){} }
     // opening Updates marks everything seen → clears the unread pill
     if(s==='notifications'){ try{ if(window.__notifMax) localStorage.setItem(window.__seenKey, window.__notifMax); }catch(_){}
       var nb=navEl.querySelector('a[data-seg="notifications"] .pill'); if(nb)nb.remove(); }

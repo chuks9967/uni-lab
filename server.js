@@ -225,8 +225,12 @@ async function pushNewRecords(recs) {
   const covered = new Set();
   for (const rec of recs) {
     const row = rec.row; if (!row) continue;
-    if (['charges', 'results', 'grad_clearance_items', 'grad_clearances', 'malpractice_flags'].includes(rec.entity) && row.student_id) covered.add(row.student_id);
+    if (['charges', 'results', 'grad_clearance_items', 'grad_clearances', 'malpractice_flags', 'payments'].includes(rec.entity) && row.student_id) covered.add(row.student_id);
     else if (rec.entity === 'portal_documents') for (const sid of studentsForDoc(row)) covered.add(sid);
+    else if (rec.entity === 'ticket_events' && row.request_id) {
+      const req = oneEntity(row.kind === 'payment' ? 'payment_fix_requests' : 'result_fix_requests', row.request_id);
+      if (req && req.student_id) covered.add(req.student_id);
+    }
   }
   // Coalesce newly-billed fees per student, so a batch-bill (many charge rows at once) sends ONE
   // "you have new fees" push instead of a dozen — and the student still always hears about being billed.
@@ -278,6 +282,23 @@ async function pushNewRecords(recs) {
           .map(s => s.id);
         const tokens = tokensForStudents(studs);
         if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: '📝 ' + (row.title || row.course_code || 'Online exam'), body: 'Your online exam is ' + (row.status === 'live' ? 'live now' : 'scheduled') + ' — open the Exams tab to begin when it starts.' }, { seg: 'exam', id: String(row.id || '') }));
+      } else if (rec.entity === 'ticket_events' && row.request_id) {
+        // 🎫 the desktop AI/staff advanced a student's ticket (missing result / payment trace) — push
+        // the update so the student follows the fix live. Resolve the student via the parent request.
+        const req = oneEntity(row.kind === 'payment' ? 'payment_fix_requests' : 'result_fix_requests', row.request_id);
+        if (!req || !req.student_id) continue;
+        const tokens = tokensForStudents([req.student_id]); if (!tokens.length) continue;
+        const tno = (row.kind === 'payment' ? 'PT-' : 'RT-') + String(row.request_id).replace(/-/g, '').slice(-6).toUpperCase();
+        const TITLE = { open: '🎫 Ticket received', auto_fixed: '✅ Ticket fixed', recorded: '✅ Result recorded', not_uploaded: '🎫 Ticket update', not_found: '👤 Ticket with staff', resolved: '✅ Ticket resolved', rejected: '🎫 Ticket closed' };
+        pruneStaleTokens(await fcm.sendToTokens(tokens,
+          { title: (TITLE[row.status] || '🎫 Ticket update') + ' — ' + tno, body: String(row.message || row.status || 'Your ticket was updated.').slice(0, 220) },
+          { seg: 'results', id: String(row.request_id) }));
+      } else if (rec.entity === 'payments' && row.student_id) {
+        // 🧾 a receipt issued anywhere (bursary desk, online settle on another node) lands on the phone
+        const tokens = tokensForStudents([row.student_id]);
+        if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens,
+          { title: '🧾 Payment received', body: (row.receipt_no ? 'Receipt ' + row.receipt_no + ' — ' : '') + fmtMoney(row.amount, row.currency) + (row.category ? ' (' + titleCase(row.category) + ')' : '') + '. Tap for your receipt.' },
+          { seg: 'receipts', id: String(row.id || '') }));
       }
     } catch (_) { /* best-effort */ }
   }
@@ -296,7 +317,7 @@ async function pushNewRecords(recs) {
   }
 }
 /** Records whose arrival should trigger a push (new, not-deleted documents/results/fees/clearance steps). */
-const PUSH_ENTITIES = ['portal_documents', 'results', 'live_sessions', 'malpractice_flags', 'online_exams', 'charges', 'grad_clearance_items', 'grad_clearances', 'notifications'];
+const PUSH_ENTITIES = ['portal_documents', 'results', 'live_sessions', 'malpractice_flags', 'online_exams', 'charges', 'grad_clearance_items', 'grad_clearances', 'notifications', 'ticket_events', 'payments'];
 function collectPushable(entity, prev, row) {
   if (!PUSH_ENTITIES.includes(entity)) return false;
   if (!row || row.deleted) return false;
@@ -304,6 +325,15 @@ function collectPushable(entity, prev, row) {
   if (entity === 'malpractice_flags' && !row.student_id) return false; // only an identified student can be pushed/notified
   if (entity === 'online_exams') { if (row.status !== 'published' && row.status !== 'live') return false; return !prev || !prev.row || (prev.row.status !== 'published' && prev.row.status !== 'live'); } // push when it first becomes published/live
   if (entity === 'charges') { if (!row.student_id) return false; return !prev || !prev.row || prev.row.deleted; } // a newly-billed fee
+  if (entity === 'ticket_events') { // 🎫 the desktop AI/staff advanced a student ticket → tell the phone
+    return (!prev || !prev.row) && !!row.request_id; // each event row is immutable — push once, on arrival
+  }
+  if (entity === 'payments') { // 🧾 a receipt issued at the bursary reaches the student's phone
+    if (!row.student_id || row.status !== 'completed') return false;
+    if (prev && prev.row && !prev.row.deleted) return false;                 // only genuinely new
+    const age = Date.now() - (Date.parse(row.created_at || '') || 0);
+    return age >= 0 && age < 48 * 3600 * 1000;                               // never blast pushes for migrated history
+  }
   if (entity === 'grad_clearance_items') { // a final-clearance task that just cleared / was rejected
     if (!row.student_id) return false;
     const was = prev && prev.row ? prev.row.status : null;
@@ -333,10 +363,29 @@ function collectPushable(entity, prev, row) {
 //     primary key (exam_id, student_id));
 //   alter table public.exam_live enable row level security;  -- (service_role key bypasses RLS)
 // The simpler alternative to all of this is to pin the service to ONE instance (--max-instances=1).
-const EXAM_RELAY = process.env.EXAM_RELAY === '1' && supaEnabled();
+// DEFAULT ON whenever Supabase is configured. Cloud Run (and most managed hosts) autoscale to MULTIPLE
+// instances by default, so the per-instance in-memory relay split is the COMMON case, not the exception —
+// the live exam camera silently never reaches the officer's monitor. Defaulting the shared relay on makes
+// a standard cloud deploy "just work". Set EXAM_RELAY=0 to force it off (e.g. a single pinned instance
+// that wants to avoid the extra Supabase writes — the in-memory relay is enough there). Requires the
+// one-time `exam_live` table below; if it is missing, `examRelayStore().lastError` reports exactly that.
+const EXAM_RELAY = process.env.EXAM_RELAY !== '0' && supaEnabled();
 const RELAY_META_COLS = 'exam_id,student_id,ts,audio_level,away,risk,risk_level,identity,forfeited,last_event,has_jpeg,has_kyc,has_audio,audio_mime,audio_ts,has_clip,clip_mime,clip_ts,updated_at';
 function examRelayStore() {
-  return {
+  const store = {
+    lastError: '', lastOkTs: 0,
+    // Turn a failed PostgREST response into a precise, actionable message. A missing `exam_live` table is
+    // the overwhelmingly common setup mistake (relay enabled but the one-time SQL never run) — name it.
+    _note(r) {
+      if (r && r.status >= 200 && r.status < 300) { store.lastError = ''; store.lastOkTs = Date.now(); return r; }
+      const body = (() => { try { return JSON.stringify(r && r.json || ''); } catch (_) { return ''; } })();
+      if ((r && r.status === 404) || /exam_live/i.test(body) || /does not exist/i.test(body) || /relation .* exam_live/i.test(body)) {
+        store.lastError = 'The exam_live relay table is missing in Supabase. Run the one-time CREATE TABLE in the Supabase SQL editor (see the comment above examRelayStore in server/server.js).';
+      } else {
+        store.lastError = 'Live-frame relay error (HTTP ' + (r && r.status || '?') + '). ' + (((r && r.json && (r.json.message || r.json.hint)) || '')).toString().slice(0, 120);
+      }
+      return r;
+    },
     async put(examId, sid, fields) {
       const row = { exam_id: examId, student_id: sid, updated_at: new Date().toISOString() };
       if (fields.ts != null) row.ts = Number(fields.ts) || null;
@@ -351,10 +400,10 @@ function examRelayStore() {
       if (fields.kyc != null) { row.kyc = fields.kyc; row.has_kyc = true; }
       if (fields.audio != null) { row.audio = fields.audio; row.has_audio = true; if (fields.audioMime) row.audio_mime = fields.audioMime; if (fields.audioTs != null) row.audio_ts = Number(fields.audioTs) || null; }
       if (fields.clip != null) { row.clip = fields.clip; row.has_clip = true; if (fields.clipMime) row.clip_mime = fields.clipMime; if (fields.clipTs != null) row.clip_ts = Number(fields.clipTs) || null; }
-      await supaRest('POST', '/rest/v1/exam_live?on_conflict=exam_id,student_id', [row], { 'Prefer': 'resolution=merge-duplicates,return=minimal' }, 8000);
+      store._note(await supaRest('POST', '/rest/v1/exam_live?on_conflict=exam_id,student_id', [row], { 'Prefer': 'resolution=merge-duplicates,return=minimal' }, 8000));
     },
     async listMeta(examId) {
-      const r = await supaRest('GET', '/rest/v1/exam_live?select=' + RELAY_META_COLS + '&exam_id=eq.' + encodeURIComponent(examId), null, null, 8000);
+      const r = store._note(await supaRest('GET', '/rest/v1/exam_live?select=' + RELAY_META_COLS + '&exam_id=eq.' + encodeURIComponent(examId), null, null, 8000));
       if (!(r.status >= 200 && r.status < 300 && Array.isArray(r.json))) return [];
       return r.json.map(x => ({ student_id: x.student_id, ts: Number(x.ts) || 0,
         state: { audioLevel: x.audio_level, away: x.away, risk: x.risk, riskLevel: x.risk_level, identity: x.identity, forfeited: x.forfeited, lastEvent: x.last_event, audioMime: x.audio_mime, clipMime: x.clip_mime },
@@ -362,13 +411,14 @@ function examRelayStore() {
     },
     async getBytes(examId, sid, kind) {
       const col = kind === 'audio' ? 'audio,audio_mime' : kind === 'clip' ? 'clip,clip_mime' : kind === 'kyc' ? 'kyc' : 'jpeg';
-      const r = await supaRest('GET', '/rest/v1/exam_live?select=' + col + '&exam_id=eq.' + encodeURIComponent(examId) + '&student_id=eq.' + encodeURIComponent(sid) + '&limit=1', null, null, 8000);
+      const r = store._note(await supaRest('GET', '/rest/v1/exam_live?select=' + col + '&exam_id=eq.' + encodeURIComponent(examId) + '&student_id=eq.' + encodeURIComponent(sid) + '&limit=1', null, null, 8000));
       const x = (r.json && r.json[0]) || null; if (!x) return null;
       if (kind === 'audio') return x.audio ? { data: x.audio, mime: x.audio_mime || 'audio/webm' } : null;
       if (kind === 'clip') return x.clip ? { data: x.clip, mime: x.clip_mime || 'video/webm' } : null;
       const data = kind === 'kyc' ? x.kyc : x.jpeg; return data ? { data, mime: 'image/jpeg' } : null;
     },
   };
+  return store;
 }
 // prune stale live-frame rows (a few hours after an exam) so the relay table stays small
 if (EXAM_RELAY) setInterval(() => { try { supaRest('DELETE', '/rest/v1/exam_live?updated_at=lt.' + encodeURIComponent(new Date(Date.now() - 3 * 3600 * 1000).toISOString()), null, { 'Prefer': 'return=minimal' }).catch(() => {}); } catch (_) {} }, 30 * 60 * 1000);
