@@ -71,7 +71,8 @@ async function accessToken() {
 function stringifyData(data) { const o = {}; for (const k of Object.keys(data || {})) if (data[k] != null) o[k] = String(data[k]); return o; }
 
 /** Send one notification to many device tokens. Returns { ok, sent, total } (or { disabled:true }). */
-async function sendToTokens(tokens, notification, data) {
+async function sendToTokens(tokens, notification, data, opts) {
+  const o = opts || {};
   const sa = serviceAccount(); if (!sa) return { ok: false, disabled: true };
   const list = (tokens || []).filter(Boolean);
   if (!list.length) return { ok: true, sent: 0, total: 0 };
@@ -79,7 +80,12 @@ async function sendToTokens(tokens, notification, data) {
   const headers = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + access };
   let sent = 0; const stale = [];
   await Promise.all(list.map(async (tk) => {
-    const msg = { message: {
+    const msg = { message: o.dataOnly ? {
+      // 📞 data-only: the app builds the ringing call screen itself (a notification block would be shown by the system instead)
+      token: tk,
+      data: stringifyData(Object.assign({ title: notification.title || '', body: notification.body || '' }, data)),
+      android: Object.assign({ priority: 'high' }, o.ttl ? { ttl: String(o.ttl) + 's' } : {}),
+    } : {
       token: tk,
       notification: { title: notification.title || 'Update', body: notification.body || '' },
       data: stringifyData(data),

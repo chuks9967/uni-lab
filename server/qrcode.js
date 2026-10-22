@@ -1,10 +1,14 @@
 'use strict';
-/** Minimal, dependency-free QR Code encoder (byte mode).
+/** Minimal, dependency-free QR Code encoder (byte mode + ALPHANUMERIC mode for upper-case text such as an ID card's link —
+ *  5.5 bits a character instead of 8, so the same link needs fewer, BIGGER modules on the card).
  *  Ported from Kazuhiko Arase's qrcode-generator (MIT). Supports versions 1–10
  *  and EC levels L/M/Q/H, and renders a crisp SVG (ideal for printToPDF).
  *  Used to put a scannable verification code on clearance certificates. */
 
 const MODE_8BIT = 4;
+const MODE_ALNUM = 2;
+const ALNUM = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:';
+const ALNUM_RE = /^[0-9A-Z $%*+\-./:]+$/;
 const EC_BITS = { L: 1, M: 0, Q: 3, H: 2 }; // QR error-correction indicator bits
 
 const QRMath = (() => {
@@ -83,9 +87,15 @@ const PAD0 = 0xEC; const PAD1 = 0x11;
 function createData(version, ec, bytes) {
   const blocks = rsBlocks(version, ec);
   const buf = new BitBuffer();
-  buf.put(MODE_8BIT, 4);
-  buf.put(bytes.length, version < 10 ? 8 : 16);
-  for (const b of bytes) buf.put(b, 8);
+  if (bytes && bytes.alnum != null) {
+    const t = bytes.alnum; buf.put(MODE_ALNUM, 4); buf.put(t.length, version < 10 ? 9 : 11);
+    for (let i = 0; i + 1 < t.length; i += 2) buf.put(ALNUM.indexOf(t[i]) * 45 + ALNUM.indexOf(t[i + 1]), 11);
+    if (t.length % 2) buf.put(ALNUM.indexOf(t[t.length - 1]), 6);
+  } else {
+    buf.put(MODE_8BIT, 4);
+    buf.put(bytes.length, version < 10 ? 8 : 16);
+    for (const b of bytes) buf.put(b, 8);
+  }
   const totalData = blocks.reduce((s, b) => s + b.data, 0);
   if (buf.length > totalData * 8) throw new Error('QR: overflow');
   if (buf.length + 4 <= totalData * 8) buf.put(0, 4);
@@ -247,7 +257,7 @@ function toBytes(text) {
 }
 
 function encode(text, ec = 'M') {
-  const bytes = toBytes(text);
+  const t = String(text); const bytes = ALNUM_RE.test(t) ? { alnum: t } : toBytes(t);
   for (let v = 1; v <= 10; v++) {
     try { const m = new Model(v, ec); m.make(bytes); return m; } catch (_) { /* too small — try next version */ }
   }

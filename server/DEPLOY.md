@@ -166,4 +166,35 @@ ephemeral filesystem, so the data store wouldn't persist.)
 On **every** computer (the one with the data first): Administration → Sync →
 **Server URL** = the hub URL, **Sync token** = the SYNC_TOKEN → **Save** →
 **🌐 Test Connection** → on the data PC, **♻️ Re-sync Everything**. The same hub powers the
-student/parent/staff **Portal** at that URL.
+student/parent/staff **Portal** at that URL. In the **mobile app**, tap *Server settings* on the
+login screen and enter the same URL.
+
+---
+
+## 💾 "Lots of storage" for free — split records from files
+
+The server itself is tiny. What grows is **records** (students, payments, results, tickets) and
+**files** (receipts, result slips, e-books, scanned mark sheets, documents). They have very
+different sizes, so give each a free specialist and you get plenty of room at **$0**:
+
+| Data | Size | Free home | Free limit | Env vars to set on the host |
+|------|------|-----------|-----------|------------------------------|
+| **Records** | tiny (text) | **Supabase** Postgres | 500 MB ≈ 50k+ students | `SUPABASE_URL`, `SUPABASE_KEY` (service_role) |
+| **Files** | large | **Cloudflare R2** | **10 GB + $0 downloads** | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY`, `R2_SECRET`, `R2_BUCKET=unibursar` |
+| **Push** | — | **Firebase FCM** | unlimited | none — `server/fcm-service-account.json` is bundled |
+
+- **Supabase** makes the cloud copy *permanent* — a Render free restart never loses data (and because
+  students use the app daily, the project never hits Supabase's 7-day idle pause). Get the URL + the
+  **service_role** key from Project Settings → API.
+- **Cloudflare R2** is the key to cheap scale: **10 GB free and it never charges for downloads
+  (egress)** — so a whole campus opening receipts and e-books all day still costs nothing. Create a
+  bucket named `unibursar` and an R2 API token (Object Read & Write). If you skip R2, files fall back
+  to Supabase's smaller 1 GB — fine to start, add R2 later with no migration.
+- The desktop pushes its gateway + storage keys to the hub automatically, so you can also set these in
+  **Administration → Storage / Online Payments** on the desktop instead of on the host.
+
+> **Under $2/mo, always-on, own disk:** a single **Fly.io** 256 MB machine is ≈ **$1.94/mo** (no cold
+> starts, persistent volume). **Free forever with the most disk:** an **Oracle Always-Free VM** gives a
+> real 24/7 server with **200 GB** — big enough to keep files locally and skip R2 entirely.
+>
+> *(Free tiers verified July 2026 — check each provider's pricing page before committing.)*
