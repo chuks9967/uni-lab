@@ -19,20 +19,30 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const net = require('net');
+// ⚡ per-entity index over the record store (all(entity) touches only that entity's rows)
+const RIX = require('./recordindex');
 const tls = require('tls');
 // portal is optional — if portal.js wasn't uploaded, the hub still runs sync/email
 let createPortal = null;
+const HTTPOPT = require('./httpopt');   // 📶 gzip + ETag/304 for the portal (the page is ~600 KB uncompressed)
 try { createPortal = require('./portal'); }
 catch (e) { console.error('[UniBursar] portal.js not loaded (' + e.message + ') — upload server/portal.js to enable the web portal. Sync/email still work.'); }
 // Firebase Cloud Messaging (native-app push). Optional — no-op unless FCM_SERVICE_ACCOUNT[_JSON] is set.
 let fcm = null;
 try { fcm = require('./fcm'); } catch (_) { fcm = null; }
+const PT = require('./pushtargets');
+const CHATR = require('./chatrules');   // ✉️ who a new message is pushed to (mutes, blocks) and what the phone shows   // 📲 which phone answers to which student / parent / staff member
 
 const BUILD = 'portal-27'; // bump when server changes — visible at /health to confirm the live code
 const PORT = process.env.PORT || 4000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const SYNC_TOKEN = process.env.SYNC_TOKEN || ''; // optional shared secret
-const tokenOk = (req) => !SYNC_TOKEN || (req.headers['x-sync-token'] || '') === SYNC_TOKEN;
+const SYNC_TOKEN = process.env.SYNC_TOKEN || ''; // shared secret — REQUIRED for any computer other than this one
+const hubauth = require('./hubauth');
+// 🔐 the data endpoints (/sync/*, /email/send, config pushes) are never open to the network: with a SYNC_TOKEN
+// the caller must present it (constant-time compare); with none, only THIS machine may call — unless the
+// operator explicitly opts into an open hub on a private network (ALLOW_OPEN_SYNC=1).
+const tokenOk = (req) => SYNC_TOKEN ? hubauth.safeEqual(req.headers['x-sync-token'] || '', SYNC_TOKEN) : (process.env.ALLOW_OPEN_SYNC === '1' || hubauth.isLocal(req));
+if (!SYNC_TOKEN) { try { console.warn('[hub] SYNC_TOKEN is not set — sync and mail relay accept requests from THIS machine only. Set SYNC_TOKEN (the same value on every desktop: Administration → Sync) to let other computers sync.'); } catch (_) {} }
 const STORE = path.join(DATA_DIR, 'central-store.json');
 try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
 
@@ -43,14 +53,21 @@ try {
     store = loaded && loaded.records ? loaded : { epoch: crypto.randomUUID(), records: loaded || {} };
   }
 } catch (_) { store = { epoch: crypto.randomUUID(), records: {} }; }
+store.records = RIX.wrap(store.records);
 if (!store.epoch) store.epoch = crypto.randomUUID();
 if (!('branding' in store)) store.branding = null; // {name, short, logo, motto} pushed by the app
 if (!store.payConfig) store.payConfig = {}; // online-payment gateway config (keys + test mode) pushed by the desktop hub
 if (!store.storageConfig) store.storageConfig = {}; // object-storage creds (Supabase/R2) pushed by the desktop hub so offloaded docs/books resolve
+if (!store.ssoConfig) store.ssoConfig = {}; // OIDC single-sign-on config (issuer/client_id/secret) pushed by the desktop hub
+if (!store.aiConfig) store.aiConfig = null;   // 🤖 portal-assistant AI provider (key included) pushed by the desktop — PRIVATE
 if (!store.deviceTokens) store.deviceTokens = {}; // fcmToken -> { kind, id, platform, ts } (native app push targets)
+// 🔐 a stable per-hub portal SESSION key (random, kept in the store) — sessions survive restarts without ever
+// falling back to a publicly known default
+let _newPortalKey = false; if (!store.portalKey) { store.portalKey = crypto.randomBytes(32).toString('hex'); _newPortalKey = true; }
 
 let saveTimer = null;
 function save() { if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = null; try { fs.writeFileSync(STORE, JSON.stringify(store)); } catch (_) {} }, 600); }
+if (_newPortalKey) save();
 
 // ---- Supabase backing (optional) ------------------------------------------
 // When SUPABASE_URL + SUPABASE_KEY are set, this hub mirrors the SAME generic JSONB
@@ -139,6 +156,9 @@ async function cloudLoadAll() {
     // (without this, a deployment that set up storage on the desktop but not in the hub env served
     // "This document is unavailable" for every offloaded file).
     const sc = await cloudGetMeta('storageConfig'); if (sc) { try { const o = JSON.parse(sc); if (o && typeof o === 'object') store.storageConfig = o; } catch (_) {} }
+    // restore the OIDC single-sign-on config (issuer/client_id/secret) the desktop pushed
+    const so = await cloudGetMeta('ssoConfig'); if (so) { try { const o = JSON.parse(so); if (o && typeof o === 'object') store.ssoConfig = o; } catch (_) {} }
+    const ai = await cloudGetMeta('aiConfig'); if (ai) { try { const o = JSON.parse(ai); if (o && typeof o === 'object') store.aiConfig = o; } catch (_) {} }
     // restore registered push tokens (Cloud Run's local FS is ephemeral — without this, a cold start
     // would forget every device and pushes would stop until each app re-registers on next open).
     const dt = await cloudGetMeta('deviceTokens'); if (dt) { try { const o = JSON.parse(dt); if (o && typeof o === 'object') store.deviceTokens = Object.assign(o, store.deviceTokens); } catch (_) {} }
@@ -164,7 +184,7 @@ async function cloudPullDelta() {
     const ep = await cloudGetMeta('epoch');
     if (ep && ep !== store.epoch) {
       console.log('[supabase] cloud epoch changed (' + String(store.epoch).slice(0, 8) + ' → ' + String(ep).slice(0, 8) + ') — clearing portal store and reloading the fresh cloud.');
-      store.epoch = ep; store.records = {}; lastCloudPull = ''; storeVersion = Date.now(); save();
+      store.epoch = ep; store.records = RIX.wrap({}); lastCloudPull = ''; storeVersion = Date.now(); save();
       await cloudLoadAll();
       storeVersion = Date.now();
       return;
@@ -196,7 +216,7 @@ async function cloudPullDelta() {
 
 // in-memory version bumped on every applied change → portal clients poll this for live updates
 let storeVersion = Date.now();
-function allEntity(entity) { const out = []; for (const k in store.records) { const r = store.records[k]; if (r.entity === entity && r.row && !r.row.deleted) out.push(r.row); } return out; }
+function allEntity(entity) { return RIX.all(store.records, entity); }
 function oneEntity(entity, id) { const r = store.records[entity + ':' + id]; return r && r.row && !r.row.deleted ? r.row : null; }
 
 // ---- native-app push (FCM) when a document/result is posted ---------------------------------
@@ -217,6 +237,12 @@ function tokensForStudents(ids) {
   for (const tk of Object.keys(store.deviceTokens || {})) { const d = store.deviceTokens[tk]; if (d && d.kind === 'student' && set.has(d.id)) out.push(tk); }
   return out;
 }
+/** The phones of any accounts by target key (student id · staff id · 'p:'+student id for a parent) — see pushtargets.js. */
+function tokensForTargets(keys) {
+  const set = new Set(keys); const out = [];
+  for (const tk of Object.keys(store.deviceTokens || {})) { const k = PT.deviceKey(store.deviceTokens[tk]); if (k && set.has(k)) out.push(tk); }
+  return out;
+}
 function persistDeviceTokens() { if (supaEnabled()) { try { cloudSetMeta('deviceTokens', JSON.stringify(store.deviceTokens)); } catch (_) {} } }
 function pruneStaleTokens(r) { if (r && r.stale && r.stale.length) { for (const t of r.stale) delete store.deviceTokens[t]; save(); persistDeviceTokens(); } }
 /** Push every enrolled student in a live class's cohort that it just went live. Shared by the desktop
@@ -231,10 +257,7 @@ async function pushLiveSession(row) {
 function titleCase(s) { return String(s || '').replace(/[_-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim() || 'Fee'; }
 function fmtMoney(amount, currency) { const n = Number(amount) || 0; return (currency ? currency + ' ' : '') + n.toLocaleString('en-US', { maximumFractionDigits: 2 }); }
 // Map an in-app notification's type to the app tab to open when its push is tapped.
-function segForNotifType(type, payload) {
-  try { const p = payload && JSON.parse(payload); if (p && p.clearance_id) return 'finalclr'; } catch (_) {}
-  return ({ fee: 'fees', payment: 'receipts', result: 'results', clearance: 'clearance', document: 'documents', exam: 'exam' })[type] || 'overview';
-}
+function segForNotifType(type, payload) { return PT.segFor(type, payload); }
 async function pushNewRecords(recs) {
   if (!pushReady || !fcm || !fcm.configured() || !recs || !recs.length) return;
   // Students who get a SPECIFIC-entity push this batch (fee/document/result/clearance/…) — so the generic
@@ -259,7 +282,7 @@ async function pushNewRecords(recs) {
   }
   for (const [sid, rows] of feeByStudent) {
     try {
-      const tokens = tokensForStudents([sid]); if (!tokens.length) continue;
+      const tokens = tokensForTargets(PT.familyTargets(sid)); if (!tokens.length) continue;   // the student and their parent
       const body = rows.length === 1
         ? (titleCase(rows[0].category) + ' — ' + fmtMoney(rows[0].amount, rows[0].currency))
         : (rows.length + ' new charges on your account — open Fees to view and pay.');
@@ -289,6 +312,45 @@ async function pushNewRecords(recs) {
         if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: 'Result published', body: row.title || 'A new statement of result is available' }, { seg: 'results', id: String(row.id || '') }));
       } else if (rec.entity === 'live_sessions' && row.active && !row.deleted) {
         await pushLiveSession(row); // A class just went live — push every enrolled student so they can tap in.
+      } else if (rec.entity === 'class_materials' && row.published && !row.deleted) {
+        // 📚 A lecturer shares the reading the night before the lecture. Nothing told the student —
+        // which defeats the entire point of publishing a reading IN ADVANCE. The class-start push
+        // already existed; this is the same cohort, the same mechanism, for the thing they are
+        // supposed to have done before the class rather than during it.
+        const ids = allEntity('students')
+          .filter(s => s.department_id === row.department_id && s.level_id === row.level_id)
+          .map(s => s.id);
+        const tokens = tokensForStudents(ids);
+        const what = (row.course_code ? row.course_code + ' — ' : '') + (row.title || 'A file was shared');
+        if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens,
+          { title: row.pinned ? '📌 Read this before class' : '📚 New class material', body: what },
+          { seg: 'liveclasses', id: String(row.id || ''), room: String(row.room || '') }));
+      } else if (rec.entity === 'class_questions' && row.resolved && row.answered_at && row.student_id && !row.deleted) {
+        // ❓ …and the student who ASKED is told when it is answered, rather than having to go back and
+        // check. Only the asker — the rest of the class sees it in the panel.
+        const tokens = tokensForStudents([row.student_id]);
+        if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens,
+          { title: '💬 Your question was answered', body: String(row.body || '').slice(0, 100) },
+          { seg: 'liveclasses', id: String(row.id || ''), room: String(row.room || '') }));
+      } else if (rec.entity === 'chat_messages' && row.conversation_id && !row.deleted && !row.call_id) {
+        // ✉️ push the students, lecturers / staff and parents in the conversation (never the sender); their
+        // "new message" notification rows in the same batch are then not pushed a second time
+        const conv = oneEntity('conversations', row.conversation_id); let members = []; try { members = JSON.parse((conv && conv.members) || '[]'); } catch (_) {}
+        for (const k of PT.chatTargets(members, row.sender_key)) covered.add(k);   // a muted member gets no second push from the bell row either
+        // chatrules.pushPlan — never to whoever muted the chat or blocked the sender; data-only, so the app groups it per chat
+        const plan = conv ? CHATR.pushPlan(row, conv, oneEntity) : null;
+        const tokens = plan && plan.data ? tokensForTargets(PT.chatTargets(plan.members, row.sender_key)) : [];
+        if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: plan.title, body: plan.body }, plan.data, { dataOnly: true }));
+      } else if (rec.entity === 'class_recordings' && row.status === 'ready' && row.published && !row.deleted) {
+        // 🎥 the cloud recording finished saving — push the cohort so a student who missed the class (or
+        // just wants to revise) can tap straight to it. Same cohort + mechanism as a new class material.
+        const ids = allEntity('students')
+          .filter(s => s.department_id === row.department_id && s.level_id === row.level_id)
+          .map(s => s.id);
+        const tokens = tokensForStudents(ids);
+        if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens,
+          { title: '🎥 Class recording ready', body: (row.course_code ? row.course_code + ' — ' : '') + (row.subject || 'Live class') + ' — tap to watch or download.' },
+          { seg: 'liveclasses', id: String(row.id || ''), room: String(row.room || '') }));
       } else if (rec.entity === 'malpractice_flags' && row.student_id && !row.deleted) {
         const tokens = tokensForStudents([row.student_id]);
         if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens, { title: '⚠️ Exam conduct notice', body: 'A possible malpractice was recorded during your exam — tap to see the evidence and appeal if it was a mistake.' }, { seg: 'surveillance', id: String(row.id || '') }));
@@ -311,8 +373,8 @@ async function pushNewRecords(recs) {
           { title: (TITLE[row.status] || '🎫 Ticket update') + ' — ' + tno, body: String(row.message || row.status || 'Your ticket was updated.').slice(0, 220) },
           { seg: 'results', id: String(row.request_id) }));
       } else if (rec.entity === 'payments' && row.student_id) {
-        // 🧾 a receipt issued anywhere (bursary desk, online settle on another node) lands on the phone
-        const tokens = tokensForStudents([row.student_id]);
+        // 🧾 a receipt issued anywhere (bursary desk, online settle on another node) lands on the phone (student + parent)
+        const tokens = tokensForTargets(PT.familyTargets(row.student_id));
         if (tokens.length) pruneStaleTokens(await fcm.sendToTokens(tokens,
           { title: '🧾 Payment received', body: (row.receipt_no ? 'Receipt ' + row.receipt_no + ' — ' : '') + fmtMoney(row.amount, row.currency) + (row.category ? ' (' + titleCase(row.category) + ')' : '') + '. Tap for your receipt.' },
           { seg: 'receipts', id: String(row.id || '') }));
@@ -327,19 +389,39 @@ async function pushNewRecords(recs) {
     const row = rec.row;
     try {
       if (!row || row.deleted || row.is_read || !row.target_user || covered.has(row.target_user)) continue;
-      const tokens = tokensForStudents([row.target_user]); if (!tokens.length) continue;
+      const tokens = tokensForTargets([row.target_user]); if (!tokens.length) continue;   // a student, a lecturer / staff member or a parent
       covered.add(row.target_user);
-      pruneStaleTokens(await fcm.sendToTokens(tokens, { title: row.title || 'Portal update', body: row.body || '' }, { seg: segForNotifType(row.type, row.payload) }));
+      const pf = PT.pushFor(row);   // 📞 an incoming call rings in the app (data-only, 45 s); the rest are ordinary notifications
+      pruneStaleTokens(await fcm.sendToTokens(tokens, { title: row.title || 'Portal update', body: row.body || '' }, pf.data, pf.opts));
     } catch (_) { /* best-effort */ }
   }
 }
 /** Records whose arrival should trigger a push (new, not-deleted documents/results/fees/clearance steps). */
-const PUSH_ENTITIES = ['portal_documents', 'results', 'live_sessions', 'malpractice_flags', 'online_exams', 'charges', 'grad_clearance_items', 'grad_clearances', 'notifications', 'ticket_events', 'payments'];
+const PUSH_ENTITIES = ['portal_documents', 'results', 'live_sessions', 'malpractice_flags', 'online_exams', 'charges', 'grad_clearance_items', 'grad_clearances', 'notifications', 'ticket_events', 'payments', 'class_materials', 'class_questions', 'class_recordings', 'chat_messages'];
 function collectPushable(entity, prev, row) {
   if (!PUSH_ENTITIES.includes(entity)) return false;
   if (!row || row.deleted) return false;
   if (entity === 'live_sessions' && !row.active) return false; // only a started (active) session pushes
   if (entity === 'malpractice_flags' && !row.student_id) return false; // only an identified student can be pushed/notified
+  if (entity === 'chat_messages' && prev && prev.row && !prev.row.deleted) return false; // ✉️ a message pushes once, when it first arrives
+  // 📚 a shared material pushes ONCE, when it first becomes visible to students. Not on a rename, not
+  // on a pin, and not when a staged item is edited — a lecturer tidying their reading list at midnight
+  // must not buzz two hundred phones each time.
+  if (entity === 'class_materials') {
+    if (!row.published) return false;
+    return !prev || !prev.row || prev.row.deleted || !prev.row.published;   // newly visible
+  }
+  // ❓ …and a question pushes its ASKER when it first gets an answer, not on every later edit of it.
+  if (entity === 'class_questions') {
+    if (!row.resolved || !row.answered_at || !row.student_id) return false;
+    return !prev || !prev.row || !prev.row.resolved;
+  }
+  // 🎥 a recording pushes the cohort ONCE, the moment it first becomes ready — never again on a later
+  // re-publish/rename, which would re-buzz two hundred phones for a class they were already told about.
+  if (entity === 'class_recordings') {
+    if (row.status !== 'ready' || !row.published) return false;
+    return !prev || !prev.row || prev.row.status !== 'ready';
+  }
   if (entity === 'online_exams') { if (row.status !== 'published' && row.status !== 'live') return false; return !prev || !prev.row || (prev.row.status !== 'published' && prev.row.status !== 'live'); } // push when it first becomes published/live
   if (entity === 'charges') { if (!row.student_id) return false; return !prev || !prev.row || prev.row.deleted; } // a newly-billed fee
   if (entity === 'ticket_events') { // 🎫 the desktop AI/staff advanced a student ticket → tell the phone
@@ -453,12 +535,23 @@ if (createPortal) {
   try {
     portal = createPortal({
       all: allEntity, one: oneEntity, getVersion: () => storeVersion, secret: SYNC_TOKEN || 'unibursar-portal',
+      // 🔐 sessions: PORTAL_SECRET or this hub's own stable random key; seals/verify codes: PORTAL_SECRET (else the
+      // sync token); the desktop's exam monitor presents SYNC_TOKEN; behind a proxy/load balancer by default
+      sessionKey: process.env.PORTAL_SECRET || store.portalKey, sealKey: process.env.PORTAL_SECRET || '', syncToken: SYNC_TOKEN,
+      trustProxy: process.env.TRUST_PROXY !== '0',
       // shared cross-instance live-frame relay (Cloud Run); null ⇒ portal uses pure in-memory (pinned single instance)
       frameStore: EXAM_RELAY ? examRelayStore() : null,
       // resolve offloaded book/document bytes from object storage (env creds) — see server/blobstore.js
       blobFetch: (key) => require('./blobstore').getBuffer(key),
+      // 🎥 object-storage WRITE + ranged/presigned READ for live-class recordings (put/putStream/getRange/
+      // del/presignGet/configured) — the hub is the writer for browser-captured recordings.
+      blobStore: (() => { try { return require('./blobstore'); } catch (_) { return null; } })(),
       // multi-provider online-payment gateway (Paystack/Flutterwave; env-keyed) — server/payments-gateway.js
       paymentGateway: (() => { try { return require('./payments-gateway'); } catch (_) { return null; } })(),
+      // 🔐 OIDC single-sign-on config (issuer/client_id/secret) the desktop pushed — private, never served
+      ssoConfig: () => store.ssoConfig || {},
+      // 🤖 the portal assistant's AI provider (never served — only used server-side to answer students)
+      aiConfig: () => store.aiConfig || null,
       // portal writes (e.g. password reset) update the store and bump updated_at so the
       // change syncs back to the desktop app on the next /sync/pull
       update: (entity, id, patch) => {
@@ -486,12 +579,20 @@ if (createPortal) {
         // admissions-desk notifications below) to Supabase so they sync DOWN to the registrar's
         // desktop in cloud-sync mode. Without this the admissions dashboard stays empty. No-op in hub mode.
         try { cloudUpsert([{ entity, id: row.id, row, updated_at: now }]); } catch (_) {}
+        // ✉️ a message written on the portal (student ↔ classmate, lecturer → student) pushes the other phones
+        if (entity === 'chat_messages') { try { pushNewRecords([{ entity, row }]).catch(() => {}); } catch (_) {} }
+        // 📣 a note written on the portal for someone's phone (a lecturer's class notice…) — message notes are
+        // already pushed with their chat message above
+        if (entity === 'notifications' && row.type !== 'message') { try { pushNewRecords([{ entity, row }]).catch(() => {}); } catch (_) {} }
         return true;
       },
       // A class started FROM THE PORTAL (a lecturer hosting on the web) → push the cohort, exactly like a
       // desktop-started class does via the sync ingest. portal.js calls this ONLY for a genuinely new
       // session (it skips a re-host), so there is no duplicate notification. Best-effort + async.
       onLiveStart: (row) => { try { pushLiveSession(row).catch(() => {}); } catch (_) {} },
+      // 🎥 a recording finished saving ON the portal → push its cohort directly (it never rides the
+      // desktop sync-push path, so this is the one place the cohort gets the "recording ready" push).
+      onRecordingReady: (row) => { try { pushNewRecords([{ entity: 'class_recordings', row }]).catch(() => {}); } catch (_) {} },
       // Send an applicant email (application confirmation + status updates) directly via the hub's SMTP
       // relay. Best-effort + async — it NEVER blocks or fails the apply flow; a missing relay just no-ops.
       sendMail: (msg) => { try { if (!relayConfigured()) return Promise.resolve({ ok: false, error: 'relay not configured' }); return relaySend(msg).then(r => r || { ok: true }).catch(e => ({ ok: false, error: e && e.message })); } catch (e) { return Promise.resolve({ ok: false, error: e && e.message }); } },
@@ -640,7 +741,13 @@ function send(res, code, obj) {
 function readBody(req) {
   return new Promise((resolve) => {
     let b = ''; req.on('data', d => { b += d; if (b.length > 24 * 1024 * 1024) req.destroy(); });
-    req.on('end', () => { try { resolve(b ? JSON.parse(b) : {}); } catch (_) { resolve({}); } });
+    req.on('end', () => {
+      // JSON is the norm; identity providers POST application/x-www-form-urlencoded (SAML ACS)
+      if (/x-www-form-urlencoded/i.test(String(req.headers['content-type'] || ''))) {
+        try { return resolve(Object.fromEntries(new URLSearchParams(b))); } catch (_) { return resolve({}); }
+      }
+      try { resolve(b ? JSON.parse(b) : {}); } catch (_) { resolve({}); }
+    });
     req.on('error', () => resolve({}));
   });
 }
@@ -658,7 +765,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' }); return res.end(); }
 
   // online portal (login page, dashboards, printable documents) — public, has its own auth
-  if (portal) { try { if (await portal.handle(req, res, u, req.method, () => readBody(req))) return; } catch (e) { return send(res, 500, { ok: false, error: 'portal error' }); } }
+  if (portal) { const unwrap = HTTPOPT.wrap(req, res); try { if (await portal.handle(req, res, u, req.method, () => readBody(req))) return; } catch (e) { return send(res, 500, { ok: false, error: 'portal error' }); } unwrap(); }
 
   // friendly root when the portal module isn't loaded (so the domain never looks "broken")
   if (p === '/' && req.method === 'GET' && !portal) { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('UniBursar hub is running. The web portal is unavailable because server/portal.js was not uploaded — add it and Restart. Sync endpoint: /health'); }
@@ -693,7 +800,7 @@ const server = http.createServer(async (req, res) => {
     if (!tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized.' });
     const body = await readBody(req);
     if (!body || body.confirm !== 'RESET') return send(res, 400, { ok: false, error: 'confirm required' });
-    store = { epoch: crypto.randomUUID(), records: {}, branding: store.branding };
+    store = { epoch: crypto.randomUUID(), records: RIX.wrap({}), branding: store.branding, portalKey: store.portalKey };
     storeVersion = Date.now(); save();
     if (supaEnabled()) { lastCloudPull = ''; cloudSchemaMode().then((m) => supaRest('DELETE', '/rest/v1/sync_records' + (m === 'entity' ? '?entity=not.is.null' : '?key=not.is.null'), null, { 'Prefer': 'return=minimal' })).catch(() => {}); cloudSetMeta('epoch', store.epoch); }
     return send(res, 200, { ok: true });
@@ -746,6 +853,27 @@ const server = http.createServer(async (req, res) => {
     store.storageConfig = cfg || {};
     storeVersion = Date.now(); save();
     cloudSetMeta('storageConfig', JSON.stringify(store.storageConfig));
+    return send(res, 200, { ok: true });
+  }
+  // the desktop hub pushes its OIDC single-sign-on config (issuer/client id + SECRET) so the cloud
+  // portal can run the SSO flow. Token-protected: it carries the confidential client secret.
+  // 🤖 the desktop pushes the portal assistant's AI provider config (it carries an API key → token-protected)
+  if (p === '/ai-config' && req.method === 'POST') {
+    if (!tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized.' });
+    const body = await readBody(req);
+    const cfg = (body && typeof body.config === 'object' && body.config) ? body.config : null;
+    store.aiConfig = cfg && cfg.enabled !== false ? cfg : null;
+    storeVersion = Date.now(); save();
+    cloudSetMeta('aiConfig', JSON.stringify(store.aiConfig || { enabled: false }));
+    return send(res, 200, { ok: true });
+  }
+  if (p === '/sso-config' && req.method === 'POST') {
+    if (!tokenOk(req)) return send(res, 401, { ok: false, error: 'Unauthorized.' });
+    const body = await readBody(req);
+    const cfg = (body && typeof body.config === 'object' && body.config) ? body.config : (body && typeof body === 'object' ? body : {});
+    store.ssoConfig = cfg || {};
+    storeVersion = Date.now(); save();
+    cloudSetMeta('ssoConfig', JSON.stringify(store.ssoConfig));
     return send(res, 200, { ok: true });
   }
 
