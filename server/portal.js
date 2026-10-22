@@ -63,7 +63,7 @@ function numWords(num) { num = Math.floor(Number(num) || 0); if (num === 0) retu
 function amountWords(a, c) { const whole = Math.floor(Number(a) || 0); const k = Math.round((Number(a) - whole) * 100); let s = `${numWords(whole)} ${WORD_CCY[c] || c}`; if (k > 0) s += ` and ${numWords(k)}/100`; return s + ' only'; }
 
 module.exports = function createPortal(deps) {
-  const { all, one, getVersion, secret, institution, update, create, registerDevice, jitsiConfig, onLiveStart, blobFetch, sendMail } = deps;
+  const { all, one, getVersion, secret, institution, update, create, registerDevice, jitsiConfig, onLiveStart, blobFetch, blobUrl, sendMail } = deps;
   // Multi-provider online-payment gateway (Paystack/Flutterwave). Injected by the hub; falls back to the
   // bundled module so it always works. Tests inject a MOCK so the money path runs without a live gateway.
   const gateway = (deps && deps.paymentGateway) || (function () { try { return require('./payments-gateway'); } catch (_) { return null; } })();
@@ -151,6 +151,12 @@ module.exports = function createPortal(deps) {
   // the rest of a shared campus connection.
   const LOGIN_MAX = 8, LOGIN_WINDOW = 15 * 60 * 1000, LOGIN_BLOCK = 15 * 60 * 1000;
   const loginFails = new Map();                    // key -> { n, first, until }
+  // Short-lived password-reset codes (emailed to the address on file). Kept IN MEMORY — like the
+  // login throttle and proctor frames — so it works identically whether the portal runs on the cloud
+  // hub or embedded in the desktop app (whose SQLite has a fixed schema and no place for a temp column).
+  const pwResets = new Map();                       // studentId -> { h, exp, role }
+  const RESET_TTL = 15 * 60 * 1000;
+  function pruneResets() { const now = Date.now(); for (const [k, v] of pwResets) if (!v || now > v.exp) pwResets.delete(k); }
   function clientIp(req) { return String((req.headers['x-forwarded-for'] || '').split(',')[0].trim() || (req.socket && req.socket.remoteAddress) || ''); }
   function loginKey(req, login) { return String(login || '').trim().toLowerCase() + '|' + clientIp(req); }
   /** Seconds remaining on a lock, or 0 if not blocked (clears an elapsed lock as a side effect). */
@@ -169,6 +175,24 @@ module.exports = function createPortal(deps) {
     return e;
   }
   function loginOk(key) { loginFails.delete(key); }
+
+  // 🛡 anti-enumeration throttle for the PUBLIC credential-verification desk. A verifier confirms ONE
+  // graduate they already know; a scraper walks the matric space and harvests the whole student body's
+  // name, photo, DOB, nationality and programme — the endpoint needs no password, so the cap IS the lock.
+  // Keyed on IP ALONE (unlike loginKey, which keys on login+IP): here the attacker varies the matric on
+  // every request, so folding the matric into the key would drop each attempt in its own empty bucket
+  // and the limiter would never fire.
+  const VERIFY_MAX = 25, VERIFY_WINDOW = 10 * 60 * 1000;
+  const verifyHits = new Map();                    // ip -> { n, first }
+  /** Count this verification attempt. Returns 0 when allowed, else minutes until the window rolls over. */
+  function verifyThrottle(req) {
+    const ip = clientIp(req) || 'unknown', now = Date.now();
+    let e = verifyHits.get(ip);
+    if (!e || (now - e.first) > VERIFY_WINDOW) e = { n: 0, first: now };
+    e.n++; verifyHits.set(ip, e);
+    if (verifyHits.size > 5000) for (const [k, v] of verifyHits) if ((now - v.first) > VERIFY_WINDOW) verifyHits.delete(k);
+    return e.n > VERIFY_MAX ? (Math.ceil((VERIFY_WINDOW - (now - e.first)) / 60000) || 1) : 0;
+  }
 
   // ---- Face Biometric (pure-maths 1:1 / identity-hold; mirrors electron/services/face.js) ----
   // The 128-D descriptors are computed in the student's browser (face-api.js, served below from
@@ -289,6 +313,28 @@ module.exports = function createPortal(deps) {
     return one(entity, id);
   }
   function passField(kind, row) { return kind === 'parent' ? row.parent_portal_pass : row.portal_pass; }
+
+  // Is a published portal document visible to this student?
+  // A document ADDRESSED TO A SPECIFIC STUDENT (student_id set) is always theirs and must NEVER be
+  // hidden just because their faculty/department/level later changed (promotion, transfer, session
+  // roll-over) — that regression is what made "uploaded documents disappear". Only BROADCAST
+  // documents (no student_id) are scoped by faculty/department/level.
+  function docVisibleTo(d, s) {
+    if (!d || d.deleted) return false;
+    if (d.student_id) return d.student_id === s.id;
+    return (!d.faculty_id || d.faculty_id === s.faculty_id)
+      && (!d.department_id || d.department_id === s.department_id)
+      && (!d.level_id || d.level_id === s.level_id);
+  }
+  // Mask an email for a recovery hint ("ada.obi@gmail.com" → "ad••••@gm•••.com") — enough to recognise
+  // your own address without exposing it.
+  function maskEmail(e) {
+    e = String(e || '').trim(); const at = e.indexOf('@'); if (at < 1) return '';
+    const user = e.slice(0, at), dom = e.slice(at + 1), dot = dom.lastIndexOf('.');
+    const host = dot > 0 ? dom.slice(0, dot) : dom, tld = dot > 0 ? dom.slice(dot) : '';
+    const mask = (str, keep) => str.length <= keep ? str : str.slice(0, keep) + '•'.repeat(Math.min(4, str.length - keep));
+    return mask(user, 2) + '@' + mask(host, 2) + tld;
+  }
 
   // ---- shared computations ----
   const nameOf = (entity, id) => { const r = id ? one(entity, id) : null; return r ? r.name : null; };
@@ -423,7 +469,7 @@ module.exports = function createPortal(deps) {
       configOverwrite:{prejoinPageEnabled:true,startWithAudioMuted:${isHost ? 'false' : 'true'},startWithVideoMuted:false,disableDeepLinking:true,subject:${JSON.stringify(subj)},disableReactions:false},
       interfaceConfigOverwrite:{MOBILE_APP_PROMO:false,SHOW_JITSI_WATERMARK:false,DEFAULT_BACKGROUND:'#0b1220',TOOLBAR_BUTTONS:${isHost ? HOST_TOOLBAR : STUDENT_TOOLBAR}}
     });
-    api.addEventListener('readyToClose',function(){lcEndClass();location.href='/';});
+    api.addEventListener('readyToClose',function(){lcEndClass();location.href=(window.__B||'')+'/';});
     if(isHost){
       // The lecturer hosts: enable the lobby so students must be admitted, label the room, and MARK the
       // class live for the cohort (so it shows "Live now", the app can join, and there is a session to
@@ -456,7 +502,7 @@ module.exports = function createPortal(deps) {
         try{api.dispose();}catch(e){}
         var m=document.getElementById('meet'); if(m)m.style.display='none';
         if(w){w.style.display='flex';w.innerHTML='<div><div style="font-size:40px">\\uD83D\\uDCF4</div><h3>The class has ended</h3><p style="opacity:.8">Your lecturer ended this live class.</p><p><a href="/" style="color:#9bd">Back to portal</a></p></div>';}
-        setTimeout(function(){location.href='/';},4000);
+        setTimeout(function(){location.href=(window.__B||'')+'/';},4000);
       }
       if(LC_ROOM){
         var lcPoll=setInterval(function(){
@@ -485,7 +531,7 @@ module.exports = function createPortal(deps) {
       add('fee', '💳', 'New fee on your account', `${catLabel(c.category)} — ${money(c.amount, c.currency)}`, c.created_at, 'fees', null);
     for (const r of all('results').filter(r => r.student_id === s.id))
       add('result', '📑', 'Result published', r.title || 'A new statement of result is available', r.created_at, 'results', null);
-    for (const d of all('portal_documents').filter(d => (!d.student_id || d.student_id === s.id) && (!d.faculty_id || d.faculty_id === s.faculty_id) && (!d.department_id || d.department_id === s.department_id) && (!d.level_id || d.level_id === s.level_id)))
+    for (const d of all('portal_documents').filter(d => docVisibleTo(d, s)))
       add('document', '📂', 'New document available', d.title || 'A document was published for you', d.created_at, 'documents', '/doc/portal-document/' + d.id);
     for (const t of all('timetables').filter(t => !t.deleted && t.status === 'published' && (t.scope === 'faculty' ? t.faculty_id === s.faculty_id : (t.department_id === s.department_id && (!t.level_id || t.level_id === s.level_id)))))
       add('timetable', '🗓', 'Timetable published', t.title || 'A new timetable is available', t.published_at, 'timetable', '/doc/timetable/' + t.id);
@@ -794,7 +840,7 @@ button.warnbtn{background:#7c3aed;margin-left:auto}
 </div></div></div>
 
 <canvas id="cv" style="display:none"></canvas>
-${faceEnrolled ? '<script defer src="/vendor/face-api.min.js"></script>' : ''}
+${faceEnrolled ? '<script>var fes=document.createElement("script");fes.defer=true;fes.src=(window.__B||"")+"/vendor/face-api.min.js";document.head.appendChild(fes)</script>' : ''}
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" id="MathJax-script" async></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <script defer src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
@@ -1290,10 +1336,19 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       library: libraryForStudent(s),
       surveillance: surveillanceForStudent(s),
       exams: examsForStudent(s),
-      documents: all('portal_documents').filter(d => (!d.student_id || d.student_id === s.id) && (!d.faculty_id || d.faculty_id === s.faculty_id) && (!d.department_id || d.department_id === s.department_id) && (!d.level_id || d.level_id === s.level_id))
+      documents: all('portal_documents').filter(d => docVisibleTo(d, s))
         .map(d => ({ id: d.id, title: d.title, category: d.category, office: d.office, by: userName(d.uploaded_by), mime: d.mime, date: d.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
       transcriptRequests: all('transcript_requests').filter(r => r.student_id === s.id && !r.deleted)
         .map(r => ({ id: r.id, kind: r.kind, purpose: r.purpose, status: r.status, note: r.note, date: r.created_at })).sort((a, b) => String(b.date).localeCompare(String(a.date))),
+      // 📨 GRADUATE DOCUMENT DISPATCH — can this student send their credentials to an organization,
+      // and which issued documents are available to send? (graduates only; registrar's email sends)
+      dispatch: (() => {
+        const al2 = all('alumni').find(a => a.student_id === s.id && !a.deleted);
+        const graduated = !!al2 || ['alumni', 'graduated'].includes(String(s.status || '').toLowerCase());
+        const byKind = (k) => all('portal_documents').some(x => !x.deleted && x.student_id === s.id && x.auto_kind === k);
+        const docs = CREDENTIAL_DOCS.map(spec => ({ key: spec.key, label: spec.label, available: (!spec.gradOnly || graduated) && spec.kinds.some(byKind) }));
+        return { graduated, docs, ready: graduated && ['transcript', 'certificate'].every(k => (docs.find(x => x.key === k) || {}).available) };
+      })(),
       // OPEN evaluation surveys for this student's cohort that they have NOT yet answered
       surveys: openSurveysForStudent(s),
       // any score withheld by the examinations board (released=0) → the results tab shows a notice.
@@ -1649,8 +1704,432 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     };
   }
 
+  // ---- 🔎 external credential verification (university / government / employer) ----
+  // A DD/MM/YYYY DOB formatted from its parts (never `new Date`, which would shift the day by a zone).
+  function dobText(v) { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(v || '')); return m ? `${m[3]}/${m[2]}/${m[1]}` : (v || '—'); }
+  function classOf(cgpa) { const x = Number(cgpa) || 0; return x >= 4.5 ? 'First Class' : x >= 3.5 ? 'Second Class (Upper Division)' : x >= 2.4 ? 'Second Class (Lower Division)' : x >= 1.5 ? 'Third Class' : x >= 1 ? 'Pass' : '—'; }
+  /** The institution's public contact block (shown when a matric can't be verified → manual route). */
+  function instContact() {
+    const i = inst();
+    return { name: i.name || 'the University', email: i.email || '', phone: i.phone || '', address: i.address || '', website: i.website || (i.portal_url || '') };
+  }
+  /** Matric normaliser: verifiers type matrics with spaces, dots, dashes or different separators
+   *  ("021 / 0205 / 004", "021-0205-004") — compare on the alphanumeric skeleton so a valid matric
+   *  is never rejected over formatting. */
+  function normMatric(v) { return String(v || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+  /**
+   * Find a student by matric number across the ENTIRE student body — active students AND alumni
+   * (graduates keep their students row with status='alumni'; nothing here filters on status).
+   * Match order: exact (case-insensitive) → normalised skeleton → raw id. The alumni table is also
+   * walked as a safety net for any legacy record whose student row lost its matric.
+   */
+  function findStudentByMatric(key) {
+    const k = String(key || '').trim(); if (!k) return null;
+    const kl = k.toLowerCase(); const kn = normMatric(k);
+    const rows = all('students');
+    let s = rows.find(x => String(x.matric_no || '').toLowerCase() === kl)
+      || (kn ? rows.find(x => normMatric(x.matric_no) === kn) : null)
+      || one('students', k);
+    if (s && !s.deleted) return s;
+    // legacy safety net: an alumni row whose linked student still matches by id/matric skeleton
+    const al = all('alumni').find(a => normMatric(a.matric_no) === kn || a.student_id === k);
+    if (al) { const st = one('students', al.student_id); if (st && !st.deleted) return st; }
+    return null;
+  }
+  /** The credential documents an external verifier may request. Each maps to the auto_kind(s) the
+   *  publish pipeline stores (first match wins), so the list grows with the document suite. */
+  const CREDENTIAL_DOCS = [
+    { key: 'transcript', label: 'Academic Transcript', kinds: ['transcript_copy', 'transcript'], gradOnly: false },
+    { key: 'certificate', label: 'Degree Certificate', kinds: ['certificate_copy', 'certificate'], gradOnly: true },
+    { key: 'recommendation', label: 'Letter of Recommendation', kinds: ['recommendation'], gradOnly: false },
+    { key: 'english_proficiency', label: 'English Proficiency Letter', kinds: ['english_proficiency'], gradOnly: false },
+    { key: 'accreditation_status', label: 'Accreditation Status Confirmation', kinds: ['accreditation_status'], gradOnly: false },
+    { key: 'programme_accreditation', label: 'Accredited Programme Confirmation', kinds: ['programme_accreditation'], gradOnly: false },
+  ];
+  // ---- 🔐 document authenticity (tamper-evidence) --------------------------------------------
+  /** SHA-256 of a buffer/string → lowercase hex. */
+  function sha256Hex(buf) { return crypto.createHash('sha256').update(buf).digest('hex'); }
+  /** A stable, public verification CODE for an issued document (safe to print on the document and to
+   *  show a verifier) derived from its internal id — never reveals the id itself. */
+  function docCode(id) { return 'UB-' + sha256Hex('doccode:' + String(id)).slice(0, 10).toUpperCase(); }
+  /** Group a hex fingerprint into readable quads: "A1B2C3D4E5F60718" → "A1B2 C3D4 E5F6 0718". */
+  function groupFp(hex) { return String(hex || '').replace(/(.{4})(?=.)/g, '$1 '); }
+  /** Normalise a verification code a human typed or read off paper. They arrive as "ub 1a2b3c4d5e",
+   *  "UB-1A2B-3C4D-5E", "1a2b3c4d5e" — compare on the bare hex so a valid code is never rejected over
+   *  formatting (the same tolerance normMatric() gives matric numbers). '' when it isn't a code shape. */
+  function normCode(v) {
+    const s = String(v || '').toUpperCase().replace(/[^0-9A-Z]/g, '').replace(/^UB/, '');
+    return /^[0-9A-F]{10}$/.test(s) ? 'UB-' + s : '';
+  }
+  function isCredentialKind(k) { return CREDENTIAL_DOCS.some(s => s.kinds.includes(String(k || ''))); }
+  /** Every issued credential document row — the universe a code/file lookup searches. */
+  function credentialDocs() { return all('portal_documents').filter(x => !x.deleted && isCredentialKind(x.auto_kind)); }
+  /** code → document row, so a verifier can verify straight from the code PRINTED ON the document without
+   *  knowing the matric number at all. Cheap (docCode hashes the id — no bytes fetched) but O(rows), so the
+   *  index is memoised briefly rather than rebuilt per request. */
+  let _codeIx = null, _codeIxAt = 0;
+  function docByCode(code) {
+    const c = normCode(code); if (!c) return null;
+    if (!_codeIx || (Date.now() - _codeIxAt) > 60000) {
+      _codeIx = new Map(); _codeIxAt = Date.now();
+      for (const d of credentialDocs()) _codeIx.set(docCode(d.id), d);
+    }
+    return _codeIx.get(c) || null;
+  }
+  // An ISSUED document is immutable — a re-issue writes a NEW row rather than rewriting these bytes — so a
+  // fingerprint, once computed, can be cached for the life of the process. This is what keeps the registry-
+  // wide file lookup below affordable: only the first pass pays the blob fetches.
+  const _fpMemo = new Map();                       // docId -> sha256 hex
+  /** The SHA-256 fingerprint of an issued document's actual bytes (file inline or in blob storage),
+   *  or '' when the bytes aren't retrievable. This is what makes a forged/altered copy detectable:
+   *  the same document always hashes to the same value; a single changed grade changes the hash. */
+  async function fingerprintOfDoc(docId) {
+    if (_fpMemo.has(docId)) return _fpMemo.get(docId);
+    const d = one('portal_documents', docId); if (!d || d.deleted) return '';
+    let fp = '';
+    if (d.file) { try { fp = sha256Hex(Buffer.from(String(d.file), 'base64')); } catch (_) { fp = ''; } }
+    else if (d.file_key) { const buf = await blobFetchLocal(d.file_key); if (buf) fp = sha256Hex(buf); }
+    // only a SUCCESSFUL hash is cached — a blob fetch that failed transiently must be retried, not
+    // remembered as "this document has no bytes".
+    if (fp) { if (_fpMemo.size > 4000) _fpMemo.clear(); _fpMemo.set(docId, fp); }
+    return fp;
+  }
+  /** Find the issued document whose bytes hash to `hash`, across the WHOLE registry. This is what lets a
+   *  verifier drop in a PDF with NO matric number and be told whose credential it is — or that it matches
+   *  nothing the institution ever issued. Newest-first so a re-issued document identifies as the current one. */
+  async function docByHash(hash) {
+    if (!hash) return null;
+    const rows = credentialDocs().sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+    for (const d of rows) { if (await fingerprintOfDoc(d.id) === hash) return d; }
+    return null;
+  }
+  /** The newer row that has REPLACED `d`, if the registry has since re-issued that credential. A verifier
+   *  holding a superseded transcript holds a genuine-but-outdated document — materially different from a
+   *  forgery, and reporting the two the same way would be wrong in both directions. */
+  function supersededBy(d) {
+    if (!d) return null;
+    return all('portal_documents')
+      .filter(x => !x.deleted && x.student_id === d.student_id && x.auto_kind === d.auto_kind && String(x.created_at || '') > String(d.created_at || ''))
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))[0] || null;
+  }
+  /** The label CREDENTIAL_DOCS gives an auto_kind ('transcript_copy' → 'Academic Transcript'). */
+  function labelOfKind(k) { const s = CREDENTIAL_DOCS.find(x => x.kinds.includes(String(k || ''))); return s ? s.label : 'Official Document'; }
+  // ---- 🫥 invisible document seal --------------------------------------------------------------
+  // Every PDF the registry issues carries a hidden `%UBSEAL1 <keyid>.<payload>.<hmac>` trailer line
+  // (written by electron/services/docseal.js): invisible in every viewer, but readable here. The HMAC
+  // key is the SAME stable portal secret this desk already runs on, so a seal validates online with
+  // no database lookup — and then binds to the registry row for the identity report. This is what
+  // lets an ALTERED copy of a genuine document be recognised as exactly that (its bytes no longer
+  // match any issued file, but its seal still proves what it started life as).
+  function sealOfBuffer(buf) {
+    try {
+      const tail = buf.slice(Math.max(0, buf.length - 4096)).toString('latin1');
+      const m = /%UBSEAL1 ([0-9a-f]{8})\.([A-Za-z0-9_-]+)\.([0-9a-f]{64})/.exec(tail);
+      if (!m) return { present: false };
+      const key = String(secret || '');
+      const keyId = crypto.createHash('sha256').update('ubseal|' + key).digest('hex').slice(0, 8);
+      if (m[1] !== keyId) return { present: true, valid: false, reason: 'foreign-key' };
+      if (crypto.createHmac('sha256', key).update(m[2]).digest('hex') !== m[3]) return { present: true, valid: false, reason: 'signature' };
+      const p = JSON.parse(Buffer.from(m[2].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+      return { present: true, valid: true, docId: p.d || '', studentId: p.s || '', kind: p.k || '', issuedAt: p.t || '' };
+    } catch (_) { return { present: false }; }
+  }
+  /** Fill each available document with its content fingerprint (awaits blob fetches); strips the
+   *  internal id afterwards. Mutates + returns the verification record. */
+  async function enrichFingerprints(v) {
+    if (!v || !v.valid || !Array.isArray(v.documents)) return v;
+    for (const d of v.documents) {
+      if (d._docId) { const fp = await fingerprintOfDoc(d._docId); d.fingerprint = fp ? groupFp(fp.slice(0, 16).toUpperCase()) : ''; }
+      delete d._docId;
+    }
+    return v;
+  }
+
+  /**
+   * Look up a student by matric and return everything an external verifier legitimately needs to
+   * confirm a transcript/certificate: identity, programme, entry & graduation years, CGPA + class,
+   * whether the student has actually GRADUATED (an active-but-not-graduated student is reported
+   * as such, never as a graduate), and which issued documents are available — each with its issue
+   * date, a public verification CODE and (after enrichFingerprints) a tamper-evident fingerprint.
+   * Returns { valid:false } when the matric matches no record.
+   */
+  /**
+   * Resolve whatever the verifier typed to a student. They hold a DOCUMENT, not necessarily a matric
+   * number — so a verification code printed on that document identifies the record just as well, and is
+   * the stronger signal of the two (it proves possession of an issued credential rather than a guess at
+   * an id). Matric first (the common case), then code.
+   * → { student, viaDoc } — viaDoc is the document row when a code resolved the lookup.
+   */
+  function resolveSubject(key) {
+    const s = findStudentByMatric(key);
+    if (s) return { student: s, viaDoc: null };
+    const d = docByCode(key);
+    if (d) { const st = one('students', d.student_id); if (st && !st.deleted) return { student: st, viaDoc: d }; }
+    return { student: null, viaDoc: null };
+  }
+  function verifyCredentials(matric) {
+    const { student: s, viaDoc } = resolveSubject(matric);
+    if (!s) return { valid: false };
+    const sc = scoresFor(s.id);
+    const al = all('alumni').find(a => a.student_id === s.id && !a.deleted);
+    const graduated = !!al || ['alumni', 'graduated'].includes(String(s.status || '').toLowerCase());
+    const fullName = [s.first_name, s.middle_name, s.last_name].map(x => String(x || '').trim()).filter(Boolean).join(' ') || 'Unknown';
+    // Academic summary: the LIVE released scores when they're on the store, else the FINAL summary
+    // stamped on the alumni row at graduation/publication (bulk-imported alumni and paper-issued
+    // records have no per-course rows here — reporting them as "CGPA 0.00" was simply wrong).
+    let cgpa = Number(sc.cgpa) || 0, units = sc.totalUnits || 0, courses = (sc.courses || []).length, recordSource = 'live';
+    if (!units && al && Number(al.cgpa) > 0) {
+      cgpa = Number(al.cgpa); units = Number(al.total_units) || 0; courses = Number(al.courses) || 0; recordSource = 'registry';
+    }
+    const hasRecord = units > 0 || cgpa > 0;
+    // the most recent issued row of a given credential (for its code + issue date + fingerprint)
+    const docRowOf = (spec) => {
+      for (const k of spec.kinds) {
+        const rows = all('portal_documents').filter(x => !x.deleted && x.student_id === s.id && x.auto_kind === k)
+          .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+        if (rows[0]) return rows[0];
+      }
+      return null;
+    };
+    /** How many times this credential has been issued for the student — >1 means every copy but the
+     *  newest is superseded, which a verifier holding an older printout needs to be told. */
+    const issueCountOf = (spec) => all('portal_documents')
+      .filter(x => !x.deleted && x.student_id === s.id && spec.kinds.includes(x.auto_kind)).length;
+    const documents = CREDENTIAL_DOCS.map(spec => {
+      const row = (!spec.gradOnly || graduated) ? docRowOf(spec) : null;
+      const issues = row ? issueCountOf(spec) : 0;
+      return {
+        key: spec.key, label: spec.label, available: !!row,
+        code: row ? docCode(row.id) : '',
+        issuedAt: row ? row.created_at : '',
+        office: row ? (row.office || 'Office of the Registrar') : '',
+        issues,                               // 1 = issued once; >1 = re-issued, older copies are superseded
+        reissued: issues > 1,
+        _docId: row ? row.id : '',            // internal — enrichFingerprints() strips this before responding
+      };
+    });
+    return {
+      valid: true, graduated,
+      ref: String(s.id).replace(/-/g, '').slice(0, 10).toUpperCase(),
+      verifiedAt: new Date().toISOString(),
+      // how the record was found: 'code' proves the verifier holds an issued document, 'matric' is a
+      // lookup by identifier. The report says which — they are not equally strong evidence.
+      matchedBy: viaDoc ? 'code' : 'matric',
+      matchedDocument: viaDoc ? { label: labelOfKind(viaDoc.auto_kind), code: docCode(viaDoc.id), issuedAt: viaDoc.created_at || '' } : null,
+      institution: (() => { const i = inst(); return { name: i.name || '', short: i.short || '', logo: i.logo || '' }; })(),
+      student: {
+        name: fullName, matric: s.matric_no || '—', photo: s.photo || '',
+        dob: dobText(s.date_of_birth), gender: s.gender || '—', nationality: s.nationality || '—',
+        email: '', // identity only — never leak the student's private contacts to a verifier
+        faculty: nameOf('faculties', s.faculty_id) || '—', department: nameOf('departments', s.department_id) || '—',
+        level: nameOf('levels', s.level_id) || '—', status: graduated ? 'alumni' : (s.status || 'active'),
+        programme: nameOf('departments', s.department_id) || '—',
+        campus: nameOf('campuses', s.campus_id) || '',
+      },
+      entryYear: nameOf('academic_sessions', s.entry_session_id) || '—',
+      gradYear: (al && nameOf('academic_sessions', al.graduation_session)) || (graduated ? '—' : ''),
+      // hasRecord=false → the metrics are UNKNOWN here (Registry holds the detail) — never "0.00"
+      hasRecord, recordSource,
+      cgpa: hasRecord ? cgpa.toFixed(2) : null,
+      totalUnits: hasRecord ? units : null,
+      courses: hasRecord ? courses : null,
+      classification: (al && al.classification) || (graduated && hasRecord ? classOf(cgpa) : ''),
+      standing: hasRecord ? classOf(cgpa) : '',
+      documents,
+      hasTranscript: documents.find(d => d.key === 'transcript').available,
+      hasCertificate: documents.find(d => d.key === 'certificate').available,
+      _sid: s.id,
+    };
+  }
+  /** Record a verification request (synced back to the registry). Best-effort. */
+  function logVerification(body, result) {
+    try {
+      const now = new Date().toISOString();
+      create('verification_requests', {
+        id: (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : ('vr-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)),
+        verifier_type: String((body && body.verifierType) || 'other').slice(0, 40),
+        verifier_name: String((body && body.name) || '').slice(0, 120),
+        verifier_email: String((body && body.email) || '').slice(0, 160),
+        matric: String((body && body.matric) || '').slice(0, 60),
+        student_id: (result && result._sid) || null,
+        found: result && result.valid ? 1 : 0, emailed: 0,
+        // audit trail: the verifier's stated purpose + consent attestation + how they verified
+        note: [
+          (body && body.purpose) ? ('purpose: ' + String(body.purpose).slice(0, 80)) : '',
+          (body && body.consent) ? 'consent: attested' : '',
+          (body && body.channel) ? ('via: ' + String(body.channel).slice(0, 24)) : '',
+        ].filter(Boolean).join(' · ').slice(0, 220),
+        created_at: now, updated_at: now, deleted: 0, origin_node: 'portal',
+      });
+    } catch (_) { /* logging is best-effort */ }
+  }
+  /** The registrar's sending identity: the documents go out AS the Office of the Registrar — the
+   *  registrar user's email is the reply-to, and the relay is asked to send through the registrar's
+   *  own configured mailbox (senderRole) when one exists, falling back to the institution's SMTP. */
+  function registrarSender() {
+    const u = all('users').find(x => !x.deleted && x.role === 'registrar' && x.email) || null;
+    const i = inst();
+    return {
+      email: (u && u.email) || i.email || '',
+      userId: u ? u.id : null,
+      name: `Office of the Registrar${i.name ? ' — ' + i.name : ''}`,
+    };
+  }
+  /** E-mail the requested STUDENT COPY documents to the verifier as attachments.
+   *  `docKeys` = CREDENTIAL_DOCS keys the verifier ticked; omitted/empty → every available one. */
+  async function emailCredentialCopies(matric, to, name, docKeys) {
+    const v = verifyCredentials(matric);
+    if (!v.valid) return { ok: false, error: 'not-found' };
+    const wanted = Array.isArray(docKeys) && docKeys.length ? docKeys.map(String) : null;
+    const atts = []; const sentLabels = [];
+    const safe = String(v.student.matric || 'student').replace(/[^a-z0-9]+/gi, '-');
+    for (const spec of CREDENTIAL_DOCS) {
+      if (wanted && !wanted.includes(spec.key)) continue;
+      if (spec.gradOnly && !v.graduated) continue;
+      for (const k of spec.kinds) {
+        const d = all('portal_documents').find(x => !x.deleted && x.student_id === v._sid && x.auto_kind === k);
+        if (!d) continue;
+        let b64 = d.file;
+        if (!b64 && d.file_key) { const buf = await blobFetchLocal(d.file_key); if (buf) b64 = buf.toString('base64'); }
+        if (b64) { atts.push({ filename: `${spec.label.replace(/[^a-z0-9]+/gi, '-')}-${safe}.pdf`, contentBase64: b64 }); sentLabels.push(spec.label); break; }
+      }
+    }
+    if (!atts.length) return { ok: false, error: 'no-documents' };
+    const i = inst();
+    const from = registrarSender();
+    const html = `<div style="font-family:Segoe UI,Arial,sans-serif;color:#0f172a">
+      <p>Dear ${esc(name || 'Verifier')},</p>
+      <p>Attached ${atts.length > 1 ? 'are the following documents' : 'is the following document'} for
+      <b>${esc(v.student.name)}</b> (Matric ${esc(v.student.matric)}), released by the Office of the Registrar, ${esc(i.name || 'the University')}, for verification purposes:</p>
+      <ul>${sentLabels.map(l => `<li>${esc(l)}</li>`).join('')}</ul>
+      <p>Student-copy documents carry a “STUDENT COPY” watermark. For a certified original, please contact the Registry${from.email ? ` at ${esc(from.email)}` : ''}.</p>
+      <p style="color:#64748b;font-size:12.5px">Verification reference ${esc(v.ref)} · ${esc(i.name || '')}${from.email ? ' · ' + esc(from.email) : ''}</p></div>`;
+    let sent = false;
+    try {
+      const r = await Promise.resolve(sendMail({
+        to, subject: `Academic credentials — ${v.student.name} (${v.student.matric})`, html, attachments: atts,
+        fromName: from.name, replyTo: from.email, senderRole: 'registrar', senderUserId: from.userId,
+      }));
+      sent = !!(r && r.ok !== false);
+    } catch (_) { sent = false; }
+    return { ok: sent, attached: atts.length, labels: sentLabels };
+  }
+  /** blobFetch alias resolved to the injected helper (server + edge both provide it). */
+  async function blobFetchLocal(key) { try { return (typeof blobFetch === 'function') ? await blobFetch(key) : null; } catch (_) { return null; } }
+
   // ---- documents (printable HTML) ----
   function inst() { return institution ? institution() : { name: 'UniBursar', short: 'UBU', logo: '', motto: '' }; }
+
+  // ---------------------------------------------------------------------------------------------
+  // CRYPTOGRAPHIC LICENSE ENFORCEMENT (v2) — the desktop pushes SIGNED licensing artifacts (a "site"
+  // standing token + the latest heartbeat verdict, both Ed25519-signed by the vendor) and the portal
+  // verifies them itself with the embedded vendor PUBLIC keys. A modified hub/server can no longer
+  // fake `licensed:true`: without a genuine signed token the portal locks. The portal ALSO
+  // self-validates directly against the vendor's enforcement server (fingerprint "portal:<lid>",
+  // which never counts toward the university's install cap) so a revocation reaches the portal even
+  // when the university's desktop is switched off. The license KEY itself never reaches this server.
+  // ---------------------------------------------------------------------------------------------
+  const LIC_MASTER_KEY_B64 = 'MCowBQYDK2VwAyEAbqdQ6677mlegHcgtxZpsm9fkoD9Rgu4dthaz9Y5A1bk=';
+  const LIC_ENFORCE_KEY_B64 = '';   // optional dedicated online-verdict key ('' = master signs verdicts)
+  const LIC_GRACE_DAYS = 14;
+  let licKeys = null;
+  function licKeyring() {
+    if (licKeys) return licKeys;
+    licKeys = [];
+    for (const b64 of [LIC_MASTER_KEY_B64, LIC_ENFORCE_KEY_B64]) {
+      if (!b64) continue;
+      try { licKeys.push(crypto.createPublicKey({ key: Buffer.from(b64, 'base64'), format: 'der', type: 'spki' })); } catch (_) {}
+    }
+    return licKeys;
+  }
+  /** Verify a vendor-signed `body.sig` token → {valid, payload}. Never throws. */
+  function licVerify(token) {
+    try {
+      const clean = String(token || '').replace(/\s+/g, '');
+      const dot = clean.indexOf('.');
+      if (dot < 1) return { valid: false };
+      const body = clean.slice(0, dot);
+      const sig = Buffer.from(clean.slice(dot + 1).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+      const ok = licKeyring().some(k => { try { return crypto.verify(null, Buffer.from(body), k, sig); } catch (_) { return false; } });
+      if (!ok) return { valid: false };
+      return { valid: true, payload: JSON.parse(Buffer.from(body.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')) };
+    } catch (_) { return { valid: false }; }
+  }
+  // CAPABILITY PROBE — the cloud edge runs on Deno, whose node:crypto compat MAY NOT implement the
+  // one-shot Ed25519 `crypto.verify` we rely on. We test the PRIMITIVE with the fixed, KEY-INDEPENDENT
+  // RFC 8032 §7.1 test vector (NOT a vendor-signed token — so rotating the vendor key never breaks this
+  // probe). If it does NOT verify, the runtime can't do Ed25519, so we must NOT lock anyone on a token we
+  // can't check (that would wrongly lock a paying customer on the cloud portal); we fall back to the
+  // desktop-computed boolean — which the desktop derives from the SAME signed verdicts, and where the
+  // self-hosted (Node) hub, the actual mod target, verifies cryptographically. Memoised once.
+  const LIC_PROBE_SPKI = 'MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=';
+  const LIC_PROBE_SIG = '5VZDAMNgrHKQhuLMgG6CioSHfx645dl02HPgZSJJAVVfuIIVkKM7rMYeOXAc+bRr0lv18FlbviRlUUFDjnoQCw==';
+  let _licCrypto;
+  function licCryptoOk() {
+    if (_licCrypto !== undefined) return _licCrypto;
+    try {
+      const k = crypto.createPublicKey({ key: Buffer.from(LIC_PROBE_SPKI, 'base64'), format: 'der', type: 'spki' });
+      _licCrypto = crypto.verify(null, Buffer.from(''), k, Buffer.from(LIC_PROBE_SIG, 'base64')) === true;
+    } catch (_) { _licCrypto = false; }
+    return _licCrypto;
+  }
+  // portal self-heartbeat — refreshed at most every 6h (10 min after a failure), non-blocking
+  const licSelf = { token: '', at: 0, triedAt: 0 };
+  function licSelfRefresh(i) {
+    try {
+      const enf = String(i.license_enf || '').replace(/\/+$/, ''), lid = String(i.license_lid || '');
+      if (!enf || !lid || typeof fetch !== 'function') return;
+      const now = Date.now();
+      const wait = licSelf.token && now - licSelf.at < 6 * 3600000;
+      if (wait || now - licSelf.triedAt < 10 * 60 * 1000) return;
+      licSelf.triedAt = now;
+      fetch(enf + '/heartbeat', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lid, inst: i.name || '', fingerprint: 'portal:' + lid, version: 2, plat: 'portal' }),
+      }).then(r => r.json()).then(j => {
+        if (j && j.token && licVerify(j.token).valid) { licSelf.token = j.token; licSelf.at = Date.now(); }
+      }).catch(() => {});
+    } catch (_) {}
+  }
+  /** The portal's own licensed verdict: the FRESHEST valid signed artifact wins; only installs that
+   *  never pushed any artifact (legacy/offline-only) fall back to the plain boolean. */
+  function licenseState() {
+    const i = inst();
+    const lid = String(i.license_lid || '');
+    const now = Date.now();
+    // If this runtime can't verify Ed25519 (some Deno edge builds), we cannot safely judge a signed
+    // token — trust the desktop-computed boolean instead of risking a wrong lock. The signed-token path
+    // still fully protects the self-hosted Node hub (the real mod target), where verify works.
+    if (!licCryptoOk()) {
+      return { licensed: (typeof i.licensed === 'boolean') ? i.licensed : true, status: 'boolean', token: '', lid };
+    }
+    licSelfRefresh(i);
+    const verdicts = [];
+    for (const [src, tok] of [['self', licSelf.token], ['site', i.license_site], ['hb', i.license_hb]]) {
+      if (!tok) continue;
+      const v = licVerify(tok);
+      if (!v.valid || !v.payload) continue;
+      const p = v.payload;
+      if (p.t !== 'hb' && p.t !== 'site') continue;
+      if (lid && p.lid && p.lid !== lid) continue;
+      const issued = p.issued ? Date.parse(p.issued) : 0;
+      // freshness: site tokens live until their exp; heartbeat verdicts count for the grace window
+      if (p.t === 'site' && p.exp && now > Date.parse(p.exp)) continue;
+      if (p.t === 'hb' && issued && now - issued > LIC_GRACE_DAYS * 86400000) continue;
+      verdicts.push({ src, status: String(p.status || 'unknown'), issued: issued || 0, token: tok });
+    }
+    if (verdicts.length) {
+      verdicts.sort((a, b) => b.issued - a.issued);
+      const top = verdicts[0];
+      const licensed = top.status === 'active';
+      return { licensed, status: top.status, token: top.token, lid };
+    }
+    // artifacts expected (online-enforced customer) but none valid/fresh → locked
+    if (i.license_enf || i.license_site || i.license_hb) return { licensed: false, status: 'unverified', token: '', lid };
+    // legacy / offline-only install → the desktop-pushed boolean (default true for older hubs)
+    return { licensed: (typeof i.licensed === 'boolean') ? i.licensed : true, status: 'legacy', token: '', lid };
+  }
+  function licenseOk() { try { return licenseState().licensed; } catch (_) { return true; } }
   function docShell(title, body, watermark, opts) {
     const i = inst();
     const fit = opts && opts.fit ? 'true' : 'false';
@@ -1950,8 +2429,21 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
   }
 
   // ---------------------------- HTTP ----------------------------
-  function J(res, code, obj) { const b = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(b); return true; }
-  function H(res, code, html) { res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(html); return true; }
+  // API JSON is live data — never let a browser/proxy serve a STALE copy from its HTTP cache (that made
+  // /api/data return outdated fees/documents after a change, and broke the version-driven live refresh).
+  function J(res, code, obj) { const b = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache' }); res.end(b); return true; }
+  // Base-path shim: when the portal is hosted under a path PREFIX (Supabase Edge Functions serve it
+  // at /functions/v1/server), every absolute '/api/…' fetch, href and navigation in the pages would
+  // miss the app. This script (injected into every HTML page's <head>) derives the prefix from the
+  // page's own URL, patches fetch(), fixes href/src attributes (initial + click-time for dynamic
+  // anchors), and exposes window.__B for the explicit location.href sites. On a normal host (Node
+  // hub / desktop / LAN) the derived prefix is '' and the whole shim is a no-op.
+  // NOTE: 'verify-credentials' must be stripped too (and listed BEFORE 'verify' so the alternation
+  // can't half-match) — without it the credential-verification page hosted on Supabase derived a base
+  // of '…/server/verify-credentials', every /api call missed the app and answered the edge 404
+  // ("not found"), which the page then showed for EVERY matric number.
+  const BASE_SHIM = "<script>(function(){var b=location.pathname.replace(/\\/(apply|scan|verify-credentials|verify|library\\/read\\/[^/]*|exam\\/take\\/[^/]*|class\\/[^/]*)\\/?$/,'').replace(/\\/+$/,'');window.__B=b;if(!b)return;var f=window.fetch.bind(window);window.fetch=function(u,o){if(typeof u==='string'&&u.charAt(0)==='/'&&u.charAt(1)!=='/'&&u.indexOf(b+'/')!==0)u=b+u;return f(u,o)};var fx=function(){var i,n,a,v,els=document.querySelectorAll('[href^=\"/\"],[src^=\"/\"]');for(i=0;i<els.length;i++){n=els[i];a=n.hasAttribute('href')?'href':'src';v=n.getAttribute(a);if(v&&v.charAt(0)==='/'&&v.charAt(1)!=='/'&&v.indexOf(b+'/')!==0&&v!==b)n.setAttribute(a,b+v)}};if(document.readyState!=='loading')fx();else document.addEventListener('DOMContentLoaded',fx);document.addEventListener('click',function(e){var t=e.target;while(t&&t!==document&&!(t.tagName==='A'&&t.getAttribute('href')))t=t.parentNode;if(t&&t!==document&&t.tagName==='A'){var v=t.getAttribute('href');if(v&&v.charAt(0)==='/'&&v.charAt(1)!=='/'&&v.indexOf(b+'/')!==0)t.setAttribute('href',b+v)}},true)})();</" + "script>";
+  function H(res, code, html) { res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(String(html).replace('<head>', '<head>' + BASE_SHIM)); return true; }
   function S(res, code, body, type) { res.writeHead(code, { 'Content-Type': type, 'Access-Control-Allow-Origin': '*' }); res.end(body); return true; }
   function rawBearer(req, u) { const hdr = req.headers['authorization'] || ''; const b = /^Bearer\s+(.+)$/i.exec(hdr); return (b && b[1]) || u.searchParams.get('t') || ''; }
   function authOf(req, u) { return verifyToken(rawBearer(req, u)); }
@@ -2393,22 +2885,42 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       res.end(Buffer.from(ev.data, 'base64')); return true;
     }
     if (p === '/api/version' && method === 'GET') { J(res, 200, { version: getVersion() }); return true; }
-    // Serve the offline face-recognition engine to the student's browser (no CDN — works on LAN / APK).
-    if (method === 'GET' && p === '/vendor/face-api.min.js') {
-      const fp = faceFile('face-api.min.js');
-      if (!fp) return J(res, 404, { ok: false, error: 'face engine not bundled' });
-      res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'public, max-age=604800' });
-      res.end(fs.readFileSync(fp)); return true;
+    // 📧 recruitment-email OPEN TRACKING pixel: an <img> in the outreach email hits this; we flip
+    // email_opened on the outreach_recipients row (syncs back to the desktop report) and return a
+    // 1×1 transparent GIF. No auth — it's a pixel; it only ever SETS a boolean flag.
+    if (method === 'GET' && p === '/api/track/open') {
+      try {
+        const rid = u.searchParams.get('r');
+        if (rid && typeof update === 'function') { const rec = one('outreach_recipients', rid); if (rec && !rec.email_opened) update('outreach_recipients', rid, { email_opened: 1, email_opened_at: new Date().toISOString() }); }
+      } catch (_) { /* never let tracking break */ }
+      const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+      res.writeHead(200, { 'Content-Type': 'image/gif', 'Cache-Control': 'no-store, no-cache, must-revalidate', 'Content-Length': gif.length });
+      res.end(gif); return true;
     }
-    // Serve a model weight/manifest file. Tries server/face/models first, then assets/models.
+    // Serve the offline face-recognition engine to the student's browser (no CDN — works on LAN / APK).
+    // Disk first (Node hub / desktop); OBJECT STORAGE fallback (key face/…) for serverless hosts whose
+    // filesystem can't carry the ~13 MB engine — the one-click deploy uploads the assets to R2 so face
+    // check-in works on the cloud portal too.
+    // faceAsset: disk (Node hub / desktop) → 302 to a presigned storage URL (serverless: the browser
+    // pulls the ~13 MB engine straight from R2/Storage, never through the isolate) → proxy fallback.
+    const faceAsset = async (rel, mime) => {
+      const fp = faceFile(rel);
+      if (fp) { try { const buf = fs.readFileSync(fp); res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=604800' }); res.end(buf); return true; } catch (_) {} }
+      const key = 'face/' + rel.split(path.sep).join('/');
+      if (typeof blobUrl === 'function') {
+        try { let url = blobUrl(key); if (url && typeof url.then === 'function') url = await url; if (url) { res.writeHead(302, { 'Location': url, 'Cache-Control': 'public, max-age=3000' }); res.end(); return true; } } catch (_) {}
+      }
+      const buf = await resolveBlob(null, key);
+      if (!buf) return J(res, 404, { ok: false, error: 'face asset not available' });
+      res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=604800' }); res.end(buf); return true;
+    };
+    // Serve the offline face-recognition engine to the student's browser (no CDN — works on LAN / APK).
+    if (method === 'GET' && p === '/vendor/face-api.min.js') return faceAsset('face-api.min.js', 'application/javascript; charset=utf-8');
+    // Serve a model weight/manifest file.
     if (method === 'GET' && p.startsWith('/face-models/')) {
       const name = path.basename(p.slice('/face-models/'.length));   // basename = no path traversal
       if (!/^[\w.\-]+$/.test(name)) return J(res, 400, { ok: false });
-      const fp = faceFile(path.join('models', name));
-      if (!fp) return J(res, 404, { ok: false, error: 'model not bundled' });
-      const mime = name.endsWith('.json') ? 'application/json' : 'application/octet-stream';
-      res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=604800' });
-      res.end(fs.readFileSync(fp)); return true;
+      return faceAsset(path.join('models', name), name.endsWith('.json') ? 'application/json' : 'application/octet-stream');
     }
     // Is a live class still running? The (already-open) student class page polls this and auto-leaves the
     // moment the host ends it — otherwise the class kept running on the APK after the lecturer ended it.
@@ -2428,11 +2940,37 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const i = inst();
       // expose the campus list publicly so the login page can let a student pick the campus they belong to
       const campuses = all('campuses').filter(c => !c.deleted).sort((a, b) => (b.is_main ? 1 : 0) - (a.is_main ? 1 : 0)).map(c => ({ id: c.id, name: c.name }));
-      // licensed flag — the desktop is the source of truth and pushes it; default true for older hubs
-      const licensed = (typeof i.licensed === 'boolean') ? i.licensed : true;
-      return J(res, 200, { ok: true, name: i.name, short: i.short, logo: i.logo, motto: i.motto, language: i.language || '', i18n_custom: i.i18n_custom || '', campuses, licensed,
+      // licensed — v2: CRYPTOGRAPHICALLY computed from vendor-signed artifacts (licenseState), not a
+      // trusted boolean. The signed token is exposed so the mobile app verifies it independently too.
+      const licState = licenseState();
+      const licensed = licState.licensed;
+      // SLIM mode (?slim=1): return the heavy images (logo/login_bg/favicon can be 100s of KB of
+      // base64) as tiny CACHEABLE URLs instead of inline blobs, so the JSON is small and the NAME
+      // appears instantly even on a slow link — the images then load as normal cached images. The
+      // portal page uses this; the mobile app (Coil) does too. The default (inline) stays for any
+      // older client. A ?v= cache-buster keyed to the branding version busts the CDN on rebrand.
+      const slim = u.searchParams.get('slim') === '1';
+      const ver = String(getVersion() || 0);
+      const assetUrl = (field, val) => (val ? ('/api/branding/asset/' + field + '?v=' + ver) : '');
+      const logo = slim ? assetUrl('logo', i.logo) : (i.logo || '');
+      const login_bg = slim ? assetUrl('login_bg', i.login_bg) : (i.login_bg || '');
+      const favicon = slim ? assetUrl('favicon', i.favicon) : (i.favicon || '');
+      return J(res, 200, { ok: true, name: i.name, short: i.short, logo, motto: i.motto, language: i.language || '', i18n_custom: i.i18n_custom || '', i18n_langs: i.i18n_langs || '', campuses, licensed,
+        // signed licensing proof for the mobile app (it verifies the Ed25519 signature itself)
+        license_lid: licState.lid || '', license_token: licState.token || '', license_status: licState.status || '',
         // per-university theme so the web portal + APK colour their UI to match the institution
-        primary: i.primary || '', accent: i.accent || '', login_bg: i.login_bg || '', favicon: i.favicon || '' });
+        primary: i.primary || '', accent: i.accent || '', login_bg, favicon });
+    }
+    // Cacheable branding image (logo / login_bg / favicon) decoded from the branding blob — lets the
+    // slim /api/branding stay tiny while the image loads once and caches for a day.
+    if (method === 'GET' && p.startsWith('/api/branding/asset/')) {
+      const field = p.slice('/api/branding/asset/'.length);
+      if (!['logo', 'login_bg', 'favicon', 'seal', 'signature', 'letterhead', 'watermark'].includes(field)) return J(res, 404, { ok: false });
+      const val = inst()[field];
+      const m = /^data:([^;]+);base64,(.*)$/.exec(String(val || ''));
+      if (!m) return J(res, 404, { ok: false, error: 'not set' });
+      res.writeHead(200, { 'Content-Type': m[1] || 'image/png', 'Cache-Control': 'public, max-age=86400', 'Access-Control-Allow-Origin': '*' });
+      res.end(Buffer.from(m[2], 'base64')); return true;
     }
 
     // ---- installable app assets + public clearance verification (no login) ----
@@ -2482,10 +3020,128 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       return J(res, 200, { ok: true, ...verifyClearance(id) });
     }
 
+    // 🔎 external CREDENTIAL verification (transcript + certificate) — public, no login
+    if (method === 'GET' && p === '/verify-credentials') return H(res, 200, VERIFY_CREDENTIALS_PAGE);
+    if (method === 'POST' && p === '/api/verify-credentials') {
+      const body = await readBody();
+      // 🛡 throttle BEFORE the lookup — the whole point is to stop a scraper walking the matric space, so
+      // it must cost the same whether the matric exists or not.
+      const vWait = verifyThrottle(req);
+      if (vWait) return J(res, 200, { ok: false, error: `Too many verification attempts from this connection. Please try again in about ${vWait} minute(s), or contact the Registry directly for bulk verification.` });
+      const vKey = String((body && body.matric) || '').trim().slice(0, 80);
+      if (!vKey) return J(res, 200, { ok: false, error: 'Enter the student matric number, or the verification code printed on the document.' });
+      if (!String((body && body.email) || '').trim() || !/@/.test(String(body.email))) return J(res, 200, { ok: false, error: 'Enter a valid e-mail address so the record of this verification reaches you.' });
+      // consent / lawful-basis attestation (data-protection best practice — verifiers confirm they
+      // have the graduate's consent or another lawful basis before pulling their academic record).
+      if (!body.consent) return J(res, 200, { ok: false, error: 'Please confirm you have the student’s consent or another lawful basis to verify their credentials.' });
+      const r = verifyCredentials(vKey);
+      logVerification(Object.assign({}, body, { channel: normCode(vKey) ? 'code' : 'matric' }), r);
+      if (!r.valid) return J(res, 200, { ok: true, valid: false, contact: instContact() });
+      const out = Object.assign({}, r); delete out._sid;                              // never leak the internal id
+      await enrichFingerprints(out);                                                  // tamper-evident document fingerprints
+      return J(res, 200, { ok: true, ...out });
+    }
+    // 🔐 TAMPER CHECK — a verifier uploads the transcript/certificate FILE they received and we confirm
+    // whether that EXACT file was issued by the registry (its SHA-256 matches an issued document), or
+    // whether it has been altered / was never issued. This is how a forged grade is caught.
+    if (method === 'POST' && p === '/api/verify-credentials/check-file') {
+      const body = await readBody();
+      const wait = verifyThrottle(req);
+      if (wait) return J(res, 200, { ok: false, error: `Too many verification attempts from this connection. Please try again in about ${wait} minute(s).` });
+      // The matric is now OPTIONAL: the document's own bytes identify it. A verifier who was handed a PDF
+      // and nothing else can still authenticate it — which is the situation they are actually in.
+      const matric = String((body && body.matric) || '').trim().slice(0, 80);
+      const fileB64 = String((body && body.file) || '').replace(/^data:[^;]+;base64,/, '');
+      if (!fileB64) return J(res, 200, { ok: false, error: 'Upload the document file you received.' });
+      // Size cap BEFORE decoding — the client's check is not a security boundary, and a huge base64 body
+      // would otherwise be decoded straight into memory here.
+      // 21e6 base64 chars ≈ 15 MB of file. This ceiling is NOT arbitrary: server.js's readBody destroys
+      // the request at 24 MB of raw body, so anything above that never reaches this handler at all — the
+      // verifier just sees a dead connection. Base64 inflates a file by ~4/3, so the largest file that can
+      // survive the transport is ~17 MB; 15 MB keeps a margin and lets us fail with a SENTENCE instead of
+      // a reset. Raising it here alone would only move the silent failure, not fix it.
+      if (fileB64.length > 21e6) return J(res, 200, { ok: false, error: 'That file is too large (maximum 15 MB). If the document is genuinely larger, please contact the Registry.' });
+      let hash = '', fileBuf = null;
+      try {
+        fileBuf = Buffer.from(fileB64, 'base64');
+        if (!fileBuf.length) throw new Error('empty');
+        hash = sha256Hex(fileBuf);
+      } catch (_) { return J(res, 200, { ok: false, error: 'That file could not be read — upload the original PDF you received.' }); }
+      const shown = groupFp(hash.slice(0, 16).toUpperCase());
+      // 🫥 the invisible seal travels IN the bytes — read it regardless of what the hash says
+      const seal = sealOfBuffer(fileBuf);
+      const sealOut = seal.present ? { present: true, valid: !!seal.valid, reason: seal.reason || '' } : { present: false };
+
+      // 1️⃣ identify the FILE against the whole registry — authoritative, and needs no matric.
+      const hit = await docByHash(hash);
+      const v = matric ? verifyCredentials(matric) : { valid: false };
+      logVerification(Object.assign({}, body, { channel: matric ? 'file-check' : 'file-only' }), hit ? { valid: true, _sid: hit.student_id } : v);
+
+      if (hit) {
+        const st = one('students', hit.student_id);
+        const holder = st ? ([st.first_name, st.middle_name, st.last_name].map(x => String(x || '').trim()).filter(Boolean).join(' ') || 'Unknown') : 'Unknown';
+        const newer = supersededBy(hit);
+        // 2️⃣ cross-check: the file IS genuine, but is it the person the verifier was told it belongs to?
+        // A real transcript presented under someone else's matric is a specific, serious fraud — and it
+        // would read as "genuine" if we only ever asked whether the bytes were issued.
+        const mismatch = !!(matric && v.valid && v._sid !== hit.student_id);
+        return J(res, 200, {
+          ok: true, valid: true, match: !mismatch, identified: true, mismatch,
+          superseded: !!newer,
+          supersededAt: newer ? (newer.created_at || '') : '',
+          document: { label: labelOfKind(hit.auto_kind), issuedAt: hit.created_at || '', code: docCode(hit.id), office: hit.office || 'Office of the Registrar' },
+          student: { name: holder, matric: (st && st.matric_no) || '—' },
+          claimed: mismatch ? { name: v.student.name, matric: v.student.matric } : null,
+          fingerprint: shown, seal: sealOut,
+        });
+      }
+      // 2️⃣b no byte-exact match, but a VALID invisible seal — the origin is cryptographically proven.
+      // Two sub-cases, distinguished so we never cry "altered" at a legitimate copy:
+      //   • the seal names a SPECIFIC issued row (doc_id) → the bytes should have matched it but didn't
+      //     → that exact document was ALTERED (edited grade, re-saved). The sharp fraud signal.
+      //   • the seal has NO doc_id (an officer's directly-saved/emailed copy, a translation) → the file
+      //     is GENUINE and origin-verified; there is simply no single stored row to byte-compare against.
+      if (seal.valid) {
+        const st = seal.studentId ? one('students', seal.studentId) : null;
+        const holder = st ? ([st.first_name, st.middle_name, st.last_name].map(x => String(x || '').trim()).filter(Boolean).join(' ') || 'Unknown') : '';
+        const row = seal.docId ? one('portal_documents', seal.docId) : null;
+        const altered = !!(row && !row.deleted);                     // a real issued row, but the bytes differ
+        return J(res, 200, {
+          ok: true, valid: true, match: false, identified: false, sealIdentified: true, altered,
+          document: { label: labelOfKind(seal.kind), issuedAt: seal.issuedAt || '', code: seal.docId ? docCode(seal.docId) : '' },
+          student: st ? { name: holder, matric: st.matric_no || '—' } : null,
+          fingerprint: shown, seal: sealOut, contact: instContact(),
+        });
+      }
+      // 3️⃣ the bytes match nothing this institution ever issued.
+      if (matric && !v.valid) return J(res, 200, { ok: true, valid: false, contact: instContact(), fingerprint: shown, seal: sealOut });
+      return J(res, 200, {
+        ok: true, valid: true, match: false, identified: false, superseded: false,
+        document: null,
+        student: v.valid ? { name: v.student.name, matric: v.student.matric } : null,
+        fingerprint: shown, seal: sealOut, contact: instContact(),
+      });
+    }
+    if (method === 'POST' && p === '/api/verify-credentials/copy') {
+      const body = await readBody();
+      // this endpoint MAILS real credential documents — it is throttled on the same budget as the lookups
+      // so it can't be turned into a bulk document tap (or a mail-flood aimed at a third party).
+      const cWait = verifyThrottle(req);
+      if (cWait) return J(res, 200, { ok: false, error: `Too many requests from this connection. Please try again in about ${cWait} minute(s).` });
+      const matric = String((body && body.matric) || '').trim().slice(0, 80);
+      const to = String((body && body.email) || '').trim().slice(0, 160);
+      if (!matric || !to || !/@/.test(to)) return J(res, 200, { ok: false, error: 'A matric number and a valid e-mail are required.' });
+      const r = await emailCredentialCopies(matric, to, (body && body.name) || '', body && body.docs);
+      if (r.ok) { try { const row = all('verification_requests').filter(x => x.matric === matric).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0]; if (row) update('verification_requests', row.id, { emailed: 1, updated_at: new Date().toISOString() }); } catch (_) {} }
+      return J(res, 200, r.ok
+        ? { ok: true, attached: r.attached, message: `Sent ${r.attached} document(s) to ${to}.` }
+        : { ok: false, error: r.error === 'no-documents' ? 'The published documents for this student are not available yet — please contact the Registry.' : (r.error === 'not-found' ? 'That matric number could not be verified.' : 'The mail service is not available right now. Please try again later.') });
+    }
+
     if (p === '/api/login' && method === 'POST') {
       const body = await readBody();
       // license gate: an unactivated institution can't serve the portal/APK (defense-in-depth, not just UI)
-      if (inst().licensed === false) return J(res, 200, { ok: false, error: 'This institution’s software has not been activated. Please contact your administrator.' });
+      if (!licenseOk()) return J(res, 200, { ok: false, error: 'This institution’s software has not been activated. Please contact your administrator.' });
       const key = loginKey(req, body.login);
       const wait = loginBlocked(key);
       if (wait) return J(res, 200, { ok: false, error: `Too many failed attempts. Please wait about ${Math.ceil(wait / 60)} minute(s) and try again.` });
@@ -2516,7 +3172,7 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
     // identity with the email/phone on their record — so nobody is locked out when SMTP isn't set up.
     if (p === '/api/portal/recover' && method === 'POST') {
       const body = await readBody();
-      if (inst().licensed === false) return J(res, 200, { ok: false, error: 'This institution’s software has not been activated. Please contact your administrator.' });
+      if (!licenseOk()) return J(res, 200, { ok: false, error: 'This institution’s software has not been activated. Please contact your administrator.' });
       const key = loginKey(req, 'recover:' + (body.login || ''));
       if (loginBlocked(key)) return J(res, 200, { ok: false, error: 'Too many attempts — please wait a few minutes and try again.' });
       const login = String(body.login || '').trim().toLowerCase();
@@ -2545,6 +3201,106 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       const username = stu.portal_username || stu.matric_no || stu.email;
       update('students', stu.id, { portal_username: username, portal_pass: hashPass(newPassword) });
       return J(res, 200, { ok: true, username, role: 'student' });
+    }
+
+    // ================= EMAIL-BASED SELF-SERVICE RECOVERY (code to your inbox) =================
+    // A student/parent who has forgotten BOTH their username AND password recovers using only the
+    // email address on their record: we email a 6-digit code, they enter it with a new password, and
+    // we sign them in and show their username. Deno/Node safe (no crypto.randomInt), rate-limited,
+    // anti-enumeration. The code is stored (hashed, 15-min expiry) on the student row.
+    const genResetCode = () => String(parseInt(crypto.randomBytes(4).toString('hex'), 16) % 1000000).padStart(6, '0');
+    // Find the student row + role for a login that may be a matric no, username OR an email address.
+    const findAccountFor = (login) => {
+      login = String(login || '').trim().toLowerCase(); if (!login) return null;
+      for (const s of all('students')) {
+        if (s.deleted) continue;
+        if ([s.matric_no, s.portal_username, s.email].some(v => (v || '').toLowerCase() === login)) return { s, role: 'student' };
+        if ([s.parent_portal_username, s.parent_email].some(v => (v || '').toLowerCase() === login)) return { s, role: 'parent' };
+      }
+      return null;
+    };
+    const emailOf = (s, role) => (role === 'parent' ? s.parent_email : s.email) || '';
+    const usernameOf = (s, role) => role === 'parent'
+      ? (s.parent_portal_username || (s.matric_no ? 'p-' + s.matric_no : 'par-' + String(s.id).slice(0, 8)))
+      : (s.portal_username || s.matric_no || s.email);
+
+    // STEP 1 — email a reset code to the address on file.
+    if (p === '/api/portal/reset-request' && method === 'POST') {
+      const body = await readBody();
+      if (!licenseOk()) return J(res, 200, { ok: false, error: 'This institution’s software has not been activated. Please contact your administrator.' });
+      const key = loginKey(req, 'reset');
+      if (loginBlocked(key)) return J(res, 200, { ok: false, error: 'Too many attempts — please wait a few minutes and try again.' });
+      const login = String(body.login || '').trim();
+      if (!login) return J(res, 200, { ok: false, error: 'Enter your matric number, username or email address.' });
+      const hit = findAccountFor(login);
+      const email = hit ? emailOf(hit.s, hit.role) : '';
+      if (!hit || !email) { loginFailed(key); return J(res, 200, { ok: false, error: 'We could not find an account with an email on record for those details. Please contact your school office to recover your account.' }); }
+      if (typeof update !== 'function' || typeof sendMail !== 'function') return J(res, 200, { ok: false, error: 'Email recovery is unavailable on this server. Use “I know my matric number” below, or contact your school office.' });
+      const code = genResetCode();
+      pruneResets();
+      pwResets.set(hit.s.id, { h: hashPass(code), exp: Date.now() + RESET_TTL, role: hit.role });
+      const i = inst();
+      const nm = hit.role === 'parent' ? 'Parent/Guardian' : ((hit.s.first_name || '') + ' ' + (hit.s.last_name || '')).trim();
+      const html = `<div style="font-family:Segoe UI,Arial,sans-serif;color:#0f172a;max-width:520px;margin:0 auto">`
+        + `<div style="background:linear-gradient(135deg,#1e3a8a,#4338ca);color:#fff;padding:18px 22px;border-radius:14px 14px 0 0"><div style="font-weight:800;font-size:17px">${esc(i.name || 'University Portal')}</div><div style="opacity:.85;font-size:13px">Account recovery</div></div>`
+        + `<div style="border:1px solid #e2e8f0;border-top:0;border-radius:0 0 14px 14px;padding:22px">`
+        + `<p>Dear ${esc(nm || 'Student')},</p><p>Use this code to reset your portal password. It expires in <b>15 minutes</b>.</p>`
+        + `<div style="text-align:center;margin:18px 0"><div style="display:inline-block;background:#f1f5f9;border-radius:12px;padding:14px 26px;font-size:30px;font-weight:800;letter-spacing:8px;color:#1e3a8a">${esc(code)}</div></div>`
+        + `<p style="color:#64748b;font-size:12.5px">If you did not request this, you can safely ignore this email — your password will not change.</p></div></div>`;
+      try { await Promise.resolve(sendMail({ to: email, subject: `Your ${i.short || i.name || 'portal'} password reset code: ${code}`, html, text: `Your password reset code is ${code}. It expires in 15 minutes.` })); } catch (_) {}
+      loginOk(key);
+      return J(res, 200, { ok: true, sent: true, hint: maskEmail(email), role: hit.role });
+    }
+
+    // STEP 2 — verify the code and set a new password; signs them in on the client.
+    if (p === '/api/portal/reset-confirm' && method === 'POST') {
+      const body = await readBody();
+      const key = loginKey(req, 'reset');
+      if (loginBlocked(key)) return J(res, 200, { ok: false, error: 'Too many attempts — please wait a few minutes and try again.' });
+      const login = String(body.login || '').trim();
+      const code = String(body.code || '').replace(/\D/g, '');
+      const newPassword = String(body.password || '');
+      if (!login || !code) return J(res, 200, { ok: false, error: 'Enter the code we emailed you.' });
+      if (newPassword.length < 5) return J(res, 200, { ok: false, error: 'Your new password must be at least 5 characters.' });
+      const hit = findAccountFor(login);
+      const fail = () => { loginFailed(key); return J(res, 200, { ok: false, error: 'That code is incorrect or has expired. Request a new one and try again.' }); };
+      if (!hit) return fail();
+      const saved = pwResets.get(hit.s.id);
+      if (!saved || !saved.h || !saved.exp || Date.now() > saved.exp) { if (saved) pwResets.delete(hit.s.id); return fail(); }
+      if (!verifyPass(code, saved.h)) return fail();
+      const role = saved.role === 'parent' ? 'parent' : 'student';
+      const username = usernameOf(hit.s, role);
+      const patch = role === 'parent'
+        ? { parent_portal_username: username, parent_portal_pass: hashPass(newPassword) }
+        : { portal_username: username, portal_pass: hashPass(newPassword) };
+      update('students', hit.s.id, patch);
+      pwResets.delete(hit.s.id);                     // single-use
+      loginOk(key);
+      return J(res, 200, { ok: true, username, role });
+    }
+
+    // Forgot your USERNAME? Email it to the address on record (never revealed in the HTTP response).
+    if (p === '/api/portal/username-reminder' && method === 'POST') {
+      const body = await readBody();
+      const key = loginKey(req, 'reset');
+      if (loginBlocked(key)) return J(res, 200, { ok: false, error: 'Too many attempts — please wait a few minutes and try again.' });
+      const email = String(body.email || '').trim().toLowerCase();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return J(res, 200, { ok: false, error: 'Enter the email address on your record.' });
+      // collect every account (student + parent) that uses this email — a family may share one inbox
+      const accounts = [];
+      for (const s of all('students')) {
+        if (s.deleted) continue;
+        if ((s.email || '').toLowerCase() === email) accounts.push({ label: 'Student', username: usernameOf(s, 'student'), name: ((s.first_name || '') + ' ' + (s.last_name || '')).trim(), matric: s.matric_no || '' });
+        if ((s.parent_email || '').toLowerCase() === email) accounts.push({ label: 'Parent/Guardian', username: usernameOf(s, 'parent'), name: ((s.first_name || '') + ' ' + (s.last_name || '')).trim(), matric: s.matric_no || '' });
+      }
+      if (accounts.length && typeof sendMail === 'function') {
+        const i = inst();
+        const rowsHtml = accounts.map(a => `<tr><td style="padding:7px 10px;border-bottom:1px solid #eef2f7">${esc(a.label)}${a.name ? ' — ' + esc(a.name) : ''}${a.matric ? ' (' + esc(a.matric) + ')' : ''}</td><td style="padding:7px 10px;border-bottom:1px solid #eef2f7;font-weight:800;color:#1e3a8a">${esc(a.username)}</td></tr>`).join('');
+        const html = `<div style="font-family:Segoe UI,Arial,sans-serif;color:#0f172a;max-width:520px;margin:0 auto"><div style="background:linear-gradient(135deg,#1e3a8a,#4338ca);color:#fff;padding:18px 22px;border-radius:14px 14px 0 0"><div style="font-weight:800;font-size:17px">${esc(i.name || 'University Portal')}</div><div style="opacity:.85;font-size:13px">Your portal username</div></div><div style="border:1px solid #e2e8f0;border-top:0;border-radius:0 0 14px 14px;padding:22px"><p>Here ${accounts.length > 1 ? 'are the usernames' : 'is the username'} linked to this email:</p><table style="width:100%;border-collapse:collapse;font-size:13.5px"><tbody>${rowsHtml}</tbody></table><p style="color:#64748b;font-size:12.5px;margin-top:14px">Forgot your password too? Use “Email me a reset code” on the sign-in screen.</p></div></div>`;
+        try { await Promise.resolve(sendMail({ to: email, subject: `Your ${i.short || i.name || 'portal'} username`, html, text: accounts.map(a => a.label + ': ' + a.username).join('\n') })); } catch (_) {}
+      }
+      // generic response either way (anti-enumeration): don't reveal whether the email exists
+      return J(res, 200, { ok: true, sent: true });
     }
 
     // ---- Online Admissions (public application portal, temporary-pass auth) ----
@@ -2856,6 +3612,81 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
       return J(res, 200, { ok: true, request: { id, kind, status: 'pending', date: now } });
     }
 
+    // 📨 GRADUATE DOCUMENT DISPATCH — a GRADUATE sends their transcript / certificate / letters to a
+    // government agency, university or employer. The documents go out from the OFFICE OF THE
+    // REGISTRAR's email (never the student's), the send is logged for the registry, and the whole
+    // feature is gated: graduates only, and the issued transcript + certificate must both exist —
+    // otherwise the student is told to contact the Registrar.
+    if (p === '/api/my/send-documents' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student.' });
+      const s = accountById('student', t.id); if (!s) return J(res, 401, { ok: false });
+      const body = await readBody();
+      // — graduate gate —
+      const al = all('alumni').find(a => a.student_id === s.id && !a.deleted);
+      const graduated = !!al || ['alumni', 'graduated'].includes(String(s.status || '').toLowerCase());
+      if (!graduated) return J(res, 200, { ok: false, error: 'Only graduates of the university can send credentials to organizations. If you have graduated and still see this, please contact the Office of the Registrar.' });
+      // — the transcript AND certificate must both be issued before ANY dispatch —
+      const rowOf = (spec) => { for (const k of spec.kinds) { const d = all('portal_documents').filter(x => !x.deleted && x.student_id === s.id && x.auto_kind === k).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0]; if (d) return d; } return null; };
+      const core = ['transcript', 'certificate'].map(k => CREDENTIAL_DOCS.find(x => x.key === k));
+      const missing = core.filter(spec => !rowOf(spec)).map(spec => spec.label);
+      if (missing.length) return J(res, 200, { ok: false, error: `Your ${missing.join(' and ')} ${missing.length > 1 ? 'are' : 'is'} not yet available on your record. Please contact the Office of the Registrar for help before sending documents to an organization.` });
+      // — validate the organization + selection —
+      const ORG_TYPES = { government: 'Government agency', university: 'University / higher institution', institution: 'Other institution', employer: 'Employer', other: 'Organization' };
+      const orgType = ORG_TYPES[String(body.orgType || '').toLowerCase()] ? String(body.orgType).toLowerCase() : 'other';
+      const orgName = String(body.orgName || '').trim().slice(0, 140);
+      const orgEmail = String(body.orgEmail || '').trim().slice(0, 160);
+      if (!orgName) return J(res, 200, { ok: false, error: 'Enter the organization’s name.' });
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(orgEmail)) return J(res, 200, { ok: false, error: 'Enter a valid email address for the organization.' });
+      const wanted = (Array.isArray(body.docs) && body.docs.length ? body.docs.map(String) : ['transcript', 'certificate']).filter(k => CREDENTIAL_DOCS.some(x => x.key === k));
+      if (!wanted.length) return J(res, 200, { ok: false, error: 'Select at least one document to send.' });
+      // every SELECTED document must actually be issued
+      const unavailable = wanted.map(k => CREDENTIAL_DOCS.find(x => x.key === k)).filter(spec => !rowOf(spec)).map(spec => spec.label);
+      if (unavailable.length) return J(res, 200, { ok: false, error: `${unavailable.join(', ')} ${unavailable.length > 1 ? 'are' : 'is'} not yet issued on your record — untick ${unavailable.length > 1 ? 'them' : 'it'} or contact the Office of the Registrar for help.` });
+      // — anti-abuse throttle: max 5 dispatches per day per student —
+      const today = new Date().toISOString().slice(0, 10);
+      const sentToday = all('verification_requests').filter(r => !r.deleted && r.student_id === s.id && r.verifier_type === 'graduate-dispatch' && String(r.created_at || '').slice(0, 10) === today).length;
+      if (sentToday >= 5) return J(res, 200, { ok: false, error: 'You have reached today’s limit of 5 document dispatches. Try again tomorrow, or contact the Office of the Registrar.' });
+      // — build the attachments (student-copy PDFs; inline file or blob storage) —
+      const nmFull = [s.first_name, s.middle_name, s.last_name].map(x => String(x || '').trim()).filter(Boolean).join(' ');
+      const safe = String(s.matric_no || 'graduate').replace(/[^a-z0-9]+/gi, '-');
+      const atts = []; const sentLabels = [];
+      for (const k of wanted) {
+        const spec = CREDENTIAL_DOCS.find(x => x.key === k);
+        const d = rowOf(spec); if (!d) continue;
+        let b64 = d.file;
+        if (!b64 && d.file_key) { const buf = await blobFetchLocal(d.file_key); if (buf) b64 = buf.toString('base64'); }
+        if (b64) { atts.push({ filename: `${spec.label.replace(/[^a-z0-9]+/gi, '-')}-${safe}.pdf`, contentBase64: b64 }); sentLabels.push(spec.label); }
+      }
+      if (!atts.length) return J(res, 200, { ok: false, error: 'Your documents could not be retrieved right now — please try again shortly or contact the Office of the Registrar.' });
+      // — send AS the Office of the Registrar —
+      const i = inst();
+      const from = registrarSender();
+      const ref = 'GD-' + String(crypto.randomUUID()).replace(/-/g, '').slice(0, 8).toUpperCase();
+      const html = `<div style="font-family:Segoe UI,Arial,sans-serif;color:#0f172a">
+        <p>Dear ${esc(orgName)},</p>
+        <p>At the request of our graduate <b>${esc(nmFull)}</b> (Matric No. ${esc(s.matric_no || '—')}), the Office of the Registrar,
+        <b>${esc(i.name || 'the University')}</b>, transmits the following official document${atts.length > 1 ? 's' : ''} for your records:</p>
+        <ul>${sentLabels.map(l => `<li>${esc(l)}</li>`).join('')}</ul>
+        <p>These are watermarked student copies issued by this Office. To independently confirm their authenticity — or to request
+        certified originals — please use the university's credential verification portal or contact this Office${from.email ? ` at ${esc(from.email)}` : ''},
+        quoting reference <b>${esc(ref)}</b>.</p>
+        <p style="color:#64748b;font-size:12.5px">Office of the Registrar · ${esc(i.name || '')}${from.email ? ' · ' + esc(from.email) : ''} · Ref ${esc(ref)}</p></div>`;
+      let sent = false;
+      try {
+        const r = await Promise.resolve(sendMail({ to: orgEmail, subject: `Academic credentials of ${nmFull} (${s.matric_no || ''}) — ${i.short || i.name || 'University'} [${ref}]`, html, attachments: atts, fromName: from.name, replyTo: from.email, senderRole: 'registrar', senderUserId: from.userId }));
+        sent = !!(r && r.ok !== false);
+      } catch (_) { sent = false; }
+      if (!sent) return J(res, 200, { ok: false, error: 'The mail service is not available right now. Please try again later or contact the Office of the Registrar.' });
+      // — confirmation copy to the graduate (best-effort) + registry log + registrar notification —
+      try { if (s.email) await Promise.resolve(sendMail({ to: s.email, subject: `Your documents were sent to ${orgName} [${ref}]`, html: `<div style="font-family:Segoe UI,Arial,sans-serif;color:#0f172a"><p>Dear ${esc(s.first_name || nmFull)},</p><p>As you requested, the Office of the Registrar has sent your ${esc(sentLabels.join(', '))} to <b>${esc(orgName)}</b> (${esc(orgEmail)}). Reference <b>${esc(ref)}</b>.</p><p>If you did not make this request, contact the Registrar immediately.</p></div>`, fromName: from.name, replyTo: from.email, senderRole: 'registrar', senderUserId: from.userId })); } catch (_) {}
+      const now = new Date().toISOString();
+      try {
+        create('verification_requests', { id: crypto.randomUUID(), verifier_type: 'graduate-dispatch', verifier_name: `${ORG_TYPES[orgType]}: ${orgName}`.slice(0, 120), verifier_email: orgEmail, matric: s.matric_no || '', student_id: s.id, found: 1, emailed: 1, note: `ref ${ref} · sent: ${sentLabels.join(', ')}`.slice(0, 220), created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+        for (const role of ['registrar', 'admin']) create('notifications', { id: crypto.randomUUID(), target_user: null, target_role: role, title: '📨 Graduate document dispatch', body: `${nmFull} sent ${sentLabels.join(', ')} to ${orgName} (${orgEmail}). Ref ${ref}.`, type: 'system', payload: JSON.stringify({ student_id: s.id, ref }), is_read: 0, created_at: now, updated_at: now, deleted: 0, origin_node: 'portal' });
+      } catch (_) { /* logging is best-effort */ }
+      return J(res, 200, { ok: true, ref, sent: sentLabels, message: `Sent ${sentLabels.join(', ')} to ${orgName} from the Office of the Registrar. Reference ${ref} — a confirmation copy is in your email.` });
+    }
+
     // 🔎 A student reports a MISSING result or a WRONG score for a registered course. Creates a synced
     // result_fix_requests row (reverse-syncs to the desktop) where the AI locates the uploaded row and
     // auto-links it (or flags it for a human). Notifies the registrar/ICT.
@@ -2906,8 +3737,48 @@ document.getElementById('instr').textContent=EXAM.instructions||'Read each quest
         if (r.deleted || r.student_id !== s.id) continue;
         tickets.push({ kind: 'payment', id: r.id, ticket_no: tnoOf(r.id, 'PT'), title: `Payment ${String(r.currency || 'NGN').toUpperCase()} ${Number(r.amount || 0).toLocaleString()}${r.reference ? ' · ref ' + r.reference : ''}`, status: r.status, resolution: r.resolution || '', created_at: r.created_at, updated_at: r.updated_at, events: (evByReq['payment|' + r.id] || []).sort(sortEv) });
       }
+      // 🏦 manual bank-transfer claims ride the same timeline UI
+      for (const r of all('manual_payments')) {
+        if (r.deleted || r.student_id !== s.id) continue;
+        tickets.push({ kind: 'manualpay', id: r.id, ticket_no: r.ticket_no || tnoOf(r.id, 'MP'), title: `Bank transfer ${String(r.currency || 'NGN').toUpperCase()} ${Number(r.amount || 0).toLocaleString()}${r.reference ? ' · ref ' + r.reference : ''}`, status: r.status, resolution: r.flag_reason || '', created_at: r.created_at, updated_at: r.updated_at, events: (evByReq['manualpay|' + r.id] || []).sort(sortEv) });
+      }
       tickets.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
       return J(res, 200, { ok: true, tickets });
+    }
+
+    // 🏦 MANUAL BANK TRANSFER — the student sees the university's bank details, transfers, then
+    // files a claim (payer/bank/amount/date/reference + a receipt upload). The DESKTOP AI reconciles
+    // it against the bank's alert inbox every 30 minutes, the accountant gives second-layer approval,
+    // and only then is the receipt issued. Everything lands on the 🎫 My Tickets timeline.
+    if (p === '/api/manualpay/info' && method === 'GET') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false });
+      const bank = inst().fees_bank || '';
+      return J(res, 200, { ok: true, enabled: !!bank, bank, note: 'Put the ticket code you get after submitting — or your matric number — in the transfer narration so the bank alert matches instantly.' });
+    }
+    if (p === '/api/manualpay/submit' && method === 'POST') {
+      const t = authOf(req, u); if (!t || t.k !== 'student') return J(res, 401, { ok: false, error: 'Sign in as a student.' });
+      const s = accountById('student', t.id); if (!s) return J(res, 401, { ok: false });
+      if (typeof create !== 'function') return J(res, 200, { ok: false, error: 'Manual payments are not available on this server.' });
+      const body = await readBody();
+      const amount = Math.round((Number(body.amount) || 0) * 100) / 100;
+      if (!(amount > 0)) return J(res, 200, { ok: false, error: 'Enter the exact amount you transferred.' });
+      if (!String(body.payer_name || '').trim()) return J(res, 200, { ok: false, error: 'Enter the name on the account that made the transfer.' });
+      let receipt = String(body.receipt_base64 || '').replace(/^data:[^;]+;base64,/, '');
+      if (!receipt) return J(res, 200, { ok: false, error: 'Upload your payment receipt (photo or PDF).' });
+      if (receipt.length > 8 * 1024 * 1024) return J(res, 200, { ok: false, error: 'The receipt file is too large (max ~6 MB).' });
+      const rid = crypto.randomUUID();
+      const ticketNo = 'MP-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+      const now = new Date().toISOString();
+      create('manual_payments', {
+        id: rid, ticket_no: ticketNo, student_id: s.id,
+        category: String(body.category || 'tuition').slice(0, 60), currency: String(body.currency || 'NGN').toUpperCase().slice(0, 6), amount,
+        payer_name: String(body.payer_name || '').slice(0, 120), payer_bank: String(body.payer_bank || '').slice(0, 80),
+        paid_at: String(body.paid_at || '').slice(0, 30), reference: String(body.reference || '').slice(0, 80), note: String(body.note || '').slice(0, 400),
+        receipt, receipt_mime: String(body.receipt_mime || 'image/jpeg').slice(0, 60), receipt_name: String(body.receipt_name || 'receipt').slice(0, 120),
+        status: 'submitted', created_at: now, updated_at: now, deleted: 0,
+      });
+      create('ticket_events', { id: crypto.randomUUID(), kind: 'manualpay', request_id: rid, status: 'submitted', message: 'Claim submitted from the portal — receipt attached. The AI reconciles it against the bank inbox every 30 minutes.', actor: 'student', created_at: now, updated_at: now, deleted: 0 });
+      return J(res, 200, { ok: true, id: rid, ticket_no: ticketNo, message: 'Submitted! Ticket ' + ticketNo + ' — put this code (or your matric number) in your transfer narration next time for instant matching. You will get an email at every step, and your receipt appears here once verified.' });
     }
 
     // 💳 A student reports a PAYMENT that is not reflecting on their app/portal. Creates a synced
@@ -3610,11 +4481,16 @@ const PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta n
 <title>UniBursar Portal</title>
 <link rel="manifest" href="/manifest.webmanifest"><meta name="theme-color" content="#1e3a8a"><link rel="icon" href="/favicon">
 <style>
-:root{--navy:#0f1e3d;--brand:#2563eb;--brand-rgb:37,99,235;--ink:#0f172a;--muted:#64748b;--line:#e6eaf0;--bg:#eef2f8}
+:root{--navy:#0f1e3d;--brand:#2563eb;--brand-rgb:37,99,235;--ink:#0f172a;--muted:#64748b;--line:#e6eaf0;--bg:#eef2f8;--card:#ffffff;--th:#f8fafc;--rowline:#f1f5f9;--input-bg:#ffffff}
+/* 🌙 dark theme — the whole UI is painted from the variables above, so overriding them here
+   re-skins every surface. Chosen for AA contrast on OLED-friendly deep navy. */
+html[data-theme=dark]{--navy:#0b1428;--ink:#e6edf7;--muted:#94a7c4;--line:#1d2b45;--bg:#0b1220;--card:#111d33;--th:#0e1930;--rowline:#18263f;--input-bg:#0d1830}
+html[data-theme=dark] .btn.ghost{color:#9db8e8}
+html[data-theme=dark] .lbox h1,html[data-theme=dark] .uname,html[data-theme=dark] .sectitle{color:#dbe7fb}
 *{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',system-ui,Arial,sans-serif;background:var(--bg);color:var(--ink)}
 a{color:var(--brand)}
 .login{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:radial-gradient(1200px 600px at 20% -10%,rgba(var(--brand-rgb,30,58,138),.13),transparent),var(--login-bg-img,linear-gradient(transparent,transparent)) center/cover no-repeat,var(--bg)}
-.card{background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:0 20px 60px rgba(15,23,42,.12)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:0 20px 60px rgba(15,23,42,.12)}
 .lbox{width:380px;max-width:94vw;padding:30px}
 .lbox h1{margin:0 0 2px;font-size:22px;color:var(--navy)}.lbox .sub{color:var(--muted);font-size:13px;margin-bottom:18px}
 .brandhead{display:flex;gap:12px;align-items:center;margin-bottom:4px}
@@ -3624,21 +4500,57 @@ a{color:var(--brand)}
 .umotto{font-size:11px;color:var(--muted);font-style:italic;margin-top:2px}
 .psub{font-size:13px;color:var(--brand);font-weight:700;margin:8px 0 16px}
 .hintbar{font-size:12px;color:var(--muted);text-align:center;margin-top:12px;line-height:1.5}
-.field{margin-bottom:12px}.field label{display:block;font-size:12px;font-weight:600;color:#334155;margin-bottom:5px}
-input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px}
+/* ===================== WIDE SPLIT-SCREEN SIGN-IN (homepage) =====================
+   Desktop: a branded hero (left) fills the width + a focused sign-in card (right).
+   Tablet/phone: collapses to one column — compact hero banner on top, card below.
+   Everything is themeable (CSS vars) + RTL-aware (grid auto-mirrors under dir=rtl). */
+.authwrap{min-height:100vh;display:grid;grid-template-columns:1.05fr .95fr;background:var(--bg)}
+@supports(min-height:100dvh){.authwrap{min-height:100dvh}}
+.authhero{position:relative;overflow:hidden;color:#fff;padding:clamp(30px,5vw,60px);display:flex;flex-direction:column;justify-content:center;gap:22px;
+  background:var(--navy);
+  background:linear-gradient(150deg,var(--navy),var(--brand) 175%),var(--login-bg-img,linear-gradient(transparent,transparent)) center/cover no-repeat}
+.authhero::before{content:"";position:absolute;inset:0;background:radial-gradient(760px 420px at 88% -12%,rgba(255,255,255,.16),transparent),radial-gradient(620px 520px at -12% 112%,rgba(255,255,255,.10),transparent);pointer-events:none}
+.authhero>*{position:relative;z-index:1}
+.authhero .hbrand{display:flex;align-items:center;gap:14px}
+.authhero .hbrand img,.authhero .hbrand .mono{width:62px;height:62px;border-radius:16px;background:#fff;padding:6px;object-fit:contain;flex:none;box-shadow:0 8px 24px rgba(0,0,0,.22)}
+.authhero .hbrand .mono{display:flex;align-items:center;justify-content:center;color:var(--navy);font-weight:800;font-size:22px}
+.authhero .hname{font-size:22px;font-weight:800;line-height:1.15}
+.authhero .hmotto{opacity:.85;font-size:12.5px;font-style:italic;margin-top:2px}
+.authhero h1{font-size:clamp(26px,3.2vw,38px);line-height:1.1;margin:4px 0 0;font-weight:800;max-width:15ch;letter-spacing:-.5px}
+.authhero .hsub{opacity:.9;font-size:clamp(14px,1.3vw,16px);max-width:46ch;line-height:1.5}
+.authfeat{display:grid;grid-template-columns:1fr 1fr;gap:12px;max-width:540px;margin-top:4px}
+.authfeat .f{display:flex;gap:11px;align-items:flex-start;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.18);border-radius:14px;padding:13px 14px;backdrop-filter:blur(4px)}
+.authfeat .f .fi{font-size:20px;line-height:1;flex:none}
+.authfeat .f .ft{font-weight:700;font-size:13.5px}
+.authfeat .f .fd{opacity:.82;font-size:11.5px;margin-top:2px;line-height:1.35}
+.authhero .hverify{margin-top:6px;font-size:12.5px;opacity:.9}.authhero .hverify a{color:#fff;font-weight:700}
+.authpanel{background:var(--card);display:flex;align-items:center;justify-content:center;padding:clamp(22px,3vw,40px);min-width:0}
+.authcard{width:100%;max-width:404px}
+@media(max-width:900px){
+  .authwrap{grid-template-columns:1fr}
+  .authhero{padding:24px 20px;gap:12px;text-align:center;align-items:center}
+  .authhero .hbrand{flex-direction:column;gap:8px}
+  .authhero h1{font-size:22px;max-width:22ch}.authhero .hsub{font-size:13.5px;max-width:40ch}
+  .authfeat,.authhero .hverify{display:none}          /* keep the mobile top compact */
+  .authpanel{padding:22px 16px}
+}
+@media(max-width:900px) and (max-height:640px){.authhero{display:none}}   /* very short phones → straight to the card */
+.field{margin-bottom:12px}.field label{display:block;font-size:12px;font-weight:600;color:var(--ink);margin-bottom:5px}
+input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px;background:var(--input-bg);color:var(--ink)}
+textarea{background:var(--input-bg);color:var(--ink);border:1px solid var(--line);border-radius:10px}
 .btn{background:linear-gradient(135deg,#2563eb,#4338ca);color:#fff;border:0;border-radius:10px;padding:12px;font-weight:700;width:100%;cursor:pointer;font-size:14px}
-.btn.sm{width:auto;padding:8px 13px;font-size:12.5px;border-radius:8px}.btn.ghost{background:#fff;color:var(--brand);border:1px solid var(--line)}
+.btn.sm{width:auto;padding:8px 13px;font-size:12.5px;border-radius:8px}.btn.ghost{background:var(--card);color:var(--brand);border:1px solid var(--line)}
 .err{background:#fee2e2;color:#991b1b;padding:9px 12px;border-radius:9px;font-size:13px;margin-bottom:12px;display:none}
 .top{background:var(--navy);color:#fff;display:flex;align-items:center;gap:12px;padding:12px 20px}
 .top .nm{font-weight:800}.top .rl{margin-left:auto;opacity:.85;font-size:13px;text-transform:capitalize}
 .wrap{max-width:1040px;margin:0 auto;padding:20px}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin-bottom:18px}
-.kpi{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
 .kpi .l{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.4px}.kpi .v{font-size:22px;font-weight:800;margin-top:4px}
-.panel{background:#fff;border:1px solid var(--line);border-radius:14px;margin-bottom:18px;overflow:hidden}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:14px;margin-bottom:18px;overflow:hidden}
 .panel h3{margin:0;padding:14px 18px;border-bottom:1px solid var(--line);font-size:15px}
-table{width:100%;border-collapse:collapse}th,td{padding:11px 16px;text-align:left;border-bottom:1px solid #f1f5f9;font-size:13.5px}
-th{background:#f8fafc;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}
+table{width:100%;border-collapse:collapse}th,td{padding:11px 16px;text-align:left;border-bottom:1px solid var(--rowline);font-size:13.5px}
+th{background:var(--th);font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}
 .r{text-align:right}.neg{color:#b91c1c;font-weight:700}.pos{color:#065f46;font-weight:700}
 .prof{display:flex;gap:16px;align-items:center;padding:18px}.prof img,.prof .ph{width:84px;height:96px;border-radius:10px;object-fit:cover;border:2px solid var(--brand)}
 .prof .ph{background:#e2e8f0;display:flex;align-items:center;justify-content:center;color:#94a3b8}
@@ -3647,7 +4559,7 @@ th{background:#f8fafc;font-size:11px;text-transform:uppercase;letter-spacing:.4p
 .empty{padding:24px;text-align:center;color:var(--muted)}
 .live{font-size:11px;color:#16a34a;margin-left:8px}
 .tscroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
-select{padding:9px 10px;border:1px solid var(--line);border-radius:9px;font-size:13.5px;background:#fff;max-width:100%}
+select{padding:9px 10px;border:1px solid var(--line);border-radius:9px;font-size:13.5px;background:var(--input-bg);color:var(--ink);max-width:100%}
 .toolbarp{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .pbanner{background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe;border-radius:12px;padding:11px 16px;margin-bottom:14px;font-size:13.5px}
 .exbar{border-radius:12px;padding:13px 16px;margin-bottom:14px;font-weight:800;text-align:center;letter-spacing:.3px;font-size:15px}
@@ -3655,7 +4567,7 @@ select{padding:9px 10px;border:1px solid var(--line);border-radius:9px;font-size
 .exbar.warn{background:#fef9c3;color:#854d0e;border:1px solid #fde68a}
 .exbar.bad{background:#fee2e2;color:#991b1b;border:1px solid #fca5a5}
 /* ---- final-clearance progress bar + stepper ---- */
-.fcprog{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px 18px;margin-bottom:16px;box-shadow:0 4px 16px rgba(15,23,42,.06)}
+.fcprog{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px;margin-bottom:16px;box-shadow:0 4px 16px rgba(15,23,42,.06)}
 .fcprog .top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px}
 .fcprog .pct{font-size:30px;font-weight:900;background:linear-gradient(135deg,#2563eb,#4338ca);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;line-height:1}
 .fcprog .lbl{font-size:12.5px;color:var(--muted);font-weight:700;text-align:right}
@@ -3682,14 +4594,14 @@ select{padding:9px 10px;border:1px solid var(--line);border-radius:9px;font-size
 .phead .bal{margin-left:8px;font-size:13px;opacity:.95}
 .phead .chip{vertical-align:middle}
 /* horizontal section tabs (sticky to the top of the page so they're always reachable) */
-.nav{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;background:#fff;border:1px solid var(--line);border-radius:14px;padding:6px;margin-bottom:16px;position:sticky;top:8px;z-index:6;box-shadow:0 4px 16px rgba(15,23,42,.05)}
-.nav a{display:inline-flex;gap:7px;align-items:center;padding:9px 14px;color:#334155;text-decoration:none;font-size:13.5px;font-weight:700;border-radius:10px;white-space:nowrap;cursor:pointer}
+.nav{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:6px;margin-bottom:16px;position:sticky;top:8px;z-index:6;box-shadow:0 4px 16px rgba(15,23,42,.05)}
+.nav a{display:inline-flex;gap:7px;align-items:center;padding:9px 14px;color:var(--ink);text-decoration:none;font-size:13.5px;font-weight:700;border-radius:10px;white-space:nowrap;cursor:pointer}
 .nav a .ic{font-size:15px}
 .nav a.active{background:var(--brand);color:#fff}
-.nav a:hover{background:#f1f5f9}.nav a.active:hover{background:var(--brand)}
+.nav a:hover{background:var(--rowline)}.nav a.active:hover{background:var(--brand)}
 .nav a .pill{background:#ef4444;color:#fff;border-radius:999px;font-size:10px;font-weight:800;padding:1px 6px}
 .content{min-width:0}
-.hero{background:#fff;border:1px solid var(--line);border-radius:16px;padding:18px 20px;margin-bottom:16px;display:flex;align-items:center;gap:16px;box-shadow:0 6px 22px rgba(15,23,42,.05)}
+.hero{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px 20px;margin-bottom:16px;display:flex;align-items:center;gap:16px;box-shadow:0 6px 22px rgba(15,23,42,.05)}
 .hero .big{font-size:21px;font-weight:800}.hero .meta{color:var(--muted);font-size:13px;margin-top:3px}
 .chip{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 12px;font-size:12.5px;font-weight:800}
 .chip.ok{background:#dcfce7;color:#166534}.chip.warn{background:#fef9c3;color:#854d0e}.chip.bad{background:#fee2e2;color:#991b1b}
@@ -3741,6 +4653,9 @@ body{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
 .seg.on>*{animation:portalIn .34s var(--ease) both}
 @keyframes portalIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 @media(prefers-reduced-motion:reduce){.seg.on>*{animation:none}}
+/* a silent live refresh (data changed in the background) swaps the DOM in place — never replay the
+   entrance animation, so the page doesn't visibly "reload" every few seconds */
+#app.bgswap .seg.on>*{animation:none!important}
 /* tactile press feedback everywhere a finger lands (the native-app "tap" feel) */
 .btn,.nav a,.qa button,button,.chip,.lib-card{transition:transform .12s var(--ease),background .18s,box-shadow .18s,color .18s}
 .btn:active,.qa button:active,button:active{transform:scale(.96)}
@@ -3772,28 +4687,164 @@ input:focus,select:focus,textarea:focus{outline:0;border-color:var(--brand);box-
   .nav a{padding:10px 13px;border-radius:12px}
   .sectitle{font-size:19px}
   .panel{border-radius:14px}
+  /* the top account bar must never overflow: let it wrap, truncate the long institution name,
+     and shrink the header action buttons */
+  .top{padding:10px 12px;gap:8px;flex-wrap:wrap}
+  .top .nm{font-size:14px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:52%}
+  .top .rl{font-size:11px}
+  .top .btn.sm{padding:7px 10px;font-size:12px}
+}
+/* ============================================================================
+   📱💻 RESPONSIVE / DEVICE-FIT — the portal adapts to phone, tablet and desktop
+   from ONE codebase. The viewport meta already maps CSS px to device px; these
+   rules make each size band comfortable and prevent the classic mobile pitfalls
+   (input-focus zoom, browser-chrome clipping, sideways scroll). ============= */
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+img{max-width:100%;height:auto}
+.wrap,.shell,.content{max-width:100%}
+/* use the DYNAMIC viewport height so the mobile address bar never clips the login */
+@supports(height:100dvh){.login{min-height:100dvh}}
+/* inputs render at 16px on phones/tablets so iOS Safari does NOT auto-zoom the whole
+   page when a field is focused (the #1 cause of a "broken" mobile fit) */
+@media(max-width:820px){input,select,textarea{font-size:16px}}
+/* Tablet band (portrait + landscape): full labels, roomier grids, edge-to-edge shell */
+@media(min-width:601px) and (max-width:1024px){
+  .shell{max-width:100%;padding:16px 20px}
+  .nav a .lbl{display:inline}
+  .nav a{padding:9px 13px}
+  .kpis{grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+  .qa{gap:10px}
+}
+/* Large desktop: let the reading column breathe a little wider on big monitors */
+@media(min-width:1280px){.shell{max-width:1080px}.wrap{max-width:1160px}}
+/* Small phones: tighten everything so nothing overflows on a 320–360px screen */
+@media(max-width:380px){
+  .shell{padding:9px 7px}
+  .phead{padding:12px;gap:10px}.phead .nm{font-size:15px}
+  .sectitle{font-size:17px}.lbox{padding:18px}
+  th,td{padding:8px 9px;font-size:12.5px}
+  .kpi .v{font-size:18px}
+}
+/* Landscape phone: reclaim vertical space (short viewport) */
+@media(max-height:480px) and (orientation:landscape){
+  .phead{padding:10px 14px}
+  .nav{position:static}
 }
 </style></head>
 <body>
-<div id="app"></div>
+<div id="app"><div class="bootsplash" style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:#64748b;font-family:'Segoe UI',system-ui,Arial,sans-serif"><div style="width:44px;height:44px;border-radius:50%;border:4px solid #e2e8f0;border-top-color:#2563eb;animation:ubuspin 1s linear infinite"></div><div style="font-size:14px;font-weight:600">Loading portal…</div><style>@keyframes ubuspin{to{transform:rotate(360deg)}}</style></div></div>
 <script>
 const $=(h)=>{const d=document.createElement('div');d.innerHTML=h;return d.firstElementChild;};
 let TOKEN=localStorage.getItem('ubu_token')||'';let VER=0;let TIMER=null;
+// Branding, cached: paint the login INSTANTLY from the last-seen branding (localStorage) instead of
+// blocking the first paint on /api/branding — on a cold serverless host that call can take 10+ s,
+// which used to leave the page BLANK. The fetch still runs (time-capped) and refreshes the cache;
+// a changed name/logo repaints once it lands.
+function brandCache(){try{return JSON.parse(localStorage.getItem('ubu_branding')||'null')||null;}catch(_){return null;}}
+// slim branding returns logo/login_bg/favicon as tiny cacheable URLs — absolutize them under any
+// path prefix (Supabase Edge serves the portal at /functions/v1/server) so <img src> resolves.
+function absBrand(b){if(!b)return b;var B=window.__B||'';['logo','login_bg','favicon'].forEach(function(k){if(b[k]&&b[k].charAt(0)==='/'&&b[k].charAt(1)!=='/'&&b[k].indexOf(B+'/')!==0)b[k]=B+b[k];});return b;}
+function fetchBranding(capMs){
+  var f=fetch('/api/branding?slim=1').then(function(r){return r.json();}).then(function(b){b=absBrand(b||{});try{localStorage.setItem('ubu_branding',JSON.stringify(b));}catch(_){}return b;});
+  if(!capMs)return f.catch(function(){return brandCache()||{};});
+  return Promise.race([f,new Promise(function(res){setTimeout(function(){res(null);},capMs);})])
+    .then(function(b){return b||brandCache()||{};}).catch(function(){return brandCache()||{};});
+}
 const SYM={NGN:'₦',XOF:'CFA',USD:'$',EUR:'€',GBP:'£',GHS:'₵',KES:'KSh',ZAR:'R'};
 const ZERO_DEC_CUR=new Set(['JPY','KRW','VND','CLP','XOF','XAF','BIF','DJF','GNF','KMF','MGA','PYG','RWF','UGX','VUV','XPF']);
 function money(a,c){var d=ZERO_DEC_CUR.has(String(c||'').toUpperCase())?0:2;return (SYM[c]||(c?c+' ':''))+Number(a||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});}
 function mapMoney(m){const e=Object.entries(m||{});return e.length?e.map(([c,v])=>money(v,c)).join(' • '):money(0);}
 function fmt(d){if(!d)return '—';try{return new Date(d).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'});}catch(_){return '—';}}
-async function api(path,opts={}){opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});if(TOKEN)opts.headers.Authorization='Bearer '+TOKEN;const r=await fetch(path,opts);return r.json();}
-function logout(){TOKEN='';localStorage.removeItem('ubu_token');if(TIMER)clearInterval(TIMER);renderLogin();}
-async function changePassword(){
-  const o=prompt('Enter your CURRENT password:'); if(o===null)return;
-  const n=prompt('Enter your NEW password (at least 5 characters):'); if(n===null)return;
-  if(!n||n.length<5){alert('New password must be at least 5 characters.');return;}
-  const c2=prompt('Confirm your NEW password:'); if(c2===null)return;
-  if(n!==c2){alert('The new passwords do not match.');return;}
-  const r=await api('/api/reset-password',{method:'POST',body:JSON.stringify({oldPassword:o,newPassword:n})});
-  alert(r.ok?'✓ Password changed. Use your new password next time you sign in. It also updates on the school system.':(r.error||'Could not change password.'));
+// NEVER throws: a network/parse failure returns {ok:false,__net:true} and the HTTP status rides along
+// as __status — so callers can tell "offline" (keep the session, show cached data) apart from
+// "session rejected" (401 → sign in again). Throwing here used to LOG THE STUDENT OUT on a flaky
+// connection, which is the worst possible answer to a dropped packet.
+async function api(path,opts={}){
+  opts.headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
+  if(TOKEN)opts.headers.Authorization='Bearer '+TOKEN;
+  opts.cache='no-store';
+  try{
+    const r=await fetch(path,opts);
+    const j=await r.json();
+    if(j&&typeof j==='object'&&!Array.isArray(j)){try{j.__status=r.status;}catch(_){}}
+    return j;
+  }catch(e){return {ok:false,__net:true,error:'Network error.'};}
+}
+// ---- last-good data cache: paints the portal INSTANTLY on the next open (a cold serverless hub can
+// take seconds) and keeps it usable offline. Cleared on sign-out so nothing lingers on a shared PC.
+function dataCache(){try{return JSON.parse(localStorage.getItem('ubu_cache')||'null');}catch(_){return null;}}
+function saveCache(d){try{localStorage.setItem('ubu_cache',JSON.stringify(d));}catch(_){}}
+function setOffline(on){
+  var b=document.getElementById('offbar');
+  if(on){
+    if(b)return;
+    b=document.createElement('div');b.id='offbar';
+    b.style.cssText='position:fixed;left:50%;transform:translateX(-50%);bottom:14px;z-index:9700;background:#7c2d12;color:#fff;padding:9px 16px;border-radius:999px;font-size:12.5px;font-weight:700;box-shadow:0 8px 24px rgba(0,0,0,.35);max-width:92vw;text-align:center';
+    b.textContent='📡 You are offline — showing your last saved data. Reconnecting…';
+    document.body.appendChild(b);
+    try{PI18N.translate(b);}catch(_){}
+  } else if(b)b.remove();
+}
+function logout(msg){TOKEN='';localStorage.removeItem('ubu_token');localStorage.removeItem('ubu_cache');if(TIMER)clearInterval(TIMER);setOffline(false);renderLogin(msg);}
+// ---- 🌗 light / dark / system theme --------------------------------------
+function themePref(){try{return localStorage.getItem('ubu_theme')||'system';}catch(_){return 'system';}}
+function applyThemeMode(){
+  var p=themePref();
+  var dark=p==='dark'||(p==='system'&&window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.setAttribute('data-theme',dark?'dark':'light');
+  var m=document.querySelector('meta[name=theme-color]');if(m)m.setAttribute('content',dark?'#0b1220':'#1e3a8a');
+}
+function themeIcon(){var p=themePref();return p==='dark'?'🌙':(p==='light'?'☀️':'🌗');}
+function cycleTheme(btn){
+  var order=['system','light','dark'];var n=order[(order.indexOf(themePref())+1)%3];
+  try{localStorage.setItem('ubu_theme',n);}catch(_){}
+  applyThemeMode();
+  if(btn){btn.textContent=themeIcon();btn.title='Theme: '+n;}
+}
+function themeBtn(extra){return '<button class="btn sm ghost" data-noi18n onclick="cycleTheme(this)" title="Theme: '+themePref()+'" style="'+(extra||'')+'">'+themeIcon()+'</button>';}
+applyThemeMode();
+try{if(window.matchMedia)matchMedia('(prefers-color-scheme: dark)').addEventListener('change',applyThemeMode);}catch(_){}
+// Proper modal (replaces the old prompt() chain — which could not be translated, styled or cancelled
+// cleanly, and prompt() is blocked entirely inside some WebViews).
+function changePassword(){
+  if(document.getElementById('pwModal'))return;
+  var ov=document.createElement('div');ov.id='pwModal';
+  ov.style.cssText='position:fixed;inset:0;z-index:9600;background:rgba(2,6,23,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+  ov.innerHTML='<div class="card" style="width:360px;max-width:96vw;padding:22px">'
+    +'<h3 style="margin:0 0 4px;font-size:17px">🔑 Change password</h3>'
+    +'<div style="font-size:12.5px;color:var(--muted);margin-bottom:12px">It updates here and on the school system.</div>'
+    +'<div class="err" id="pwErr"></div>'
+    +'<div class="ok2" id="pwOk" style="display:none;color:#166534;background:#dcfce7;border-radius:9px;padding:10px 12px;margin-bottom:10px;font-size:13px"></div>'
+    +'<div class="field"><label>Current password</label><input id="pwOld" type="password" autocomplete="current-password"></div>'
+    +'<div class="field"><label>New password</label><input id="pwNew" type="password" autocomplete="new-password"></div>'
+    +'<div class="field"><label>Confirm new password</label><input id="pwCf" type="password" autocomplete="new-password"></div>'
+    +'<label style="display:flex;gap:7px;align-items:center;font-size:12.5px;color:var(--muted);margin-bottom:12px;cursor:pointer"><input type="checkbox" id="pwShow" style="width:auto"> Show passwords</label>'
+    +'<div style="display:flex;gap:8px"><button class="btn" id="pwGo" style="flex:1">Save new password</button><button class="btn ghost" id="pwX" style="width:auto;padding:12px 16px">Cancel</button></div>'
+    +'</div>';
+  document.body.appendChild(ov);
+  try{PI18N.translate(ov);}catch(_){}
+  var q=function(s){return ov.querySelector(s);};
+  var close=function(){ov.remove();};
+  q('#pwX').onclick=close;
+  ov.addEventListener('click',function(e){if(e.target===ov)close();});
+  q('#pwShow').onchange=function(){var t=this.checked?'text':'password';q('#pwOld').type=t;q('#pwNew').type=t;q('#pwCf').type=t;};
+  var go=async function(){
+    var e=q('#pwErr');e.style.display='none';
+    var o=q('#pwOld').value,n=q('#pwNew').value,c2=q('#pwCf').value;
+    var showErr=function(m){e.textContent=m;e.style.display='block';};
+    if(!o||!n){showErr('Fill in every field.');return;}
+    if(n.length<5){showErr('New password must be at least 5 characters.');return;}
+    if(n!==c2){showErr('The new passwords do not match.');return;}
+    var btn=q('#pwGo');btn.disabled=true;btn.textContent='Saving…';
+    var r=await api('/api/reset-password',{method:'POST',body:JSON.stringify({oldPassword:o,newPassword:n})});
+    btn.disabled=false;btn.textContent='Save new password';
+    if(!r||!r.ok){showErr((r&&r.error)||'Could not change password.');return;}
+    var okb=q('#pwOk');okb.textContent='✓ Password changed. Use it next time you sign in.';okb.style.display='block';
+    setTimeout(close,1600);
+  };
+  q('#pwGo').onclick=go;
+  ov.querySelectorAll('input').forEach(function(i){i.addEventListener('keydown',function(e){if(e.key==='Enter')go();if(e.key==='Escape')close();});});
+  q('#pwOld').focus();
 }
 
 function eh(s){return String(s==null?'':s).replace(/[&<>"]/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[m];});}
@@ -3818,10 +4869,25 @@ var PI18N=(function(){
   };
   var lang=(function(){try{return localStorage.getItem(KEY)||'';}catch(e){return '';}})(); if(!LANGS[lang])lang='en';
   function t(s){if(lang==='en')return s;var d=D[lang];if(!d)return s;var v=d[s];return v==null?s:v;}
+  // translate ONE segment: exact match, else tolerate a leading emoji/symbol prefix ("📂 Documents").
+  // NOTE the DOUBLE backslashes: this whole client script lives in a template literal, where a single
+  // "\\p" collapses to "p" — which silently broke the emoji-prefix match (so most section titles and
+  // emoji-labelled buttons never translated). \\p{L}\\p{N} emits the correct \\p{L}\\p{N} regex.
+  function txseg(str){
+    var d=D[lang]; if(!d)return str; var k=str.trim(); if(!k)return str;
+    if(d[k]!=null)return str.replace(k,d[k]);
+    try{var m=/^([^\\p{L}\\p{N}]+)(.+)$/u.exec(k);if(m){var rest=m[2].trim();if(d[rest]!=null)return str.replace(rest,d[rest]);}}catch(e){}
+    return str;
+  }
   function tx(s){
-    if(lang==='en'||!D[lang])return s;var d=D[lang];var key=s.trim();if(!key)return s;
-    if(d[key]!=null)return s.replace(key,d[key]);
-    try{var m=/^([^\p{L}\p{N}]+)(.+)$/u.exec(key);if(m){var rest=m[2].trim();if(d[rest]!=null)return s.replace(rest,d[rest]);}}catch(e){}
+    if(lang==='en'||!D[lang])return s;
+    var whole=txseg(s); if(whole!==s)return whole;
+    // dynamic "Fixed label — detail" lines (e.g. the exam-clearance banner): translate each side
+    if(s.indexOf(' — ')>=0){
+      var parts=s.split(' — '),any=false;
+      var out=parts.map(function(p){var t=txseg(p);if(t!==p)any=true;return t;});
+      if(any)return out.join(' — ');
+    }
     return s;
   }
   var SKIP={SCRIPT:1,STYLE:1,CODE:1,INPUT:1,TEXTAREA:1,SELECT:1,OPTION:1};
@@ -3842,32 +4908,137 @@ var PI18N=(function(){
   function options(){return Object.keys(LANGS).map(function(c){return '<option value="'+c+'"'+(c===lang?' selected':'')+'>'+LANGS[c].n+'</option>';}).join('');}
   function picker(extraStyle){return '<select data-noi18n onchange="PI18N.setLang(this.value)" title="Language" style="border:1px solid rgba(148,163,184,.5);background:rgba(255,255,255,.12);color:inherit;border-radius:8px;padding:4px 6px;font-size:12px;cursor:pointer;'+(extraStyle||'')+'">'+options()+'</select>';}
   applyDir();
-  return {t:t,tx:tx,translate:translate,setLang:setLang,use:use,hasPref:hasPref,applyDir:applyDir,options:options,picker:picker,merge:function(c){if(!c)return;for(var l in c){D[l]=Object.assign(D[l]||{},c[l]);if(!LANGS[l])LANGS[l]={n:l,dir:'ltr'};}},get lang(){return lang;}};
+  /* Register DOWNLOADED languages (from the synced i18n_langs pack list) with their real display name
+     and text direction, so a pack like Urdu shows as "اردو" in the picker AND flips the page to RTL.
+     Without this the strings would exist but PI18N.use()/setLang() would reject the unknown code. */
+  function addLangs(list){if(!list||!list.length)return;for(var i=0;i<list.length;i++){var L=list[i];if(!L||!L.code)continue;LANGS[L.code]={n:(L.native||L.name||L.code),dir:(L.dir==='rtl'?'rtl':'ltr')};}}
+  return {t:t,tx:tx,translate:translate,setLang:setLang,use:use,hasPref:hasPref,applyDir:applyDir,options:options,picker:picker,addLangs:addLangs,merge:function(c){if(!c)return;for(var l in c){D[l]=Object.assign(D[l]||{},c[l]);if(!LANGS[l])LANGS[l]={n:l,dir:'ltr'};}},get lang(){return lang;}};
 })();
+/* ---- Comprehensive UI termbase ----------------------------------------------------------------
+ * The base dictionary only covered the section tabs; everything else (headings, table headers,
+ * buttons, statuses, empty states, login prompts) stayed in English after switching language. This
+ * supplement translates the whole fixed chrome of the portal for the built-in languages. It is merged
+ * BEFORE any institution i18n_custom pack, so a school can still override any term. */
+try{PI18N.merge({
+  fr:{
+    'Graduation':'Fin d’études','University Documents':'Documents universitaires','Online Exams':'Examens en ligne','E-Library':'Bibliothèque numérique','My Results':'Mes résultats','Examination Clearance':'Autorisation d’examen','Final Clearance (Graduation)':'Quitus final (fin d’études)','Exam Conduct':'Conduite d’examen','Course & Lecturer Evaluation':'Évaluation des cours et enseignants','Disciplinary Records':'Dossiers disciplinaires','Updates & Notifications':'Mises à jour et notifications','My Profile':'Mon profil','My Timetable & Course Allocation':'Mon emploi du temps et mes cours','Payment History & Receipts':'Historique des paiements et reçus','My Academic Progress':'Ma progression académique','My Tickets':'Mes tickets',
+    'Office':'Bureau','Charged':'Facturé','Billed':'Facturé','Fee Category':'Catégorie de frais','Currency':'Devise','Description':'Description','Set By':'Défini par','Collected By':'Encaissé par','Day':'Jour','Time':'Heure','Lecturer':'Enseignant','Venue':'Salle','Title':'Titre','Type':'Type','From Office':'Bureau émetteur','Offense':'Infraction','Severity':'Gravité','Action':'Sanction','Fine':'Amende','Note':'Remarque','Purpose':'Objet','Requested':'Demandé','For':'Pour','Grade':'Note','Units':'Unités','Credit Units':'Unités de valeur','Score':'Score','Total':'Total','Bank':'Banque','Period':'Période','Net Pay':'Net à payer','Base / Default Pay':'Salaire de base','Payslips':'Bulletins de paie','Position':'Poste','Invoice':'Facture','Due':'Échéance',
+    'Who You Owe — by Office':'Ce que vous devez — par bureau','Outstanding Fees':'Frais impayés','All Fees & Charges':'Tous les frais','Fee Invoices':'Factures','Other Result Documents':'Autres relevés','Exam Validation History':'Historique de validation des examens','Request an Official Document':'Demander un document officiel','Send My Documents to an Organization':'Envoyer mes documents à un organisme','My Documents':'Mes documents','Ready to graduate?':'Prêt à obtenir votre diplôme ?','My Payslips':'Mes bulletins de paie',
+    'Download':'Télécharger','Download PDF':'Télécharger le PDF','Download full statement':'Télécharger le relevé complet','Download full statement (all semesters)':'Télécharger le relevé complet (tous les semestres)','Change password':'Changer le mot de passe','Pay online':'Payer en ligne','Read':'Lire','Request Transcript':'Demander un relevé','Request Certificate':'Demander un diplôme','Submit Evaluation':'Envoyer l’évaluation','Join':'Rejoindre','Appeal':'Contester','Payment not showing?':'Paiement non affiché ?','Set my password':'Définir mon mot de passe','Back to sign in':'Retour à la connexion','Set your password':'Définir votre mot de passe','Set your password →':'Définir votre mot de passe →','Verify a Transcript or Certificate':'Vérifier un relevé ou un diplôme','New password':'Nouveau mot de passe','Confirm':'Confirmer','Continue':'Continuer','Save & Continue':'Enregistrer et continuer','Back':'Retour','Next':'Suivant','Submit':'Envoyer','Email me a reset code':'M’envoyer un code de réinitialisation','I forgot my username':'J’ai oublié mon identifiant','Send code':'Envoyer le code','Verify & set password':'Vérifier et définir le mot de passe','Email me my username':'M’envoyer mon identifiant',
+    'Cleared for exams':'Autorisé aux examens','Not cleared':'Non autorisé','Partially cleared':'Partiellement autorisé','Under review':'En cours d’examen','Pending':'En attente','Owing':'Dû','Cleared':'Réglé','Not approved':'Non approuvé','Resolved':'Résolu','Open':'Ouvert','Available':'Disponible','Not issued':'Non délivré','current':'en cours','Current':'En cours','Withheld':'Retenu','Released':'Publié',
+    'Balance':'Solde','Balance:':'Solde :','Exam Status':'Statut d’examen','Welcome':'Bienvenue','Yes':'Oui','No':'Non','Loading…':'Chargement…','Cancel':'Annuler','Close':'Fermer','Search':'Rechercher','All':'Tout','Optional':'Facultatif','Required':'Obligatoire','minor':'mineur','major':'majeur','severe':'grave','I am a':'Je suis','Student':'Étudiant','Parent / Guardian':'Parent / Tuteur',
+    'No documents published yet.':'Aucun document publié pour l’instant.','No requests yet.':'Aucune demande pour l’instant.','Nothing to show.':'Rien à afficher.','No invoices.':'Aucune facture.','No other result documents.':'Aucun autre relevé.','No exam validations yet.':'Aucune validation d’examen pour l’instant.','No misconduct on record.':'Aucune infraction enregistrée.','No payslips yet.':'Aucun bulletin de paie pour l’instant.',
+    'Matric pending':'Matricule en attente','Set / reset your password':'Définir / réinitialiser votre mot de passe','Student, Staff & Lecturer Portal':'Portail étudiants, personnel et enseignants','First time here, or forgot your password?':'Première visite ou mot de passe oublié ?','New here? Not yet a student?':'Nouveau ? Pas encore étudiant ?'
+  },
+  es:{
+    'Graduation':'Graduación','University Documents':'Documentos universitarios','Online Exams':'Exámenes en línea','E-Library':'Biblioteca digital','My Results':'Mis resultados','Examination Clearance':'Habilitación de examen','Final Clearance (Graduation)':'Habilitación final (graduación)','Exam Conduct':'Conducta de examen','Course & Lecturer Evaluation':'Evaluación de cursos y profesores','Disciplinary Records':'Registros disciplinarios','Updates & Notifications':'Novedades y notificaciones','My Profile':'Mi perfil','My Timetable & Course Allocation':'Mi horario y asignación de cursos','Payment History & Receipts':'Historial de pagos y recibos','My Academic Progress':'Mi progreso académico','My Tickets':'Mis tickets',
+    'Office':'Oficina','Charged':'Cargado','Billed':'Facturado','Fee Category':'Categoría de tasa','Currency':'Moneda','Description':'Descripción','Set By':'Establecido por','Collected By':'Cobrado por','Day':'Día','Time':'Hora','Lecturer':'Profesor','Venue':'Aula','Title':'Título','Type':'Tipo','From Office':'Oficina emisora','Offense':'Falta','Severity':'Gravedad','Action':'Sanción','Fine':'Multa','Note':'Nota','Purpose':'Propósito','Requested':'Solicitado','For':'Por','Grade':'Calificación','Units':'Unidades','Credit Units':'Créditos','Score':'Puntuación','Total':'Total','Bank':'Banco','Period':'Período','Net Pay':'Pago neto','Base / Default Pay':'Salario base','Payslips':'Nóminas','Position':'Cargo','Invoice':'Factura','Due':'Vencimiento',
+    'Who You Owe — by Office':'Lo que debes — por oficina','Outstanding Fees':'Tasas pendientes','All Fees & Charges':'Todas las tasas','Fee Invoices':'Facturas','Other Result Documents':'Otros documentos de resultados','Exam Validation History':'Historial de validación de exámenes','Request an Official Document':'Solicitar un documento oficial','Send My Documents to an Organization':'Enviar mis documentos a una organización','My Documents':'Mis documentos','Ready to graduate?':'¿Listo para graduarte?','My Payslips':'Mis nóminas',
+    'Download':'Descargar','Download PDF':'Descargar PDF','Download full statement':'Descargar estado completo','Download full statement (all semesters)':'Descargar estado completo (todos los semestres)','Change password':'Cambiar contraseña','Pay online':'Pagar en línea','Read':'Leer','Request Transcript':'Solicitar expediente','Request Certificate':'Solicitar título','Submit Evaluation':'Enviar evaluación','Join':'Unirse','Appeal':'Apelar','Payment not showing?':'¿Pago no reflejado?','Set my password':'Establecer mi contraseña','Back to sign in':'Volver a iniciar sesión','Set your password':'Establece tu contraseña','Set your password →':'Establece tu contraseña →','Verify a Transcript or Certificate':'Verificar un expediente o título','New password':'Nueva contraseña','Confirm':'Confirmar','Continue':'Continuar','Save & Continue':'Guardar y continuar','Back':'Atrás','Next':'Siguiente','Submit':'Enviar','Email me a reset code':'Enviarme un código de restablecimiento','I forgot my username':'Olvidé mi usuario','Send code':'Enviar código','Verify & set password':'Verificar y establecer contraseña','Email me my username':'Enviarme mi usuario',
+    'Cleared for exams':'Habilitado para exámenes','Not cleared':'No habilitado','Partially cleared':'Parcialmente habilitado','Under review':'En revisión','Pending':'Pendiente','Owing':'Adeuda','Cleared':'Saldado','Not approved':'No aprobado','Resolved':'Resuelto','Open':'Abierto','Available':'Disponible','Not issued':'No emitido','current':'actual','Current':'Actual','Withheld':'Retenido','Released':'Publicado',
+    'Balance':'Saldo','Balance:':'Saldo:','Exam Status':'Estado del examen','Welcome':'Bienvenido','Yes':'Sí','No':'No','Loading…':'Cargando…','Cancel':'Cancelar','Close':'Cerrar','Search':'Buscar','All':'Todo','Optional':'Opcional','Required':'Obligatorio','minor':'leve','major':'grave','severe':'muy grave','I am a':'Soy','Student':'Estudiante','Parent / Guardian':'Padre / Tutor',
+    'No documents published yet.':'Aún no hay documentos publicados.','No requests yet.':'Aún no hay solicitudes.','Nothing to show.':'Nada que mostrar.','No invoices.':'Sin facturas.','No other result documents.':'No hay otros documentos de resultados.','No exam validations yet.':'Aún no hay validaciones de examen.','No misconduct on record.':'Sin faltas registradas.','No payslips yet.':'Aún no hay nóminas.',
+    'Matric pending':'Matrícula pendiente','Set / reset your password':'Establecer / restablecer tu contraseña','Student, Staff & Lecturer Portal':'Portal de estudiantes, personal y profesores','First time here, or forgot your password?':'¿Primera vez o olvidaste tu contraseña?','New here? Not yet a student?':'¿Nuevo? ¿Aún no eres estudiante?'
+  },
+  ar:{
+    'Graduation':'التخرّج','University Documents':'الوثائق الجامعية','Online Exams':'الامتحانات الإلكترونية','E-Library':'المكتبة الإلكترونية','My Results':'نتائجي','Examination Clearance':'إخلاء طرف الامتحان','Final Clearance (Graduation)':'الإخلاء النهائي (التخرّج)','Exam Conduct':'سلوك الامتحان','Course & Lecturer Evaluation':'تقييم المقرر والمحاضر','Disciplinary Records':'السجلات التأديبية','Updates & Notifications':'التحديثات والإشعارات','My Profile':'ملفي الشخصي','My Timetable & Course Allocation':'جدولي وتوزيع المقررات','Payment History & Receipts':'سجل المدفوعات والإيصالات','My Academic Progress':'تقدّمي الأكاديمي','My Tickets':'تذاكري',
+    'Office':'المكتب','Charged':'المستحق','Billed':'المفوتر','Fee Category':'فئة الرسوم','Currency':'العملة','Description':'الوصف','Set By':'حُدِّد بواسطة','Collected By':'حُصِّل بواسطة','Day':'اليوم','Time':'الوقت','Lecturer':'المحاضر','Venue':'القاعة','Title':'العنوان','Type':'النوع','From Office':'المكتب المُصدِر','Offense':'المخالفة','Severity':'الخطورة','Action':'الإجراء','Fine':'الغرامة','Note':'ملاحظة','Purpose':'الغرض','Requested':'تاريخ الطلب','For':'مقابل','Grade':'التقدير','Units':'الوحدات','Credit Units':'الوحدات المعتمدة','Score':'الدرجة','Total':'المجموع','Bank':'البنك','Period':'الفترة','Net Pay':'صافي الراتب','Base / Default Pay':'الراتب الأساسي','Payslips':'قسائم الراتب','Position':'المنصب','Invoice':'الفاتورة','Due':'الاستحقاق',
+    'Who You Owe — by Office':'ما عليك دفعه — حسب المكتب','Outstanding Fees':'الرسوم المستحقة','All Fees & Charges':'جميع الرسوم','Fee Invoices':'الفواتير','Other Result Documents':'وثائق نتائج أخرى','Exam Validation History':'سجل اعتماد الامتحانات','Request an Official Document':'طلب وثيقة رسمية','Send My Documents to an Organization':'إرسال وثائقي إلى جهة','My Documents':'وثائقي','Ready to graduate?':'جاهز للتخرّج؟','My Payslips':'قسائم راتبي',
+    'Download':'تنزيل','Download PDF':'تنزيل PDF','Download full statement':'تنزيل الكشف الكامل','Download full statement (all semesters)':'تنزيل الكشف الكامل (كل الفصول)','Change password':'تغيير كلمة المرور','Pay online':'ادفع إلكترونيًا','Read':'قراءة','Request Transcript':'طلب كشف الدرجات','Request Certificate':'طلب الشهادة','Submit Evaluation':'إرسال التقييم','Join':'انضمام','Appeal':'اعتراض','Payment not showing?':'الدفع لا يظهر؟','Set my password':'تعيين كلمة المرور','Back to sign in':'العودة لتسجيل الدخول','Set your password':'عيّن كلمة المرور','Set your password →':'عيّن كلمة المرور →','Verify a Transcript or Certificate':'التحقق من كشف درجات أو شهادة','New password':'كلمة مرور جديدة','Confirm':'تأكيد','Continue':'متابعة','Save & Continue':'حفظ ومتابعة','Back':'رجوع','Next':'التالي','Submit':'إرسال','Email me a reset code':'أرسل لي رمز إعادة تعيين','I forgot my username':'نسيت اسم المستخدم','Send code':'إرسال الرمز','Verify & set password':'تحقّق وعيّن كلمة المرور','Email me my username':'أرسل لي اسم المستخدم',
+    'Cleared for exams':'مسموح بدخول الامتحان','Not cleared':'غير مسموح','Partially cleared':'مسموح جزئيًا','Under review':'قيد المراجعة','Pending':'قيد الانتظار','Owing':'مستحق','Cleared':'مُسدَّد','Not approved':'غير معتمد','Resolved':'تم الحل','Open':'مفتوح','Available':'متاح','Not issued':'غير صادر','current':'الحالي','Current':'الحالي','Withheld':'محجوب','Released':'منشور',
+    'Balance':'الرصيد','Balance:':'الرصيد:','Exam Status':'حالة الامتحان','Welcome':'مرحبًا','Yes':'نعم','No':'لا','Loading…':'جارٍ التحميل…','Cancel':'إلغاء','Close':'إغلاق','Search':'بحث','All':'الكل','Optional':'اختياري','Required':'مطلوب','minor':'بسيط','major':'كبير','severe':'خطير','I am a':'أنا','Student':'طالب','Parent / Guardian':'ولي الأمر',
+    'No documents published yet.':'لا توجد وثائق منشورة بعد.','No requests yet.':'لا توجد طلبات بعد.','Nothing to show.':'لا يوجد ما يُعرض.','No invoices.':'لا توجد فواتير.','No other result documents.':'لا توجد وثائق نتائج أخرى.','No exam validations yet.':'لا توجد اعتمادات امتحان بعد.','No misconduct on record.':'لا توجد مخالفات مسجلة.','No payslips yet.':'لا توجد قسائم راتب بعد.',
+    'Matric pending':'الرقم الجامعي قيد الإصدار','Set / reset your password':'تعيين / إعادة تعيين كلمة المرور','Student, Staff & Lecturer Portal':'بوابة الطلاب والموظفين والمحاضرين','First time here, or forgot your password?':'أول مرة هنا أو نسيت كلمة المرور؟','New here? Not yet a student?':'جديد هنا؟ لست طالبًا بعد؟'
+  },
+  ha:{
+    'Graduation':'Kammala karatu','University Documents':'Takardun jami’a','Online Exams':'Jarrabawar kan layi','E-Library':'Ɗakin karatu na dijital','My Results':'Sakamakona','Examination Clearance':'Izinin jarrabawa','Final Clearance (Graduation)':'Izini na ƙarshe (kammalawa)','Exam Conduct':'Halin jarrabawa','Course & Lecturer Evaluation':'Kimanta darasi da malami','Disciplinary Records':'Bayanan ladabtarwa','Updates & Notifications':'Sabuntawa da sanarwa','My Profile':'Bayanina','My Timetable & Course Allocation':'Jadawali da rabon darussa','Payment History & Receipts':'Tarihin biya da rasidi','My Academic Progress':'Cigabana na ilimi','My Tickets':'Koke-koke na',
+    'Office':'Ofis','Charged':'An caji','Billed':'An caji','Fee Category':'Nau’in kuɗi','Currency':'Kuɗi','Description':'Bayani','Set By':'Wanda ya kafa','Collected By':'Wanda ya karɓa','Day':'Rana','Time':'Lokaci','Lecturer':'Malami','Venue':'Wuri','Title':'Take','Type':'Nau’i','From Office':'Daga ofis','Offense':'Laifi','Severity':'Girman laifi','Action':'Mataki','Fine':'Tara','Note':'Bayani','Purpose':'Dalili','Requested':'An nema','For':'Domin','Grade':'Daraja','Units':'Raka’o’i','Credit Units':'Raka’o’in kiredit','Score':'Maki','Total':'Jimla','Bank':'Banki','Period':'Lokaci','Net Pay':'Albashi na ƙarshe','Base / Default Pay':'Albashin asali','Payslips':'Takardun albashi','Position':'Muƙami','Invoice':'Takardar kuɗi','Due':'Ranar biya',
+    'Who You Owe — by Office':'Abin da kake bin bashi — bisa ofis','Outstanding Fees':'Kuɗin da ba a biya ba','All Fees & Charges':'Dukkan kuɗi','Fee Invoices':'Takardun kuɗi','Other Result Documents':'Sauran takardun sakamako','Exam Validation History':'Tarihin tabbatar da jarrabawa','Request an Official Document':'Nemi takarda ta hukuma','Send My Documents to an Organization':'Aika takarduna zuwa ƙungiya','My Documents':'Takarduna','Ready to graduate?':'A shirye don kammala karatu?','My Payslips':'Takardun albashina',
+    'Download':'Sauke','Download PDF':'Sauke PDF','Download full statement':'Sauke cikakken bayani','Download full statement (all semesters)':'Sauke cikakken bayani (dukkan sassa)','Change password':'Canza kalmar sirri','Pay online':'Biya kan layi','Read':'Karanta','Request Transcript':'Nemi kwafin sakamako','Request Certificate':'Nemi shaida','Submit Evaluation':'Aika kimantawa','Join':'Shiga','Appeal':'Ƙara','Payment not showing?':'Biya bai bayyana ba?','Set my password':'Kafa kalmar sirri','Back to sign in':'Koma shiga','Set your password':'Kafa kalmar sirrin ka','Set your password →':'Kafa kalmar sirrin ka →','Verify a Transcript or Certificate':'Tabbatar da sakamako ko shaida','New password':'Sabuwar kalmar sirri','Confirm':'Tabbatar','Continue':'Ci gaba','Save & Continue':'Ajiye ka ci gaba','Back':'Baya','Next':'Na gaba','Submit':'Aika','Email me a reset code':'Aiko min lambar sake saiti','I forgot my username':'Na manta sunan mai amfani','Send code':'Aika lamba','Verify & set password':'Tabbatar ka kafa kalmar sirri','Email me my username':'Aiko min sunan mai amfani na',
+    'Cleared for exams':'An bar ka jarrabawa','Not cleared':'Ba a bari ba','Partially cleared':'An bar wani ɓangare','Under review':'Ana dubawa','Pending':'Ana jira','Owing':'Ana bin bashi','Cleared':'An biya','Not approved':'Ba a amince ba','Resolved':'An warware','Open':'A buɗe','Available':'Akwai','Not issued':'Ba a bayar ba','current':'na yanzu','Current':'Na yanzu','Withheld':'An riƙe','Released':'An fitar',
+    'Balance':'Saura','Balance:':'Saura:','Exam Status':'Matsayin jarrabawa','Welcome':'Barka da zuwa','Yes':'Ee','No':'A’a','Loading…':'Ana ɗaukarwa…','Cancel':'Soke','Close':'Rufe','Search':'Nema','All':'Duka','Optional':'Na zaɓi','Required':'Wajibi','minor':'ƙarami','major':'babba','severe':'mai tsanani','I am a':'Ni','Student':'Ɗalibi','Parent / Guardian':'Iyaye / Mai kula',
+    'No documents published yet.':'Ba a buga takardu ba tukuna.','No requests yet.':'Babu buƙata tukuna.','Nothing to show.':'Babu abin nunawa.','No invoices.':'Babu takardun kuɗi.','No other result documents.':'Babu sauran takardun sakamako.','No exam validations yet.':'Babu tabbatar da jarrabawa tukuna.','No misconduct on record.':'Babu laifi a rikodi.','No payslips yet.':'Babu takardun albashi tukuna.',
+    'Matric pending':'Lambar rajista tana jira','Set / reset your password':'Kafa / sake kafa kalmar sirri','Student, Staff & Lecturer Portal':'Tashar ɗalibai, ma’aikata da malamai','First time here, or forgot your password?':'Sabon shiga ne, ko ka manta kalmar sirri?','New here? Not yet a student?':'Sabo ne? Ba ɗalibi tukuna?'
+  }
+});}catch(_){}
+/* exam-clearance banner (a dynamic "LABEL — reason" line) + the reason phrases, so tx()'s " — " split
+   can translate both halves */
+try{PI18N.merge({
+  fr:{'CLEARED for examinations':'AUTORISÉ aux examens','PARTIALLY CLEARED for exams':'PARTIELLEMENT AUTORISÉ aux examens','NOT CLEARED for exams':'NON AUTORISÉ aux examens','you still owe fees':'vous avez encore des frais impayés','Outstanding fees not cleared':'Frais impayés non réglés','No examination clearance issued':'Aucune autorisation d’examen délivrée','no clearance':'aucune autorisation'},
+  es:{'CLEARED for examinations':'HABILITADO para exámenes','PARTIALLY CLEARED for exams':'PARCIALMENTE HABILITADO para exámenes','NOT CLEARED for exams':'NO HABILITADO para exámenes','you still owe fees':'aún debes tasas','Outstanding fees not cleared':'Tasas pendientes sin pagar','No examination clearance issued':'No se ha emitido habilitación de examen','no clearance':'sin habilitación'},
+  ar:{'CLEARED for examinations':'مسموح بدخول الامتحانات','PARTIALLY CLEARED for exams':'مسموح جزئيًا بدخول الامتحانات','NOT CLEARED for exams':'غير مسموح بدخول الامتحانات','you still owe fees':'لا تزال عليك رسوم مستحقة','Outstanding fees not cleared':'رسوم مستحقة غير مسددة','No examination clearance issued':'لم يصدر إخلاء طرف للامتحان','no clearance':'لا يوجد إخلاء طرف'},
+  ha:{'CLEARED for examinations':'AN BAR ka shiga jarrabawa','PARTIALLY CLEARED for exams':'AN BAR wani ɓangare na jarrabawa','NOT CLEARED for exams':'BA A BAR ka shiga jarrabawa ba','you still owe fees':'har yanzu kana bin kuɗi','Outstanding fees not cleared':'Kuɗin da ba a biya ba','No examination clearance issued':'Ba a bayar da izinin jarrabawa ba','no clearance':'babu izini'}
+});}catch(_){}
+/* password-change modal, offline banner, retry screen (the resilience UI added 2026-07) */
+try{PI18N.merge({
+  fr:{'Current password':'Mot de passe actuel','Confirm new password':'Confirmer le nouveau mot de passe','Show passwords':'Afficher les mots de passe','Save new password':'Enregistrer le nouveau mot de passe','It updates here and on the school system.':'Il est mis à jour ici et dans le système de l’école.','You are offline — showing your last saved data. Reconnecting…':'Vous êtes hors ligne — affichage de vos dernières données. Reconnexion…','Cannot reach the server':'Impossible de joindre le serveur','Check your connection. We will keep retrying automatically.':'Vérifiez votre connexion. Nouvel essai automatique.','Retry now':'Réessayer maintenant','Your session has expired — please sign in again.':'Votre session a expiré — veuillez vous reconnecter.'},
+  es:{'Current password':'Contraseña actual','Confirm new password':'Confirmar la nueva contraseña','Show passwords':'Mostrar contraseñas','Save new password':'Guardar la nueva contraseña','It updates here and on the school system.':'Se actualiza aquí y en el sistema de la escuela.','You are offline — showing your last saved data. Reconnecting…':'Estás sin conexión — mostrando tus últimos datos guardados. Reconectando…','Cannot reach the server':'No se puede conectar con el servidor','Check your connection. We will keep retrying automatically.':'Revisa tu conexión. Seguiremos reintentando automáticamente.','Retry now':'Reintentar ahora','Your session has expired — please sign in again.':'Tu sesión ha expirado — inicia sesión de nuevo.'},
+  ar:{'Current password':'كلمة المرور الحالية','Confirm new password':'تأكيد كلمة المرور الجديدة','Show passwords':'إظهار كلمات المرور','Save new password':'حفظ كلمة المرور الجديدة','It updates here and on the school system.':'يتم تحديثها هنا وفي نظام الجامعة.','You are offline — showing your last saved data. Reconnecting…':'أنت غير متصل — نعرض آخر بياناتك المحفوظة. جارٍ إعادة الاتصال…','Cannot reach the server':'تعذر الوصول إلى الخادم','Check your connection. We will keep retrying automatically.':'تحقق من اتصالك. سنواصل المحاولة تلقائيًا.','Retry now':'أعد المحاولة الآن','Your session has expired — please sign in again.':'انتهت صلاحية جلستك — يرجى تسجيل الدخول مجددًا.'},
+  ha:{'Current password':'Kalmar sirri ta yanzu','Confirm new password':'Tabbatar da sabuwar kalmar sirri','Show passwords':'Nuna kalmomin sirri','Save new password':'Ajiye sabuwar kalmar sirri','It updates here and on the school system.':'Ana sabunta ta a nan da kuma tsarin makaranta.','You are offline — showing your last saved data. Reconnecting…':'Ba ka da haɗi — muna nuna bayanan da aka ajiye. Ana sake haɗawa…','Cannot reach the server':'Ba a iya kaiwa uwar garke ba','Check your connection. We will keep retrying automatically.':'Duba haɗin ka. Za mu ci gaba da sake gwadawa.','Retry now':'Sake gwadawa yanzu','Your session has expired — please sign in again.':'Zamanka ya ƙare — ka sake shiga.'}
+});}catch(_){}
+/* wide split-screen sign-in hero (homepage) */
+try{PI18N.merge({
+  fr:{'Your whole campus, in one place.':'Tout votre campus, au même endroit.','Results, fees, timetable, live classes and official documents — one secure portal for students, staff and lecturers.':'Résultats, frais, emploi du temps, cours en direct et documents officiels — un portail sécurisé pour étudiants, personnel et enseignants.','Results & GPA':'Résultats et moyenne','Grades, transcripts and your live CGPA.':'Notes, relevés et votre moyenne en direct.','Fees & Receipts':'Frais et reçus','Check your balance and pay online instantly.':'Consultez votre solde et payez en ligne instantanément.','Timetable & Classes':'Emploi du temps et cours','Lectures, exams and live video classes.':'Cours, examens et classes vidéo en direct.','Documents':'Documents','Admission letter, transcripts & certificates.':'Lettre d’admission, relevés et diplômes.','Employer, university or agency?':'Employeur, université ou administration ?','Verify a Transcript or Certificate →':'Vérifier un relevé ou un diplôme →'},
+  es:{'Your whole campus, in one place.':'Todo tu campus, en un solo lugar.','Results, fees, timetable, live classes and official documents — one secure portal for students, staff and lecturers.':'Resultados, tasas, horario, clases en vivo y documentos oficiales — un portal seguro para estudiantes, personal y profesores.','Results & GPA':'Resultados y promedio','Grades, transcripts and your live CGPA.':'Notas, expedientes y tu promedio en vivo.','Fees & Receipts':'Tasas y recibos','Check your balance and pay online instantly.':'Consulta tu saldo y paga en línea al instante.','Timetable & Classes':'Horario y clases','Lectures, exams and live video classes.':'Clases, exámenes y clases por vídeo en vivo.','Documents':'Documentos','Admission letter, transcripts & certificates.':'Carta de admisión, expedientes y títulos.','Employer, university or agency?':'¿Empleador, universidad o agencia?','Verify a Transcript or Certificate →':'Verificar un expediente o título →'},
+  ar:{'Your whole campus, in one place.':'حرمك الجامعي كله في مكان واحد.','Results, fees, timetable, live classes and official documents — one secure portal for students, staff and lecturers.':'النتائج والرسوم والجدول والحصص المباشرة والوثائق الرسمية — بوابة آمنة واحدة للطلاب والموظفين والمحاضرين.','Results & GPA':'النتائج والمعدل','Grades, transcripts and your live CGPA.':'الدرجات وكشوف الدرجات ومعدلك التراكمي مباشرة.','Fees & Receipts':'الرسوم والإيصالات','Check your balance and pay online instantly.':'تحقق من رصيدك وادفع إلكترونيًا فورًا.','Timetable & Classes':'الجدول والحصص','Lectures, exams and live video classes.':'المحاضرات والامتحانات والحصص المرئية المباشرة.','Documents':'الوثائق','Admission letter, transcripts & certificates.':'خطاب القبول وكشوف الدرجات والشهادات.','Employer, university or agency?':'صاحب عمل أو جامعة أو جهة؟','Verify a Transcript or Certificate →':'تحقّق من كشف درجات أو شهادة →'},
+  ha:{'Your whole campus, in one place.':'Dukkan makarantarka, wuri ɗaya.','Results, fees, timetable, live classes and official documents — one secure portal for students, staff and lecturers.':'Sakamako, kuɗi, jadawali, azuzuwa kai tsaye da takardu na hukuma — tasha ɗaya mai tsaro ga ɗalibai, ma’aikata da malamai.','Results & GPA':'Sakamako da GPA','Grades, transcripts and your live CGPA.':'Darajoji, kwafin sakamako da CGPA kai tsaye.','Fees & Receipts':'Kuɗi da rasidi','Check your balance and pay online instantly.':'Duba saura ka biya kan layi nan take.','Timetable & Classes':'Jadawali da azuzuwa','Lectures, exams and live video classes.':'Laccoci, jarrabawa da azuzuwan bidiyo kai tsaye.','Documents':'Takardu','Admission letter, transcripts & certificates.':'Wasiƙar shiga, kwafin sakamako da shaidu.','Employer, university or agency?':'Ma’aikaci, jami’a ko hukuma?','Verify a Transcript or Certificate →':'Tabbatar da sakamako ko shaida →'}
+});}catch(_){}
+/* the "verify a credential" footer that sits at the bottom of every signed-in page (a sentence split
+   by an inline link — each half is its own text node) */
+try{PI18N.merge({
+  fr:{'Employers & institutions can':'Les employeurs et institutions peuvent','verify a transcript or certificate here':'vérifier un relevé ou un diplôme ici'},
+  es:{'Employers & institutions can':'Los empleadores e instituciones pueden','verify a transcript or certificate here':'verificar un expediente o título aquí'},
+  ar:{'Employers & institutions can':'يمكن لأصحاب العمل والمؤسسات','verify a transcript or certificate here':'التحقق من كشف الدرجات أو الشهادة هنا'},
+  ha:{'Employers & institutions can':'Masu ɗaukar aiki da cibiyoyi za su iya','verify a transcript or certificate here':'tabbatar da sakamako ko shaida a nan'}
+});}catch(_){}
 
 async function renderLogin(msg){
-  let b={};try{b=await(await fetch('/api/branding')).json();}catch(_){}
+  // paint instantly: race the branding fetch against 1.2s, fall back to the cached/last-seen
+  // branding, and repaint once the real branding lands if we painted stale defaults.
+  var bp=fetchBranding(0);
+  let b=await Promise.race([bp,new Promise(function(res){setTimeout(function(){res(null);},1200);})]);
+  var paintedStale=!b; b=b||brandCache()||{};
+  if(paintedStale)bp.then(function(nb){try{if(nb&&document.querySelector('.authwrap')&&JSON.stringify(nb)!==JSON.stringify(b))renderLogin(msg);}catch(_){}});
   const uname=eh(b.name||'University Portal');
-  const logo=b.logo?'<img class="blogo" src="'+b.logo+'" alt="logo">':'<div class="blogo mono">'+eh((b.short||'UB').slice(0,3))+'</div>';
+  const heroLogo=b.logo?'<img src="'+b.logo+'" alt="logo">':'<div class="mono">'+eh((b.short||'UB').slice(0,3))+'</div>';
   // multi-campus: a student picks the campus they belong to at login (so they're allocated to it)
   const campusField=(b.campuses&&b.campuses.length)?('<div class="field"><label>🏫 Your campus</label><select id="cmp"><option value="">Select your campus…</option>'+b.campuses.map(function(c){return '<option value="'+c.id+'">'+eh(c.name)+'</option>';}).join('')+'</select></div>'):'';
   const locked=b.licensed===false;
   const lockBanner=locked?('<div style="background:#fee2e2;color:#991b1b;border-radius:9px;padding:10px 12px;margin-bottom:10px;font-size:13px">🔒 This institution\\'s software has not been activated. Please contact your administrator.</div>'):'';
-  document.getElementById('app').innerHTML='';
-  const box=$('<div class="login"><div class="card lbox">'
-    +'<div class="brandhead">'+logo+'<div><div class="uname">'+uname+'</div>'+(b.motto?('<div class="umotto">'+eh(b.motto)+'</div>'):'')+'</div></div>'
-    +'<div class="psub">🎓 Student, Staff &amp; Lecturer Portal</div>'
+  const feat=function(ic,t,dsc){return '<div class="f"><div class="fi">'+ic+'</div><div><div class="ft">'+t+'</div><div class="fd">'+dsc+'</div></div></div>';};
+  // LEFT — branded hero that fills the desktop width (collapses to a compact banner on phones)
+  const hero='<div class="authhero">'
+    +'<div class="hbrand">'+heroLogo+'<div><div class="hname">'+uname+'</div>'+(b.motto?('<div class="hmotto">'+eh(b.motto)+'</div>'):'')+'</div></div>'
+    +'<h1>Your whole campus, in one place.</h1>'
+    +'<div class="hsub">Results, fees, timetable, live classes and official documents — one secure portal for students, staff and lecturers.</div>'
+    +'<div class="authfeat">'
+      +feat('📊','Results &amp; GPA','Grades, transcripts and your live CGPA.')
+      +feat('💳','Fees &amp; Receipts','Check your balance and pay online instantly.')
+      +feat('🗓','Timetable &amp; Classes','Lectures, exams and live video classes.')
+      +feat('🎓','Documents','Admission letter, transcripts &amp; certificates.')
+    +'</div>'
+    +'<div class="hverify">🏛 Employer, university or agency? <a href="/verify-credentials">Verify a Transcript or Certificate →</a></div>'
+  +'</div>';
+  // RIGHT — the focused sign-in card
+  const panel='<div class="authpanel"><div class="authcard">'
+    +'<div class="psub" style="margin-top:0">🎓 Student, Staff &amp; Lecturer Portal</div>'
     +lockBanner
     +'<div class="err"></div>'
     +'<div class="field"><label>Matric no · Staff no · Username · Email</label><input id="lg" autofocus autocomplete="username"></div>'
     +'<div class="field"><label>Password</label><input id="pw" type="password" autocomplete="current-password"></div>'
     +campusField
     +'<button class="btn" id="go">Sign In</button>'
-    +'<div class="hintbar">First time here, or forgot your password? <a href="#" id="recover" style="color:#1e3a8a;font-weight:700;text-decoration:none">Set your password →</a></div>'
-    +'<div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(148,163,184,.3);text-align:center"><div class="sub" style="margin-bottom:8px">New here? Not yet a student?</div><a href="/apply" style="display:inline-block;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:9px;text-decoration:none;font-weight:700">🎓 Apply for Admission</a></div>'
-    +'<div class="sub" style="margin-top:10px;text-align:center"><a href="/scan">🛡 Staff: open the Clearance Scanner →</a></div>'
-    +'<div style="margin-top:12px;text-align:center">🌐 '+PI18N.picker('color:#1e293b')+'</div>'
-    +'</div></div>');
+    +'<div class="hintbar">First time here, or forgot your password? <a href="#" id="recover" style="color:var(--brand);font-weight:700;text-decoration:none">Set your password →</a></div>'
+    +'<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line);text-align:center"><div class="sub" style="margin-bottom:8px">New here? Not yet a student?</div><a href="/apply" style="display:inline-block;background:var(--navy);color:#fff;padding:10px 18px;border-radius:9px;text-decoration:none;font-weight:700">🎓 Apply for Admission</a></div>'
+    // verify-credentials entrance — visible on phones too (the hero link is desktop-only)
+    +'<div style="margin-top:12px;background:#f0fdf4;border:1.5px solid #86efac;border-radius:12px;padding:11px 14px;text-align:center">'
+    +'<div style="font-weight:800;color:#14532d;font-size:13px;margin-bottom:6px">🏛 Employer · University · Government agency?</div>'
+    +'<a href="/verify-credentials" style="display:inline-block;background:#15803d;color:#fff;padding:9px 16px;border-radius:9px;text-decoration:none;font-weight:700;font-size:13px">🎓 Verify a Transcript or Certificate</a></div>'
+    +'<div class="sub" style="margin-top:8px;text-align:center"><a href="/scan">🛡 Staff: open the Clearance Scanner →</a></div>'
+    +'<div style="margin-top:12px;text-align:center;display:flex;gap:8px;align-items:center;justify-content:center">🌐 '+PI18N.picker('color:inherit')+themeBtn('')+'</div>'
+    +'</div></div>';
+  document.getElementById('app').innerHTML='';
+  const box=$('<div class="authwrap">'+hero+panel+'</div>');
   document.getElementById('app').appendChild(box);
   try{PI18N.translate(box);}catch(_){}
   if(msg){const e=box.querySelector('.err');e.textContent=msg;e.style.display='block';}
@@ -3880,36 +5051,111 @@ async function renderLogin(msg){
 // Self-service first-time / forgot-password for students & parents — proves identity with the email/phone
 // on record (no reliance on the welcome email being received), then sets a password and signs them in.
 async function recoverPassword(){
-  let b={};try{b=await(await fetch('/api/branding')).json();}catch(_){}
+  let b=await fetchBranding(1200);
   const logo=b.logo?'<img class="blogo" src="'+b.logo+'" alt="logo">':'<div class="blogo mono">'+eh((b.short||'UB').slice(0,3))+'</div>';
   document.getElementById('app').innerHTML='';
   const box=$('<div class="login"><div class="card lbox">'
     +'<div class="brandhead">'+logo+'<div><div class="uname">'+eh(b.name||'University Portal')+'</div><div class="umotto">Set / reset your password</div></div></div>'
+    // two recovery methods: a code emailed to you (forgot everything), or prove identity with a contact on file
+    +'<div class="rtabs" style="display:flex;gap:5px;background:#f1f5f9;border-radius:11px;padding:4px;margin:12px 0 14px">'
+      +'<button type="button" class="rtab" data-m="code" style="flex:1;border:0;background:#fff;border-radius:8px;padding:9px 6px;font-weight:700;font-size:12px;cursor:pointer;box-shadow:0 1px 4px rgba(15,23,42,.08)">📧 Email me a code</button>'
+      +'<button type="button" class="rtab" data-m="know" style="flex:1;border:0;background:transparent;border-radius:8px;padding:9px 6px;font-weight:700;font-size:12px;cursor:pointer;color:#475569">🔑 I have my details</button>'
+    +'</div>'
     +'<div class="err"></div><div class="ok2" style="display:none;color:#166534;background:#dcfce7;border-radius:9px;padding:10px 12px;margin-bottom:10px;font-size:13px"></div>'
-    +'<div class="sub" style="margin-bottom:10px;font-size:12.5px">Prove it is you with the email or phone number the school has on file, then choose a new password.</div>'
-    +'<div class="field"><label>I am a</label><select id="who"><option value="student">Student</option><option value="parent">Parent / Guardian</option></select></div>'
-    +'<div class="field"><label>Matric number / username</label><input id="rlg" autofocus></div>'
-    +'<div class="field"><label>Email or phone on your record</label><input id="rvf" placeholder="email or phone the school has for you"></div>'
-    +'<div class="field"><label>New password</label><input id="rpw" type="password" autocomplete="new-password"></div>'
-    +'<button class="btn" id="rgo">Set my password</button>'
-    +'<div class="sub" style="margin-top:12px;text-align:center"><a href="#" id="rback">← Back to sign in</a></div>'
+    // --- METHOD A: email a reset code (works even if you forgot your username too) ---
+    +'<div class="m-code">'
+      +'<div class="sub" style="margin-bottom:10px;font-size:12.5px">Forgot your username too? Enter your matric number, username or email and we will email a 6-digit code to the address the school has on file.</div>'
+      +'<div class="field"><label>Matric no · Username · Email</label><input id="clg" autocomplete="username"></div>'
+      +'<button class="btn" id="csend">Send code</button>'
+      +'<div class="codestep" style="display:none;margin-top:14px;border-top:1px solid rgba(148,163,184,.3);padding-top:14px">'
+        +'<div class="sub" id="chint" style="margin-bottom:10px;font-size:12.5px"></div>'
+        +'<div class="field"><label>6-digit code</label><input id="ccode" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="••••••"></div>'
+        +'<div class="field"><label>New password</label><input id="cpw" type="password" autocomplete="new-password"></div>'
+        +'<button class="btn" id="cverify">Verify &amp; set password</button>'
+        +'<div class="sub" style="margin-top:8px;text-align:center"><a href="#" id="cresend">Didn’t get it? Send again</a></div>'
+      +'</div>'
+    +'</div>'
+    // --- METHOD B: instant recovery by proving a contact on file ---
+    +'<div class="m-know" style="display:none">'
+      +'<div class="sub" style="margin-bottom:10px;font-size:12.5px">Prove it is you with the email or phone number the school has on file, then choose a new password.</div>'
+      +'<div class="field"><label>I am a</label><select id="who"><option value="student">Student</option><option value="parent">Parent / Guardian</option></select></div>'
+      +'<div class="field"><label>Matric number / username</label><input id="rlg"></div>'
+      +'<div class="field"><label>Email or phone on your record</label><input id="rvf" placeholder="email or phone the school has for you"></div>'
+      +'<div class="field"><label>New password</label><input id="rpw" type="password" autocomplete="new-password"></div>'
+      +'<button class="btn" id="rgo">Set my password</button>'
+    +'</div>'
+    +'<div class="sub" style="margin-top:14px;text-align:center;line-height:1.9"><a href="#" id="fuser">Forgot your username?</a><br><a href="#" id="rback">← Back to sign in</a></div>'
     +'</div></div>');
   document.getElementById('app').appendChild(box);
-  const go=async()=>{
-    const e=box.querySelector('.err');e.style.display='none';
+  const err=box.querySelector('.err'),ok=box.querySelector('.ok2');
+  const showErr=(m)=>{ok.style.display='none';err.textContent=m;err.style.display='block';};
+  const clearMsg=()=>{err.style.display='none';ok.style.display='none';};
+  // sign the recovered account in and open the portal
+  const finishLogin=async(username,password)=>{
+    ok.style.display='none';ok.textContent='✓ Done! Your username is '+username+'. Signing you in…';ok.style.display='block';
+    const lr=await api('/api/login',{method:'POST',body:JSON.stringify({login:username,password:password})});
+    if(lr.ok){TOKEN=lr.token;localStorage.setItem('ubu_token',TOKEN);setTimeout(renderApp,700);}else{setTimeout(function(){renderLogin('Password set — please sign in.');},1200);}
+  };
+  // method switch
+  box.querySelectorAll('.rtab').forEach(function(t){t.onclick=function(){
+    clearMsg();
+    box.querySelectorAll('.rtab').forEach(function(x){var on=x===t;x.style.background=on?'#fff':'transparent';x.style.color=on?'':'#475569';x.style.boxShadow=on?'0 1px 4px rgba(15,23,42,.08)':'none';});
+    box.querySelector('.m-code').style.display=t.getAttribute('data-m')==='code'?'':'none';
+    box.querySelector('.m-know').style.display=t.getAttribute('data-m')==='know'?'':'none';
+  };});
+  // METHOD A — send code
+  const sendCode=async()=>{
+    clearMsg();
+    const login=box.querySelector('#clg').value.trim();
+    if(!login){showErr('Enter your matric number, username or email.');return;}
+    const btn=box.querySelector('#csend');btn.disabled=true;btn.textContent='Sending…';
+    const r=await api('/api/portal/reset-request',{method:'POST',body:JSON.stringify({login:login})});
+    btn.disabled=false;btn.textContent='Send code';
+    if(!r.ok){showErr(r.error||'Could not send a code.');return;}
+    box.querySelector('.codestep').style.display='block';
+    box.querySelector('#chint').textContent='We emailed a 6-digit code to '+(r.hint||'the address on your record')+'. Enter it below with a new password.';
+    box.querySelector('#ccode').focus();
+  };
+  box.querySelector('#csend').onclick=sendCode;
+  box.querySelector('#cresend').onclick=function(ev){ev.preventDefault();sendCode();};
+  // METHOD A — verify code + set password
+  box.querySelector('#cverify').onclick=async()=>{
+    clearMsg();
+    const login=box.querySelector('#clg').value.trim(),code=box.querySelector('#ccode').value.trim(),password=box.querySelector('#cpw').value;
+    if(!code||!password){showErr('Enter the code and a new password.');return;}
+    const btn=box.querySelector('#cverify');btn.disabled=true;btn.textContent='Verifying…';
+    const r=await api('/api/portal/reset-confirm',{method:'POST',body:JSON.stringify({login:login,code:code,password:password})});
+    btn.disabled=false;btn.textContent='Verify & set password';
+    if(!r.ok){showErr(r.error||'Could not reset your password.');return;}
+    finishLogin(r.username,password);
+  };
+  // METHOD B — instant recovery
+  box.querySelector('#rgo').onclick=async()=>{
+    clearMsg();
     const login=box.querySelector('#rlg').value.trim(),verify=box.querySelector('#rvf').value.trim(),password=box.querySelector('#rpw').value,role=box.querySelector('#who').value;
-    if(!login||!verify||!password){e.textContent='Please fill in all the fields.';e.style.display='block';return;}
+    if(!login||!verify||!password){showErr('Please fill in all the fields.');return;}
     const btn=box.querySelector('#rgo');btn.disabled=true;btn.textContent='Setting…';
     const r=await api('/api/portal/recover',{method:'POST',body:JSON.stringify({login:login,verify:verify,password:password,role:role})});
     btn.disabled=false;btn.textContent='Set my password';
-    if(!r.ok){e.textContent=r.error||'Could not set your password.';e.style.display='block';return;}
-    const ok=box.querySelector('.ok2');ok.textContent='✓ Done! Your username is '+r.username+'. Signing you in…';ok.style.display='block';
-    const lr=await api('/api/login',{method:'POST',body:JSON.stringify({login:r.username,password:password})});
-    if(lr.ok){TOKEN=lr.token;localStorage.setItem('ubu_token',TOKEN);setTimeout(renderApp,700);}else{setTimeout(function(){renderLogin('Password set — please sign in.');},1200);}
+    if(!r.ok){showErr(r.error||'Could not set your password.');return;}
+    finishLogin(r.username,password);
   };
-  box.querySelector('#rgo').onclick=go;
+  // Forgot username → email it to the address on file
+  box.querySelector('#fuser').onclick=async function(ev){
+    ev.preventDefault();clearMsg();
+    const email=prompt('Enter the email address the school has on your record — we will email your username to it:');
+    if(email===null)return;
+    if(!/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(email.trim())){showErr('Enter a valid email address.');return;}
+    await api('/api/portal/username-reminder',{method:'POST',body:JSON.stringify({email:email.trim()})});
+    ok.textContent='✓ If that email is on our records, we have emailed your username to it. Check your inbox (and spam).';ok.style.display='block';
+  };
   box.querySelector('#rback').onclick=function(ev){ev.preventDefault();renderLogin();};
-  box.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',function(e){if(e.key==='Enter')go();}));
+  box.querySelectorAll('input').forEach(i=>i.addEventListener('keydown',function(e){if(e.key!=='Enter')return;
+    // Enter triggers the primary action of the visible method
+    if(box.querySelector('.m-code').style.display!=='none'){ if(box.querySelector('.codestep').style.display!=='none')box.querySelector('#cverify').click(); else box.querySelector('#csend').click(); }
+    else box.querySelector('#rgo').click();
+  }));
+  try{PI18N.translate(box);}catch(_){}
 }
 
 // ---- NATIVE NOTIFICATIONS (Android/iOS app) -------------------------------
@@ -3954,22 +5200,102 @@ if(NATIVE&&NATIVE.addListener){try{NATIVE.addListener('localNotificationActionPe
 // Android hardware BACK button: navigate within the app (back to Overview) instead of closing it.
 (function(){var A=window.Capacitor&&window.Capacitor.Plugins&&window.Capacitor.Plugins.App;if(!A||!A.addListener)return;try{A.addListener('backButton',function(){try{var seg=window.__seg||'overview';if(seg&&seg!=='overview'&&window.__goSeg){window.__goSeg('overview');return;}if(A.minimizeApp)A.minimizeApp();else if(A.exitApp)A.exitApp();}catch(_){}});}catch(_){}})();
 
-async function renderApp(){
-  const r=await api('/api/data');
-  if(!r.ok){return logout();}
-  const d=r.data;
-  const app=document.getElementById('app');app.innerHTML='';
-  app.appendChild($('<div class="top"><div class="nm">'+(d.institution||'UniBursar')+'</div><div class="rl">'+(d.profile&&d.profile.full_name?d.profile.full_name+' · ':'')+d.role+' <span class="live">● live</span></div>'+PI18N.picker('margin-left:14px')+'<button class="btn sm ghost" style="margin-left:10px" onclick="changePassword()">🔑 Password</button><button class="btn sm ghost" style="margin-left:8px" onclick="logout()">Sign out</button></div>'));
+// Signature of the last-rendered data — a live "version" bump is GLOBAL (any change anywhere in the
+// institution bumps it), so most bumps are irrelevant to this one student. We only rebuild the DOM
+// when the data THIS user actually sees has changed, which stops the constant full-page reloads.
+let LAST_SIG='';
+function dataSig(d){try{return JSON.stringify(d);}catch(_){return String(Date.now());}}
+// opts.data — pre-fetched payload (skips a round-trip); opts.bg — silent live refresh (no scroll jump,
+// no entrance animation); opts.keepVer — caller already set VER.
+let RETRY_T=null;
+// Shown when there is no session data to paint AND the server is unreachable — the student is NOT
+// logged out (their token is fine); we keep retrying until the connection returns.
+function renderRetry(){
+  const app=document.getElementById('app');
+  app.innerHTML='<div class="login"><div class="card lbox" style="text-align:center"><div style="font-size:44px">📡</div><h2 style="margin:8px 0 4px;font-size:18px">Cannot reach the server</h2><div class="sub" style="margin-bottom:14px">Check your connection. We will keep retrying automatically.</div><button class="btn" onclick="renderApp()">Retry now</button></div></div>';
+  try{PI18N.translate(app);}catch(_){}
+  if(RETRY_T)clearTimeout(RETRY_T);
+  RETRY_T=setTimeout(function(){renderApp();},6000);
+}
+async function renderApp(opts){
+  opts=opts||{};
+  if(RETRY_T){clearTimeout(RETRY_T);RETRY_T=null;}
+  let d=opts.data;
+  if(!d){
+    const r=await api('/api/data');
+    if(r&&r.ok){ d=r.data; saveCache(d); setOffline(false); }
+    else if(r&&r.__status===401){ return logout('Your session has expired — please sign in again.'); }
+    else { // offline or a server hiccup: fall back to the last-good data instead of kicking the student out
+      const c=dataCache();
+      if(c){ d=c; setOffline(true); }
+      else return renderRetry();
+    }
+  }
+  LAST_SIG=dataSig(d);
+  window.__renderBg=!!opts.bg;   // studentView.show() reads this to avoid scroll-jumping on a live refresh
+  const app=document.getElementById('app');
+  if(opts.bg)app.classList.add('bgswap'); else app.classList.remove('bgswap');
+  app.innerHTML='';
+  app.appendChild($('<div class="top"><div class="nm">'+eh(d.institution||'UniBursar')+'</div><div class="rl">'+(d.profile&&d.profile.full_name?eh(d.profile.full_name)+' · ':'')+eh(d.role||'')+' <span class="live">● live</span></div>'+PI18N.picker('margin-left:14px')+themeBtn('margin-left:8px')+'<button class="btn sm ghost" style="margin-left:8px" onclick="changePassword()">🔑 Password</button><button class="btn sm ghost" style="margin-left:8px" onclick="logout()">Sign out</button></div>'));
   const w=$('<div class="wrap"></div>');app.appendChild(w);
   if(d.kind==='student')studentView(w,d);
   else if(d.kind==='staff')staffView(w,d);
   else officerView(w,d);
+  w.appendChild($('<div style="margin:18px 0 8px;text-align:center;font-size:12px;color:#64748b">🏛 Employers &amp; institutions can <a href="/verify-credentials" style="color:#15803d;font-weight:700">verify a transcript or certificate here</a>.</div>'));
   try{PI18N.translate(app);}catch(_){}
   if(d.kind==='student'){mountChat();try{nativeNotify(d.notifications,(d.profile&&(d.profile.matric_no||d.profile.full_name))||'me');}catch(_){}}
-  VER=(await api('/api/version')).version||0;
-  if(TIMER)clearInterval(TIMER);
-  TIMER=setInterval(async()=>{try{const v=(await api('/api/version')).version;if(v!==VER){VER=v;var ae=document.activeElement;if(ae&&/^(SELECT|INPUT|TEXTAREA)$/.test(ae.tagName))return;renderApp();}}catch(_){}},2500);
+  window.__renderBg=false;
+  if(opts.bg)setTimeout(function(){try{app.classList.remove('bgswap');}catch(_){}},520);
+  if(!opts.keepVer){try{VER=(await api('/api/version')).version||0;}catch(_){}}
+  startPoll();
 }
+let POLLING=false;
+async function pollOnce(){
+  if(POLLING)return; POLLING=true;
+  try{
+    // Tab backgrounded → skip WITHOUT consuming the version, so we still catch up the moment the
+    // student returns to the tab (below, on visibilitychange). Also never fight a form being typed in.
+    if(document.hidden)return;
+    var ae=document.activeElement;
+    if(ae&&/^(SELECT|INPUT|TEXTAREA)$/.test(ae.tagName))return;
+    const vr=await api('/api/version');
+    if(vr&&vr.__net){setOffline(true);return;}                     // offline: keep the page, show the pill, retry next tick
+    setOffline(false);
+    if(vr.version===VER)return;                                    // nothing changed anywhere → nothing to do
+    const r=await api('/api/data');
+    if(r&&r.__status===401)return logout('Your session has expired — please sign in again.');
+    if(!r||!r.ok)return;
+    VER=vr.version;
+    saveCache(r.data);
+    if(dataSig(r.data)===LAST_SIG)return;                          // this student's data is unchanged → NO reload
+    const y=window.scrollY||window.pageYOffset||0;
+    await renderApp({data:r.data,bg:true,keepVer:true});
+    try{window.scrollTo(0,y);}catch(_){}                           // stay exactly where the student was
+  }catch(_){}finally{POLLING=false;}
+}
+// After painting from the local cache, pull fresh data ONCE in the background and swap it in
+// silently if anything changed (the cache may be hours old; the poll only reacts to version bumps
+// AFTER this baseline).
+async function refreshFromServer(){
+  try{
+    const r=await api('/api/data');
+    if(r&&r.__status===401)return logout('Your session has expired — please sign in again.');
+    if(r&&r.__net){setOffline(true);return;}
+    if(!r||!r.ok)return;
+    setOffline(false);saveCache(r.data);
+    if(dataSig(r.data)!==LAST_SIG){
+      const y=window.scrollY||window.pageYOffset||0;
+      await renderApp({data:r.data,bg:true});
+      try{window.scrollTo(0,y);}catch(_){}
+    }
+  }catch(_){}
+}
+function startPoll(){
+  if(TIMER)clearInterval(TIMER);
+  TIMER=setInterval(pollOnce,4000);
+}
+// Coming back to the tab? Check for updates immediately instead of waiting out the interval.
+if(!window.__visWired){window.__visWired=true;try{document.addEventListener('visibilitychange',function(){if(!document.hidden&&TOKEN)pollOnce();});}catch(_){}}
 function tbl(cols,rows,empty){if(!rows||!rows.length)return '<div class="empty">'+(empty||'Nothing to show.')+'</div>';return '<div class="tscroll"><table><thead><tr>'+cols.map(c=>'<th class="'+(c.r?'r':'')+'">'+c.t+'</th>').join('')+'</tr></thead><tbody>'+rows.map(row=>'<tr>'+cols.map(c=>'<td class="'+(c.r?'r':'')+'">'+c.f(row)+'</td>').join('')+'</tr>').join('')+'</tbody></table></div>';}
 function doc(path){window.open(path+(path.includes('?')?'&':'?')+'t='+encodeURIComponent(TOKEN),'_blank');}
 async function reqTranscript(kind){
@@ -3978,6 +5304,25 @@ async function reqTranscript(kind){
   try{var r=await api('/api/transcript-request',{method:'POST',body:JSON.stringify({kind:kind,purpose:purpose})});
     if(r&&r.ok){alert('Request submitted. The Registry will process it, email you a signed copy and place it here for download.');renderApp();}
     else{alert((r&&r.error)||'Could not submit the request.');}}catch(e){alert('Could not submit the request right now.');}
+}
+// 📨 GRADUATE ONLY — send the selected documents to an organization via the Office of the Registrar.
+async function sendToOrg(){
+  var el=function(id){return document.getElementById(id);};
+  var orgType=el('orgType').value, orgName=el('orgName').value.trim(), orgEmail=el('orgEmail').value.trim();
+  var docs=[].slice.call(document.querySelectorAll('.odck:checked')).map(function(x){return x.value;});
+  var msg=el('orgMsg'); msg.innerHTML='';
+  var err=function(t){msg.innerHTML='<div class="empty" style="color:#b91c1c;border-color:#fecaca;background:#fef2f2;margin-top:8px">'+t+'</div>';};
+  if(!orgName)return err('Enter the organization’s name.');
+  if(!orgEmail||orgEmail.indexOf('@')<0)return err('Enter a valid email address for the organization.');
+  if(!docs.length)return err('Tick at least one document to send.');
+  if(!confirm('Send your '+docs.join(', ')+' to '+orgName+' ('+orgEmail+')?\\n\\nThe documents are emailed by the Office of the Registrar and the send is logged.'))return;
+  el('orgSend').disabled=true; el('orgSend').textContent='Sending…';
+  try{
+    var r=await api('/api/my/send-documents',{method:'POST',body:JSON.stringify({orgType:orgType,orgName:orgName,orgEmail:orgEmail,docs:docs})});
+    if(r&&r.ok){msg.innerHTML='<div class="empty" style="color:#065f46;border-color:#a7f3d0;background:#ecfdf5;margin-top:8px">✓ '+(r.message||'Sent.')+'</div>';el('orgName').value='';el('orgEmail').value='';}
+    else err((r&&r.error)||'Could not send right now.');
+  }catch(e){err('Could not send right now — check your connection and try again.');}
+  el('orgSend').disabled=false; el('orgSend').textContent='📨 Send via the Office of the Registrar';
 }
 // Report a MISSING result or a WRONG score for a registered course. The desktop AI then locates the
 // uploaded row and auto-links it (or hands it to a staff member) — the outcome shows back here.
@@ -4059,12 +5404,61 @@ async function payFee(catEnc,currency,outstanding){
     +(providers.length?'<div style="font-size:12px;color:#64748b;margin-bottom:6px">Choose a payment method</div>':'')+provHtml
     +'<div id="payErr" style="color:#b91c1c;font-size:13px;margin-top:6px"></div>'
     +'<button id="payGo" class="btn full" style="margin-top:12px">Pay now</button>'
+    +'<button id="payBank" class="btn full ghost" style="margin-top:8px;background:#fff;color:#1e3a8a;border:1px solid #cbd5e1">🏦 Pay by bank transfer instead</button>'
     +'<div id="payManual" style="margin-top:10px"></div>'
     +'<div class="muted" style="font-size:11px;margin-top:10px;text-align:center">🔒 Payments are processed securely by the gateway. We never see your card details.</div></div>';
   document.body.appendChild(ov);
   function close(){try{document.body.removeChild(ov);}catch(_){}}
   ov.querySelector('#payX').onclick=close;
   ov.addEventListener('click',function(e){if(e.target===ov)close();});
+  // 🏦 manual bank transfer: bank details + claim form (payer, bank, date, reference, receipt upload).
+  // The AI reconciles the claim against the bank's alert emails; the receipt is issued after the
+  // accountant's second-layer approval — the student is emailed at every step.
+  ov.querySelector('#payBank').onclick=async function(){
+    var amt=parseFloat(ov.querySelector('#payAmt').value||'0')||Number(outstanding);
+    var info;try{info=await api('/api/manualpay/info');}catch(e){info={ok:false};}
+    var box=ov.firstElementChild;
+    box.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><h3 style="margin:0">🏦 Bank transfer — '+eh(cap(category))+'</h3><span id="mpX" style="cursor:pointer;font-size:22px;color:#64748b">×</span></div>'
+      +(info.enabled?('<div class="ok" style="text-align:left;font-size:13px;margin-bottom:10px"><b>Transfer to:</b><br>'+eh(info.bank).replace(/\\n/g,'<br>')+'</div>'):'<div class="muted" style="font-size:13px;margin-bottom:10px">Ask the Bursary for the bank account details, then declare your transfer below.</div>')
+      +'<div class="muted" style="font-size:12px;margin-bottom:10px">After transferring, fill this in EXACTLY as it appears on your bank receipt. 💡 Put your <b>matric number</b> in the transfer narration — payments match instantly.</div>'
+      +'<label style="font-size:12px;color:#64748b">Amount transferred ('+eh(currency)+') *</label><input id="mpAmt" type="number" min="1" step="0.01" value="'+amt+'" style="width:100%;border:1px solid #cbd5e1;border-radius:10px;padding:10px;margin:4px 0 10px;box-sizing:border-box">'
+      +'<label style="font-size:12px;color:#64748b">Name on the account that paid *</label><input id="mpPayer" style="width:100%;border:1px solid #cbd5e1;border-radius:10px;padding:10px;margin:4px 0 10px;box-sizing:border-box">'
+      +'<label style="font-size:12px;color:#64748b">Bank transferred from</label><input id="mpBank" style="width:100%;border:1px solid #cbd5e1;border-radius:10px;padding:10px;margin:4px 0 10px;box-sizing:border-box">'
+      +'<label style="font-size:12px;color:#64748b">Date of transfer</label><input id="mpDate" type="date" style="width:100%;border:1px solid #cbd5e1;border-radius:10px;padding:10px;margin:4px 0 10px;box-sizing:border-box">'
+      +'<label style="font-size:12px;color:#64748b">Transaction reference / session ID (from your bank alert)</label><input id="mpRef" style="width:100%;border:1px solid #cbd5e1;border-radius:10px;padding:10px;margin:4px 0 10px;box-sizing:border-box">'
+      +'<label style="font-size:12px;color:#64748b">Payment receipt (photo or PDF) *</label><input id="mpFile" type="file" accept="image/*,.pdf" style="width:100%;margin:4px 0 10px">'
+      +'<div id="mpErr" style="color:#b91c1c;font-size:13px;margin-top:2px"></div>'
+      +'<button id="mpGo" class="btn full" style="margin-top:8px">Submit for verification</button>'
+      +'<div class="muted" style="font-size:11px;margin-top:8px;text-align:center">The AI checks the bank\\'s alerts every 30 minutes and emails you at every step. Your receipt appears here once the Bursary approves.</div>';
+    box.querySelector('#mpX').onclick=close;
+    box.querySelector('#mpGo').onclick=async function(){
+      var ee=box.querySelector('#mpErr');ee.textContent='';
+      var a2=parseFloat(box.querySelector('#mpAmt').value||'0');
+      var payer=box.querySelector('#mpPayer').value.trim();
+      var f=box.querySelector('#mpFile').files&&box.querySelector('#mpFile').files[0];
+      if(!(a2>0)){ee.textContent='Enter the exact amount you transferred.';return;}
+      if(!payer){ee.textContent='Enter the name on the account that made the transfer.';return;}
+      if(!f){ee.textContent='Attach your payment receipt (photo or PDF).';return;}
+      if(f.size>6*1024*1024){ee.textContent='That file is larger than 6MB — take a clearer, smaller photo.';return;}
+      var go=box.querySelector('#mpGo');go.disabled=true;go.textContent='Submitting…';
+      // mpCompress: photos are downscaled to ≤1600px JPEG in the browser (a 6MB camera shot becomes
+      // ~300KB) so uploads are fast and the cloud store stays light; PDFs/small files pass through.
+      var mpCompress=function(file,cb){
+        var raw=function(){var rd=new FileReader();rd.onload=function(){cb(String(rd.result),file.type||'image/jpeg');};rd.readAsDataURL(file);};
+        if(!/^image\\//.test(file.type||'')||file.size<600000)return raw();
+        var url=URL.createObjectURL(file);var img=new Image();
+        img.onload=function(){try{var sc=Math.min(1,1600/Math.max(img.width,img.height));var cv=document.createElement('canvas');cv.width=Math.round(img.width*sc);cv.height=Math.round(img.height*sc);cv.getContext('2d').drawImage(img,0,0,cv.width,cv.height);var out=cv.toDataURL('image/jpeg',0.82);URL.revokeObjectURL(url);cb(out,'image/jpeg');}catch(e){URL.revokeObjectURL(url);raw();}};
+        img.onerror=function(){URL.revokeObjectURL(url);raw();};
+        img.src=url;
+      };
+      mpCompress(f,async function(dataUrl,mime){
+        var r;try{r=await api('/api/manualpay/submit',{method:'POST',body:JSON.stringify({category:category,currency:currency,amount:a2,payer_name:payer,payer_bank:box.querySelector('#mpBank').value,paid_at:box.querySelector('#mpDate').value||null,reference:box.querySelector('#mpRef').value,receipt_base64:dataUrl,receipt_mime:mime,receipt_name:f.name})});}catch(e){r={ok:false,error:'Network error.'};}
+        go.disabled=false;go.textContent='Submit for verification';
+        if(!r||!r.ok){ee.textContent=(r&&r.error)||'Could not submit.';return;}
+        close();alert(r.message||'Submitted — track it under 🎫 My Tickets.');renderApp();
+      });
+    };
+  };
   ov.querySelector('#payGo').onclick=async function(){
     var amt=parseFloat(ov.querySelector('#payAmt').value||'0');
     var sel=ov.querySelector('input[name=payprov]:checked');
@@ -4181,12 +5575,12 @@ function mountChat(){
 }
 // Open a live class room (Jitsi). Navigate in the SAME webview so the app's camera/mic permission
 // applies; Jitsi's "Back to portal" returns here. name is already URL-encoded.
-function joinClass(room,subjEnc){var n=window.__lcName||encodeURIComponent('Guest');var host=window.__lcHost?'1':'0';location.href='/class/'+room+'?n='+n+'&s='+subjEnc+'&host='+host+'&t='+encodeURIComponent(TOKEN||localStorage.getItem('ubu_token')||'');}
+function joinClass(room,subjEnc){var n=window.__lcName||encodeURIComponent('Guest');var host=window.__lcHost?'1':'0';location.href=(window.__B||'')+'/class/'+room+'?n='+n+'&s='+subjEnc+'&host='+host+'&t='+encodeURIComponent(TOKEN||localStorage.getItem('ubu_token')||'');}
 // E-library: read in-app (navigate so the pdf.js viewer fills the screen; "Back" returns here) / download
-function readBook(id){location.href='/library/read/'+id+'?t='+encodeURIComponent(TOKEN);}
+function readBook(id){location.href=(window.__B||'')+'/library/read/'+id+'?t='+encodeURIComponent(TOKEN);}
 function downloadBook(id){window.open('/library/download/'+id+'?t='+encodeURIComponent(TOKEN),'_blank');}
 function goSeg(s){if(window.__goSeg)window.__goSeg(s);}
-function startExam(id){location.href='/exam/take/'+id+'?t='+encodeURIComponent(TOKEN);}
+function startExam(id){location.href=(window.__B||'')+'/exam/take/'+id+'?t='+encodeURIComponent(TOKEN);}
 async function appealFlag(id){
   var msg=prompt('Tell the exam officer why you believe this flag is a mistake (e.g. "the camera identified the wrong person" or "I was not talking"):','');
   if(msg===null)return;
@@ -4397,6 +5791,18 @@ function studentView(w,d){
   // RESULTS — list each level + semester with a downloadable PDF statement of result
   var sc=d.scores||{courses:[],semesters:[],cgpa:0,totalUnits:0};
   var myLevel=(d.profile&&d.profile.level)||'—';
+  // 📈 the student's own GPA trend — same signal the university's Academic Watch tracks, so a
+  // student can see their progress (and the effect of a comeback semester) at a glance.
+  var gpaTrend='';
+  if(sc.semesters&&sc.semesters.length){
+    var gbars=sc.semesters.map(function(sm){var g=Number(sm.gpa)||0;var pct=Math.max(3,Math.min(100,(g/5)*100));var col=g<2?'#ef4444':g<3?'#f59e0b':'#22c55e';
+      return '<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:2px"><span>'+eh([sm.session,sm.semester].filter(Boolean).join(' · ')||'—')+'</span><b style="color:'+(g<2?'#b91c1c':g>=4?'#065f46':'#0f172a')+'">'+g.toFixed(2)+'</b></div>'
+        +'<div style="height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden"><div style="height:100%;width:'+pct+'%;background:'+col+'"></div></div></div>';}).join('');
+    gpaTrend='<div class="panel"><h3>📈 My Academic Progress</h3>'
+      +'<div style="font-size:13px;margin:4px 0 10px">Cumulative GPA: <b style="font-size:19px">'+(Number(sc.cgpa)||0).toFixed(2)+'</b> · '+(sc.totalUnits||0)+' credit units earned</div>'
+      +gbars
+      +'<div class="muted" style="font-size:11.5px;margin-top:6px">Keep it climbing — the 📚 E-Library has free textbooks for every course, and your lecturers are there to help.</div></div>';
+  }
   var resultsHtml=(sc.semesters&&sc.semesters.length)?(
     '<div class="panel"><h3>My Results</h3>'
     +'<div class="muted" style="font-size:12.5px;margin-bottom:8px">Your statement of result is generated as a PDF. Pick a semester and click <b>Download PDF</b> — the document opens ready to save/print.</div>'
@@ -4444,6 +5850,7 @@ function studentView(w,d){
     +'<div id="tixBody"><div class="empty">Loading…</div></div></div>';
   html+=seg('results',
     '<h2 class="sectitle">📑 My Results</h2>'
+    +gpaTrend
     +coursesHtml
     +ticketsHtml
     +resultsHtml
@@ -4462,9 +5869,38 @@ function studentView(w,d){
   // DOCUMENTS
   var trqRows=(d.transcriptRequests||[]);
   var trqBadge=function(s){var c=s==='dispatched'?'pos':(s==='rejected'?'neg':'');return '<span class="'+c+'" style="font-weight:800">'+cap(s||'pending')+'</span>';};
+  // 📨 graduate document dispatch — send credentials to a government agency / university / employer
+  var dsp=d.dispatch||{graduated:false,docs:[],ready:false};
+  var dspHtml='';
+  if(dsp.graduated){
+    if(dsp.ready){
+      var dcks=(dsp.docs||[]).map(function(x){
+        return '<label style="display:flex;align-items:center;gap:9px;padding:8px 11px;border:1px solid var(--line,#e2e8f0);border-radius:9px;margin-bottom:6px;'+(x.available?'cursor:pointer':'opacity:.55')+'">'
+          +'<input type="checkbox" class="odck" value="'+eh(x.key)+'"'+(x.available?((x.key==='transcript'||x.key==='certificate')?' checked':''):' disabled')+' style="width:16px;height:16px">'
+          +'<span style="flex:1;font-size:13px;font-weight:600">'+eh(x.label)+'</span>'
+          +'<span class="muted" style="font-size:11px">'+(x.available?'Available':'Not issued')+'</span></label>';
+      }).join('');
+      dspHtml='<div class="panel"><h3>📨 Send My Documents to an Organization</h3>'
+        +'<div class="muted" style="font-size:12.5px;margin-bottom:8px">Send your official transcript, certificate or letters directly to a government agency, university or employer. They are emailed by the <b>Office of the Registrar</b> (never from your personal email), and every send is logged with a reference number.</div>'
+        +'<label style="display:block;font-size:12px;font-weight:700;margin:8px 0 3px">The organization is a…</label>'
+        +'<select id="orgType" style="width:100%"><option value="government">Government agency</option><option value="university">University / higher institution</option><option value="institution">Other institution</option><option value="employer">Employer</option><option value="other">Other</option></select>'
+        +'<label style="display:block;font-size:12px;font-weight:700;margin:8px 0 3px">Organization name</label>'
+        +'<input id="orgName" placeholder="e.g. Federal Ministry of Education" style="width:100%">'
+        +'<label style="display:block;font-size:12px;font-weight:700;margin:8px 0 3px">Organization email</label>'
+        +'<input id="orgEmail" type="email" placeholder="records@organization.gov" style="width:100%">'
+        +'<label style="display:block;font-size:12px;font-weight:700;margin:10px 0 5px">Documents to send</label>'
+        +dcks
+        +'<button class="btn" id="orgSend" onclick="sendToOrg()" style="margin-top:8px">📨 Send via the Office of the Registrar</button>'
+        +'<div id="orgMsg"></div></div>';
+    } else {
+      dspHtml='<div class="panel"><h3>📨 Send My Documents to an Organization</h3>'
+        +'<div class="muted" style="font-size:12.5px">Your official transcript and certificate are not yet available on your record, so documents cannot be sent to organizations yet. <b>Please contact the Office of the Registrar for help.</b></div></div>';
+    }
+  }
   html+=seg('documents',
     '<h2 class="sectitle">📂 University Documents</h2>'
     +'<div class="panel">'+tbl([{t:'Title',f:function(r){return eh(r.title||'Document');}},{t:'Type',f:function(r){return '<span class="badge">'+eh(r.category||'Document')+'</span>';}},{t:'From Office',f:function(r){return eh(r.office||'—')+(r.by?'<br><span class="muted" style="font-size:11px">'+eh(r.by)+'</span>':'');}},{t:'Date',f:function(r){return fmt(r.date);}},{t:'',r:1,f:function(r){return '<button class="btn sm" onclick="doc(\\'/doc/portal-document/'+r.id+'\\')">Download</button>';}}],d.documents,'No documents published yet.')+'</div>'
+    +dspHtml
     +'<div class="panel"><h3>Request an Official Document</h3>'
     +'<div class="muted" style="font-size:12.5px;margin-bottom:8px">Request a signed official transcript or degree certificate. The Registry processes it, emails you a copy and places it in your Documents above.</div>'
     +'<div class="qa"><button class="btn sm" onclick="reqTranscript(\\'transcript\\')">📜 Request Transcript</button><button class="btn sm" onclick="reqTranscript(\\'certificate\\')">🎓 Request Certificate</button></div>'
@@ -4521,7 +5957,7 @@ function studentView(w,d){
     // opening Updates marks everything seen → clears the unread pill
     if(s==='notifications'){ try{ if(window.__notifMax) localStorage.setItem(window.__seenKey, window.__notifMax); }catch(_){}
       var nb=navEl.querySelector('a[data-seg="notifications"] .pill'); if(nb)nb.remove(); }
-    try{window.scrollTo(0,0);}catch(_){}   // show the top of the chosen section
+    if(!window.__renderBg){try{window.scrollTo(0,0);}catch(_){}}   // top of the chosen section (but never on a silent live refresh)
   }
   window.__goSeg=show;
   Array.prototype.forEach.call(navEl.querySelectorAll('a'),function(a){a.onclick=function(){show(a.getAttribute('data-seg'));};});
@@ -4531,7 +5967,7 @@ function studentView(w,d){
 }
 function staffView(w,d){
   const p=d.profile;
-  w.appendChild($('<div class="panel"><div class="prof">'+(p.photo?'<img src="'+p.photo+'">':'<div class="ph">👤</div>')+'<div><div class="nm">'+p.full_name+' <span class="badge">'+p.type+'</span></div><div class="meta">'+(p.staff_no||'—')+' · '+(p.position||p.title||'—')+'</div><div class="meta">'+(p.department||p.faculty||'')+' · '+(p.email||'')+'</div></div></div></div>'));
+  w.appendChild($('<div class="panel"><div class="prof">'+(p.photo?'<img src="'+p.photo+'">':'<div class="ph">👤</div>')+'<div><div class="nm">'+eh(p.full_name)+' <span class="badge">'+eh(p.type)+'</span></div><div class="meta">'+eh(p.staff_no||'—')+' · '+eh(p.position||p.title||'—')+'</div><div class="meta">'+eh(p.department||p.faculty||'')+' · '+eh(p.email||'')+'</div></div></div></div>'));
   w.appendChild($('<div class="kpis"><div class="kpi"><div class="l">Base / Default Pay</div><div class="v">'+money(p.base_salary,p.currency)+'</div></div><div class="kpi"><div class="l">Payslips</div><div class="v">'+d.payslips.length+'</div></div><div class="kpi"><div class="l">Bank</div><div class="v" style="font-size:15px">'+(p.bank_name||'—')+'</div></div></div>'));
   w.appendChild($('<div class="panel"><h3>My Payslips</h3>'+tbl([{t:'Period',f:r=>r.period||'—'},{t:'Type',f:r=>cap(r.run_type||'staff')},{t:'Status',f:r=>'<span class="badge">'+cap(r.status||'draft')+'</span>'},{t:'Net Pay',r:1,f:r=>money(r.net,r.currency)},{t:'',r:1,f:r=>'<button class="btn sm" onclick="doc(\\'/doc/payslip/'+r.id+'\\')">Payslip</button>'}],d.payslips,'No payslips yet.')+'</div>'));
   // INVIGILATION — exam duties assigned to this staff member
@@ -4632,34 +6068,48 @@ function officerView(w,d){
     w.appendChild($('<div class="panel"><h3>Expense Records (all offices)</h3>'+tbl([{t:'Category',f:r=>cap(r.category)},{t:'Description',f:r=>eh(r.description||'—')},{t:'Recorded By',f:r=>eh(r.by||'—')},{t:'Date',f:r=>fmt(r.date)},{t:'Amount',r:1,f:r=>money(r.amount,r.currency)}],d.expensesList||[],'No expenses recorded yet.')+'</div>'));
   } else if(d.kind==='registrar'){
     w.appendChild($('<div class="kpis">'+kpi('My Collections',mapMoney(d.collected))+kpi('Students I Billed',d.students.length)+'</div>'));
-    w.appendChild($('<div class="panel"><h3>Students I Billed — paid vs owing</h3>'+tbl([{t:'Name',f:r=>r.full_name},{t:'Matric',f:r=>r.matric_no||'—'},{t:'Department',f:r=>r.department||'—'},{t:'Paid',r:1,f:r=>mapMoney(r.paid)},{t:'Owing',r:1,f:r=>'<span class=neg>'+mapMoney(r.owing)+'</span>'}],d.students,'You have not billed anyone yet.')+'</div>'));
+    w.appendChild($('<div class="panel"><h3>Students I Billed — paid vs owing</h3>'+tbl([{t:'Name',f:r=>eh(r.full_name)},{t:'Matric',f:r=>eh(r.matric_no||'—')},{t:'Department',f:r=>eh(r.department||'—')},{t:'Paid',r:1,f:r=>mapMoney(r.paid)},{t:'Owing',r:1,f:r=>'<span class=neg>'+mapMoney(r.owing)+'</span>'}],d.students,'You have not billed anyone yet.')+'</div>'));
   } else if(d.kind==='dean'){
     w.appendChild($('<div class="kpis">'+kpi('Faculty Collections',mapMoney(d.collected))+kpi('My Expenditure',mapMoney(d.expenses))+kpi('Students Owing',d.debtors.length)+'</div>'));
-    w.appendChild($('<div class="panel"><h3>Students Owing Faculty Fees</h3>'+tbl([{t:'Name',f:r=>r.full_name},{t:'Matric',f:r=>r.matric_no||'—'},{t:'Department',f:r=>r.department||'—'},{t:'Owing',r:1,f:r=>'<span class=neg>'+mapMoney(r.owing)+'</span>'}],d.debtors,'No student owes faculty fees.')+'</div>'));
+    w.appendChild($('<div class="panel"><h3>Students Owing Faculty Fees</h3>'+tbl([{t:'Name',f:r=>eh(r.full_name)},{t:'Matric',f:r=>eh(r.matric_no||'—')},{t:'Department',f:r=>eh(r.department||'—')},{t:'Owing',r:1,f:r=>'<span class=neg>'+mapMoney(r.owing)+'</span>'}],d.debtors,'No student owes faculty fees.')+'</div>'));
   } else if(d.kind==='affairs'&&d.clearance){
     w.appendChild($('<div class="kpis">'+kpi('Clearance Pending',d.clearance.pending)+kpi('Approved',d.clearance.approved)+kpi('Misconduct (open)',d.misconduct.open)+kpi('Misconduct (total)',d.misconduct.total)+'</div>'));
     w.appendChild($('<div class="panel"><h3>Student Affairs</h3><div class="empty">Clearance approvals and discipline are summarised above. Use the desktop app to action items.</div></div>'));
   } else {
-    w.appendChild($('<div class="panel"><div class="prof"><div class="ph">👤</div><div><div class="nm">'+((d.profile&&d.profile.full_name)||'Welcome')+'</div><div class="meta" style="text-transform:capitalize">'+(d.role||'staff')+' account</div></div></div></div>'));
+    w.appendChild($('<div class="panel"><div class="prof"><div class="ph">👤</div><div><div class="nm">'+eh((d.profile&&d.profile.full_name)||'Welcome')+'</div><div class="meta" style="text-transform:capitalize">'+eh(d.role||'staff')+' account</div></div></div></div>'));
     w.appendChild($('<div class="panel"><h3>Dashboard</h3><div class="empty">You are signed in. Your reports and tools are available in the desktop app.</div></div>'));
   }
   try{PI18N.translate(w);}catch(_){}
 }
 function kpi(l,v){return '<div class="kpi"><div class="l">'+l+'</div><div class="v">'+v+'</div></div>';}
 function cap(s){s=String(s||'');return s.charAt(0).toUpperCase()+s.slice(1).replace(/_/g,' ');}
-if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js').catch(()=>{});}
+if('serviceWorker' in navigator){navigator.serviceWorker.register((window.__B||'')+'/sw.js').catch(()=>{});}
 (function(){
-  function boot(){ if(TOKEN){renderApp().catch(()=>renderLogin());}else{renderLogin();} }
+  function boot(){
+    if(!TOKEN){renderLogin();return;}
+    // ⚡ paint INSTANTLY from the last-good data (no network wait — a cold serverless hub can take
+    // seconds), then refresh from the server in the background and swap silently if anything changed.
+    var c=dataCache();
+    if(c){ renderApp({data:c,keepVer:true}).then(function(){refreshFromServer();}).catch(function(){renderApp().catch(function(){renderLogin();});}); }
+    else renderApp().catch(function(){renderLogin();});
+  }
   // colour the portal to the institution's brand (overrides the --brand CSS variable the UI is built on)
   function applyTheme(b){ try{ var hx=/^#([0-9a-fA-F]{6})$/; var r=document.documentElement.style; var p=(b&&String(b.primary||'').trim())||''; if(hx.test(p)){r.setProperty('--brand',p);r.setProperty('--brand-rgb',[parseInt(p.slice(1,3),16),parseInt(p.slice(3,5),16),parseInt(p.slice(5,7),16)].join(','));} if(b&&hx.test(String(b.accent||'').trim()))r.setProperty('--navy',b.accent.trim()); if(b&&b.login_bg)r.setProperty('--login-bg-img','url("'+String(b.login_bg).replace(/["\\)]/g,'')+'")'); if(b&&b.favicon){var fl=document.querySelector('link[rel=icon]');if(fl)fl.href=b.favicon;} }catch(_){} }
-  // fetch branding ONCE up front → apply theme + i18n (device language choice always wins), then boot.
-  try{
-    fetch('/api/branding').then(function(r){return r.json();}).then(function(b){
-      applyTheme(b);
-      try{ if(!PI18N.hasPref()){ if(b&&b.i18n_custom){try{PI18N.merge(JSON.parse(b.i18n_custom));}catch(_){}} if(b&&b.language)PI18N.use(b.language); } }catch(_){}
-      boot();
-    }).catch(boot);
-  }catch(_){ boot(); }
+  // Boot IMMEDIATELY (theme/i18n from the cached branding), then refresh branding in the background.
+  // The old flow gated the first paint on /api/branding — on a cold serverless host that call can
+  // take 10+ seconds and the page sat BLANK. Now the splash is replaced instantly and the theme
+  // simply re-applies when fresh branding lands.
+  function applyBrand(b){
+    applyTheme(b);
+    /* 🌐 downloaded language packs: register the LANGUAGES first (so the code is known + RTL is right),
+       then their strings, then the institution default — a device choice always wins. */
+    try{ if(b&&b.i18n_langs){try{PI18N.addLangs(JSON.parse(b.i18n_langs));}catch(_){}} }catch(_){}
+    try{ if(b&&b.i18n_custom){try{PI18N.merge(JSON.parse(b.i18n_custom));}catch(_){}} }catch(_){}
+    try{ if(!PI18N.hasPref()&&b&&b.language)PI18N.use(b.language); }catch(_){}
+  }
+  try{ var cb=brandCache(); if(cb)applyBrand(cb); }catch(_){}
+  boot();
+  try{ fetchBranding(0).then(function(b){ if(b)applyBrand(b); }); }catch(_){}
 })();
 </script></body></html>`;
 
@@ -4720,6 +6170,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--blue);bo
     <div class="card hero"><h1>Apply for Admission</h1><p>Start your application online in minutes. Choose your programme, upload your documents and track your admission — all from here.</p>
       <div class="btnrow"><button class="btn" style="background:#fff;color:#1e3a8a" onclick="show('s-start')">Start New Application</button><button class="btn" style="background:transparent;border:1.5px solid #fff;color:#fff" onclick="goContinue()">Continue / Check Status</button></div></div>
     <div class="card"><h2>Choose a programme</h2><div class="muted">Browse our faculties and click the department you want to apply to.</div><div id="progs"></div></div>
+    <div class="card" style="text-align:center"><div style="font-weight:800;margin-bottom:4px">🏛 Employer, university or government agency?</div><div class="muted" style="margin-bottom:8px">Confirm a certificate or transcript issued by this institution.</div><a href="/verify-credentials" style="display:inline-block;background:#15803d;color:#fff;padding:9px 16px;border-radius:9px;text-decoration:none;font-weight:700">🎓 Verify a Transcript or Certificate</a></div>
   </div>
 
   <div class="screen" id="s-start">
@@ -5063,7 +6514,281 @@ function onCode(raw){stopCam();setStatus('Found code');doVerify($('result'),extr
 $('start').onclick=startCam;$('stop').onclick=stopCam;
 $('lk').onclick=function(){doVerify($('result'),extractCode($('code').value));};
 $('code').addEventListener('keydown',function(e){if(e.key==='Enter')doVerify($('result'),extractCode($('code').value));});
-if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(function(){});
+if('serviceWorker' in navigator)navigator.serviceWorker.register((window.__B||'')+'/sw.js').catch(function(){});
+</script></body></html>`;
+
+// 🔎 external CREDENTIAL verification — universities, government agencies and employers confirm a
+// transcript/certificate is genuine and (optionally) receive a STUDENT COPY by e-mail.
+const VERIFY_CREDENTIALS_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Verify Transcript &amp; Certificate</title><link rel="icon" href="/favicon"><meta name="theme-color" content="#0f1e3d">
+<style>*{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',system-ui,Arial,sans-serif;background:linear-gradient(180deg,#eef2f8,#e2e8f0);color:#0f172a;min-height:100vh}
+.wrap{max-width:720px;margin:0 auto;padding:0 16px 40px}
+.bar{background:#0f1e3d;color:#fff;padding:16px;font-weight:800;font-size:16px;text-align:center;letter-spacing:.3px}
+.bar small{display:block;font-weight:500;opacity:.8;font-size:12px;margin-top:2px}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:16px;box-shadow:0 8px 30px rgba(15,23,42,.07);padding:20px;margin-top:18px}
+h2{margin:0 0 4px;font-size:17px}.sub{color:#64748b;font-size:13px;margin-bottom:14px}
+label{display:block;font-size:12.5px;font-weight:600;color:#334155;margin:10px 0 4px}
+input,select{width:100%;padding:11px 12px;border:1px solid #cbd5e1;border-radius:10px;font-size:14px;background:#fff}
+.row{display:flex;gap:10px}.row>div{flex:1}
+.btn{width:100%;margin-top:16px;background:#1e3a8a;color:#fff;border:0;border-radius:11px;padding:13px;font-weight:800;font-size:15px;cursor:pointer}
+.btn:disabled{opacity:.6;cursor:default}
+.btn.g{background:#065f46}.btn.ghost{background:#fff;color:#1e3a8a;border:1.5px solid #1e3a8a}
+.err{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:10px;padding:11px 13px;font-size:13px;margin-top:12px}
+.ok{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:10px;padding:11px 13px;font-size:13px;margin-top:12px}
+.stu{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}
+.photo{width:112px;height:130px;object-fit:cover;border-radius:12px;border:3px solid #dbeafe;background:#f1f5f9;flex:none;box-shadow:0 2px 8px rgba(15,23,42,.08)}
+.photo.ph{display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:38px}
+.stu .who{flex:1;min-width:220px}
+.stu .who .nm{font-size:22px;font-weight:900;color:#0f1e3d;line-height:1.15;letter-spacing:.2px}
+.stu .who .mt{font-family:ui-monospace,Consolas,monospace;font-size:14px;font-weight:700;color:#1e3a8a;margin-top:3px;letter-spacing:.5px}
+.stu .who .prg{font-size:13.5px;color:#334155;margin-top:5px}
+.badges{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:2px 18px}
+.f{padding:7px 0;border-bottom:1px solid #f1f5f9}
+.f span{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#94a3b8;font-weight:700}
+.f b{font-size:14px;color:#0f172a}
+.sect{margin-top:18px}
+.sect .st{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:#1e3a8a;font-weight:800;margin-bottom:2px;display:flex;align-items:center;gap:7px}
+.sect .st::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,#dbeafe,transparent)}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:5px 12px;border-radius:999px;font-weight:800;font-size:12px}
+.badge.grad{background:#dcfce7;color:#166534}.badge.act{background:#fef9c3;color:#854d0e}
+.badge.cls{background:#ede9fe;color:#5b21b6}.badge.reg{background:#e0f2fe;color:#075985}
+.hr{height:1px;background:#e2e8f0;margin:18px 0}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:10px}
+.metric{background:linear-gradient(160deg,#f8fafc,#eff4fb);border:1px solid #e5edf7;border-radius:14px;padding:14px 12px;text-align:center}
+.metric .v{font-size:24px;font-weight:900;color:#1e3a8a;line-height:1.1}
+.metric .v.sm{font-size:15px;line-height:1.25}
+.metric .l{font-size:10.5px;color:#64748b;text-transform:uppercase;letter-spacing:.4px;margin-top:4px;font-weight:600}
+.note{background:#f8fafc;border:1px dashed #cbd5e1;border-radius:12px;padding:12px 14px;font-size:12.5px;color:#475569;margin-top:10px;line-height:1.55}
+.docs{display:grid;gap:8px;margin:10px 0 2px}
+.doc{display:flex;align-items:center;gap:11px;padding:11px 13px;border:1px solid #e5edf7;border-radius:11px;background:#fbfdff}
+.doc.off{opacity:.62;background:#f8fafc}
+.doc input{width:17px;height:17px;flex:none;accent-color:#065f46;cursor:pointer}
+.doc .di{flex:1}
+.doc .di .dl{font-size:13.5px;font-weight:700;color:#0f172a}
+.doc .di .ds{font-size:11px;color:#94a3b8}
+.doc .chip{font-size:10px;font-weight:800;padding:3px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.3px}
+.doc .chip.on{background:#dcfce7;color:#166534}.doc .chip.no{background:#f1f5f9;color:#94a3b8}
+.doc .meta{font-size:10.5px;color:#64748b;margin-top:3px;line-height:1.5}
+.doc .meta code{font-family:ui-monospace,Consolas,monospace;background:#f1f5f9;padding:1px 5px;border-radius:5px;color:#334155;letter-spacing:.4px;font-size:10px}
+.consent{display:flex;gap:9px;align-items:flex-start;font-weight:500;font-size:12.5px;color:#334155;margin-top:12px;line-height:1.45;cursor:pointer}
+.consent input{width:17px;height:17px;flex:none;margin-top:1px;accent-color:#1e3a8a;cursor:pointer}
+.fpbox{border:1px solid #e5edf7;border-radius:11px;padding:13px;margin-top:12px}
+.fpbox.good{background:#ecfdf5;border-color:#a7f3d0}.fpbox.bad{background:#fef2f2;border-color:#fecaca}
+.fpbox.warn{background:#fffbeb;border-color:#fde68a}
+.fpbox .ttl{font-weight:800;font-size:15px}.fpbox.good .ttl{color:#065f46}.fpbox.bad .ttl{color:#991b1b}.fpbox.warn .ttl{color:#92400e}
+.fpbox .bd{font-size:12.5px;margin-top:4px;line-height:1.55}.fpbox.good .bd{color:#065f46}.fpbox.bad .bd{color:#991b1b}.fpbox.warn .bd{color:#92400e}
+.badge.code{background:#dbeafe;color:#1e40af}.badge.new{background:#fef3c7;color:#92400e}
+.fp{font-family:ui-monospace,Consolas,monospace;font-size:13px;letter-spacing:1px;color:#0f172a;background:#fff;border:1px dashed #cbd5e1;border-radius:8px;padding:7px 10px;margin-top:7px;word-break:break-all}
+.contact{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px;font-size:13px;line-height:1.7;margin-top:12px}
+.instrow{display:flex;align-items:center;gap:11px;padding-bottom:14px;margin-bottom:16px;border-bottom:2px solid #eef2f8}
+.instrow img{width:46px;height:46px;object-fit:contain;border-radius:8px}
+.instrow .il{width:46px;height:46px;border-radius:10px;background:linear-gradient(135deg,#1e3a8a,#4338ca);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px}
+.instrow .it{font-size:15px;font-weight:800;color:#0f1e3d;line-height:1.2}
+.instrow .is{font-size:11px;color:#64748b}
+.reftag{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-top:16px;padding-top:12px;border-top:1px dashed #cbd5e1;font-size:11.5px;color:#64748b}
+.reftag b{color:#334155;font-family:ui-monospace,Consolas,monospace;letter-spacing:.5px}
+.foot{text-align:center;color:#94a3b8;font-size:11.5px;margin-top:18px}
+@media print{body{background:#fff}.bar,#formcard,#checkcard,.foot,#copy,#doclist,.pbar{display:none!important}.card{box-shadow:none;border:1px solid #cbd5e1}}
+@media(max-width:520px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:1fr}}
+</style></head><body>
+<div class="bar">🎓 Transcript &amp; Certificate Verification<small>Confirm the authenticity of an academic credential</small></div>
+<div class="wrap">
+  <div class="card" id="formcard">
+    <h2>Verify a student's credentials</h2>
+    <div class="sub">Enter your details and the student's matric number. Verification requests are logged for the institution's records.</div>
+    <label>I am verifying as</label>
+    <select id="vtype"><option value="university">A university / higher institution</option><option value="government">A government agency</option><option value="employer">An employer</option><option value="institution">Another institution</option><option value="other">Other</option></select>
+    <div class="row"><div><label>Your name</label><input id="vname" placeholder="Full name"></div><div><label>Your e-mail</label><input id="vemail" type="email" placeholder="you@organisation.org"></div></div>
+    <label>Student matric number <span style="font-weight:500;color:#64748b">— or the verification code printed on the document</span></label>
+    <input id="vmatric" placeholder="e.g. 021/0101/0023  ·  or  UB-1A2B3C4D5E" autocomplete="off">
+    <label>Purpose of verification</label>
+    <select id="vpurpose">
+      <option value="Employment / background check">Employment / background check</option>
+      <option value="Admission to a university">Admission to a university</option>
+      <option value="Immigration / visa">Immigration / visa</option>
+      <option value="Professional licensing / registration">Professional licensing / registration</option>
+      <option value="Scholarship / funding">Scholarship / funding</option>
+      <option value="Other">Other</option>
+    </select>
+    <label class="consent"><input type="checkbox" id="vconsent"> I confirm I have the student's consent, or another lawful basis, to verify their academic credentials. This verification will be logged.</label>
+    <button class="btn" id="go">🔎 Verify credentials</button>
+    <div id="msg"></div>
+  </div>
+
+  <div class="card" id="checkcard">
+    <h2>🔐 Check a document you received</h2>
+    <div class="sub">Upload the transcript or certificate PDF you were given — <b>that alone is enough</b>. We fingerprint the file and match it against what the registry actually issued, so an altered grade or a forged copy is caught instantly. Add the matric number only if you also want us to confirm the document belongs to the person you were told it does.</div>
+    <label>The document file (PDF)</label>
+    <input id="cfile" type="file" accept="application/pdf,image/*">
+    <label>Student matric number <span style="font-weight:500;color:#64748b">— optional</span></label>
+    <input id="cmatric" placeholder="Leave blank to identify the document from the file alone" autocomplete="off">
+    <button class="btn g" id="cgo">🔐 Check this document</button>
+    <div id="ckmsg"></div>
+  </div>
+
+  <div id="result"></div>
+  <div class="note" style="max-width:none">🛡 <b>How this verification works.</b> A genuine record here confirms the student exists in the institution's official database with the identity, programme and (where released) academic standing shown. Each issued document carries a unique verification code and a tamper-evident fingerprint, so you can verify three ways: by <b>matric number</b>, by the <b>verification code printed on the document</b>, or by <b>uploading the file itself</b> — the upload needs nothing else, and reports whether the document is authentic, altered, superseded by a re-issue, or genuine but belonging to a different student. Always cross-check the photo and matric number, and treat any document that fails the fingerprint check as suspect.</div>
+  <div class="foot">Powered securely · results reflect the institution's official records.</div>
+</div>
+<script>
+var el=function(id){return document.getElementById(id)};
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[m]})}
+var LAST=null;
+async function verify(){
+  var matric=el('vmatric').value.trim(), email=el('vemail').value.trim(), name=el('vname').value.trim(), vtype=el('vtype').value;
+  var purpose=el('vpurpose').value, consent=el('vconsent').checked;
+  el('msg').innerHTML='';
+  if(!matric){el('msg').innerHTML='<div class="err">Enter the student matric number, or the verification code printed on the document.</div>';return}
+  if(!email||email.indexOf('@')<0){el('msg').innerHTML='<div class="err">Enter a valid e-mail address.</div>';return}
+  if(!consent){el('msg').innerHTML='<div class="err">Please tick the consent confirmation to continue.</div>';return}
+  el('go').disabled=true; el('go').textContent='Checking…';
+  try{
+    var r=await fetch('/api/verify-credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({matric:matric,email:email,name:name,verifierType:vtype,purpose:purpose,consent:consent})});
+    var d=await r.json();
+    if(!d.ok){el('msg').innerHTML='<div class="err">'+esc(d.error||'Something went wrong.')+'</div>';}
+    else if(!d.valid){render_notfound(d.contact||{});}
+    else {LAST={matric:matric,email:email,name:name};render_student(d);}
+  }catch(e){el('msg').innerHTML='<div class="err">Network error. Please try again.</div>';}
+  el('go').disabled=false; el('go').textContent='🔎 Verify credentials';
+}
+// 🔐 tamper check — hash the uploaded file in the browser is not needed; the server hashes the bytes
+// and compares to the issued document. We just ship the file as base64.
+function fileToB64(file){return new Promise(function(resolve,reject){var fr=new FileReader();fr.onerror=function(){reject(new Error('read failed'))};fr.onload=function(){resolve(String(fr.result).replace(/^data:[^;]+;base64,/,''))};fr.readAsDataURL(file);});}
+function fpbox(kind,title,body,fp){
+  return '<div class="fpbox '+kind+'"><div class="ttl">'+title+'</div><div class="bd">'+body+'</div>'+(fp?'<div class="fp">'+esc(fp)+'</div>':'')+'</div>';
+}
+async function checkFile(){
+  // the matric is OPTIONAL — the file's own fingerprint identifies it
+  var matric=el('cmatric').value.trim(), f=el('cfile').files[0];
+  el('ckmsg').innerHTML='';
+  if(!f){el('ckmsg').innerHTML='<div class="err">Choose the document file you received.</div>';return}
+  // 15 MB, matching the server: base64 inflates by ~4/3 and the hub destroys bodies over 24 MB, so a
+  // bigger file dies as an unexplained "network error" instead of this message.
+  if(f.size>15*1024*1024){el('ckmsg').innerHTML='<div class="err">That file is too large (max 15 MB). Please contact the Registry to verify a larger document.</div>';return}
+  el('cgo').disabled=true; el('cgo').textContent='Checking…';
+  try{
+    var b64=await fileToB64(f);
+    var r=await fetch('/api/verify-credentials/check-file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({matric:matric,file:b64})});
+    var d=await r.json();
+    var who=d.student?('<b>'+esc(d.student.name)+'</b> ('+esc(d.student.matric)+')'):'';
+    if(!d.ok){el('ckmsg').innerHTML='<div class="err">'+esc(d.error||'Something went wrong.')+'</div>';}
+    else if(!d.valid){el('ckmsg').innerHTML='<div class="err"><b>❌ Matric number not valid.</b> No student matches that matric number.</div>';}
+    // 🚩 the file is genuine but the holder is NOT who it was presented as — the sharpest fraud signal here
+    else if(d.identified&&d.mismatch){el('ckmsg').innerHTML=fpbox('bad','🚩 Genuine document — but NOT this student',
+      'These bytes are a real <b>'+esc(d.document.label)+'</b> issued by this institution, but it belongs to '+who+' — <b>not</b> to '+(d.claimed?'<b>'+esc(d.claimed.name)+'</b> ('+esc(d.claimed.matric)+')':'the matric number you entered')+'. A genuine document presented under someone else\\'s name is a serious misrepresentation — please contact the Registry.',d.fingerprint);}
+    // ♻ genuine, but the registry has since re-issued this credential
+    else if(d.identified&&d.superseded){el('ckmsg').innerHTML=fpbox('warn','♻ Genuine — but superseded',
+      'This is an authentic <b>'+esc(d.document.label)+'</b> issued for '+who+(d.document.issuedAt?' on '+esc(fmtWhen(d.document.issuedAt)):'')+', but the registry has since <b>re-issued</b> it'+(d.supersededAt?' ('+esc(fmtWhen(d.supersededAt))+')':'')+'. The copy you hold is genuine but out of date — ask for the current version. Code <b>'+esc(d.document.code)+'</b>.',d.fingerprint);}
+    else if(d.identified){el('ckmsg').innerHTML=fpbox('good','✓ Genuine &amp; unaltered',
+      'This is the exact <b>'+esc(d.document.label)+'</b> the registry issued for '+who+(d.document.issuedAt?' on '+esc(fmtWhen(d.document.issuedAt)):'')+'. Document code <b>'+esc(d.document.code)+'</b>.'+(d.seal&&d.seal.valid?' The document\\'s embedded security seal also verified.':''),d.fingerprint);}
+    // 🫥 a SPECIFIC issued document whose bytes no longer match — altered/re-saved since issue
+    else if(d.sealIdentified&&d.altered){el('ckmsg').innerHTML=fpbox('bad','⚠ Issued document — content ALTERED',
+      'This file carries this institution\\'s embedded security seal for a genuine <b>'+esc(d.document.label)+'</b>'+(who?' issued for '+who:'')+(d.document.issuedAt?' on '+esc(fmtWhen(d.document.issuedAt)):'')+', but its content no longer matches what the registry issued — the document has been <b>altered or re-saved</b> since issue. Do not rely on it; request the original from the Registry'+(d.document.code?' (code <b>'+esc(d.document.code)+'</b>)':'')+'.',d.fingerprint);}
+    // 🫥 valid seal, no single stored row to byte-compare (an officer-saved copy, a translation) —
+    // origin is cryptographically confirmed, so this is a GENUINE document, not an alteration.
+    else if(d.sealIdentified){el('ckmsg').innerHTML=fpbox('good','✓ Genuine — verified by security seal',
+      'This file carries this institution\\'s valid embedded security seal for a <b>'+esc(d.document.label)+'</b>'+(who?' issued for '+who:'')+(d.document.issuedAt?' on '+esc(fmtWhen(d.document.issuedAt)):'')+'. Its origin is <b>cryptographically confirmed</b> as issued by this institution. (This is a saved/forwarded copy, so it is verified by its seal rather than by an exact byte match.)',d.fingerprint);}
+    else{
+      var extra='';
+      if(d.seal&&d.seal.present&&!d.seal.valid&&d.seal.reason==='signature')extra=' It also carries a <b>forged or doctored</b> copy of this institution\\'s security seal — treat it as fraudulent.';
+      el('ckmsg').innerHTML=fpbox('bad','⚠ Does not match an issued document',
+      'This file does not match any document this institution has issued'+(who?' for '+who:'')+'. It may have been altered, or it was never issued here — treat it as unverified and contact the Registry.'+extra,d.fingerprint);}
+  }catch(e){el('ckmsg').innerHTML='<div class="err">Network error. Please try again.</div>';}
+  el('cgo').disabled=false; el('cgo').textContent='🔐 Check this document';
+}
+function f(label,val){return '<div class="f"><span>'+esc(label)+'</span><b>'+esc(val==null||val===''?'—':val)+'</b></div>'}
+function fmtWhen(iso){try{var dt=new Date(iso);return dt.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})+' '+dt.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});}catch(e){return '';}}
+function render_student(d){
+  var s=d.student||{};
+  var inst=d.institution||{};
+  // institution header (logo + name) so the record clearly belongs to the issuing university
+  var ilogo=inst.logo?'<img src="'+esc(inst.logo)+'">':'<div class="il">'+esc((inst.short||'U').slice(0,3))+'</div>';
+  var instRow=inst.name?('<div class="instrow">'+ilogo+'<div><div class="it">'+esc(inst.name)+'</div><div class="is">Office of the Registrar · Verified academic record</div></div></div>'):'';
+  var photo=s.photo?'<img class="photo" src="'+esc(s.photo)+'">':'<div class="photo ph">👤</div>';
+  // status + class badges
+  var badges='<span class="badge '+(d.graduated?'grad':'act')+'">'+(d.graduated?'✓ Graduated':'● Active — not yet graduated')+'</span>';
+  if(d.graduated&&d.classification)badges+='<span class="badge cls">🎓 '+esc(d.classification)+'</span>';
+  if(d.recordSource==='registry')badges+='<span class="badge reg">Registry record</span>';
+  // matching by a code printed on the document proves possession of an issued credential — say so
+  if(d.matchedBy==='code')badges+='<span class="badge code">🔑 Matched by document code</span>';
+  var who='<div class="who"><div class="nm">'+esc(s.name)+'</div><div class="mt">'+esc(s.matric)+'</div>'+
+    (s.programme&&s.programme!=='—'?'<div class="prg">'+esc(s.programme)+(s.level&&s.level!=='—'?' · '+esc(s.level):'')+'</div>':'')+
+    '<div class="badges">'+badges+'</div></div>';
+  // identity + academic sections
+  var identity='<div class="sect"><div class="st">👤 Identity</div><div class="grid">'+
+    f('Date of birth',s.dob)+f('Gender',s.gender)+f('Nationality',s.nationality)+f('Status',s.status==='alumni'?'Alumnus / Graduate':s.status)+
+    '</div></div>';
+  var academic='<div class="sect"><div class="st">🎓 Academic</div><div class="grid">'+
+    f('Faculty',s.faculty)+f('Department',s.department)+
+    (s.campus?f('Campus',s.campus):'')+f('Level',s.level)+
+    f('Year of entry',d.entryYear)+f('Year of graduation',d.gradYear||(d.graduated?'—':'In progress'))+
+    '</div></div>';
+  // performance — real numbers when known, an honest note when the Registry holds them
+  var perf;
+  if(d.hasRecord){
+    perf='<div class="sect"><div class="st">📊 Academic performance</div><div class="metrics">'+
+      '<div class="metric"><div class="v">'+esc(d.cgpa)+'</div><div class="l">CGPA (of 5.00)</div></div>'+
+      '<div class="metric"><div class="v sm">'+esc(d.classification||d.standing||'—')+'</div><div class="l">Class of degree</div></div>'+
+      '<div class="metric"><div class="v">'+esc(d.totalUnits)+'</div><div class="l">Credit units'+(d.courses?' · '+esc(d.courses)+' courses':'')+'</div></div>'+
+      '</div></div>';
+  } else if(d.graduated){
+    perf='<div class="note">This student has <b>graduated</b>'+(d.classification?' with a <b>'+esc(d.classification)+'</b>':'')+'. The detailed CGPA and credit summary are held on the institution\\'s registry — request the official transcript below to receive the full academic record.</div>';
+  } else {
+    perf='<div class="note">This student is currently <b>active</b> and has <b>not yet graduated</b>. A final transcript and degree certificate become available after graduation.</div>';
+  }
+  // documents — EVERY credential document, available ones tickable, the rest shown as not-yet-issued
+  var docs=d.documents||[];
+  var anyAvail=docs.some(function(x){return x.available});
+  var docSection='';
+  if(docs.length){
+    docSection='<div class="sect"><div class="st">📨 Official documents</div>'+
+      '<div class="sub" style="margin:2px 0 4px">Tick the documents you need — the Office of the Registrar e-mails them to <b>'+esc((LAST&&LAST.email)||'your address')+'</b> (student copies are watermarked, for verification).</div>'+
+      '<div class="docs" id="doclist">'+
+      docs.map(function(x){
+        var on=!!x.available;
+        var meta=on?('<div class="meta">Issued '+(x.issuedAt?esc(fmtWhen(x.issuedAt)):'—')+(x.office?' · '+esc(x.office):'')+'<br>Code <code>'+esc(x.code||'—')+'</code>'+(x.fingerprint?' · Fingerprint <code>'+esc(x.fingerprint)+'</code>':'')+
+          // re-issued → any older printout in circulation is genuine but superseded
+          (x.reissued?'<br>♻ Re-issued '+esc(x.issues)+'× — only the copy with the code above is current':'')+'</div>'):'<div class="ds">Not yet issued for this student</div>';
+        return '<label class="doc'+(on?'':' off')+'">'+
+          '<input type="checkbox" class="dck" value="'+esc(x.key)+'"'+(on?' checked':' disabled')+'>'+
+          '<div class="di"><div class="dl">'+esc(x.label)+'</div>'+meta+'</div>'+
+          '<span class="chip '+(on?'on':'no')+'">'+(on?'Available':'—')+'</span></label>';
+      }).join('')+
+      '</div>'+
+      (anyAvail?'<button class="btn g" id="copy">✉ E-mail me the selected document(s)</button><div id="cmsg"></div>':'<div class="note">No issued documents are available for this student yet. Please contact the Registry for a certified copy.</div>')+
+      '</div>';
+  }
+  el('result').innerHTML='<div class="card">'+instRow+
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><h2 style="margin:0">✓ Verified record</h2>'+
+    '<button class="btn ghost" style="width:auto;margin:0;padding:8px 14px;font-size:12.5px" onclick="window.print()">🖨 Print</button></div>'+
+    '<div class="stu">'+photo+who+'</div>'+
+    identity+academic+perf+docSection+
+    '<div class="reftag"><span>Verification reference <b>'+esc(d.ref)+'</b></span><span>Verified '+esc(fmtWhen(d.verifiedAt)||'just now')+'</span></div>'+
+    '</div>';
+  if(el('copy'))el('copy').onclick=requestCopies;
+}
+function render_notfound(c){
+  el('result').innerHTML='<div class="card"><div class="err" style="font-size:14px"><b>❌ Matric number not valid.</b><br>No student record matches the matric number you entered.</div>'+
+   '<div class="contact"><b>Please contact '+esc(c.name||'the University')+' for manual verification:</b><br>'+
+   (c.email?('✉ '+esc(c.email)+'<br>'):'')+(c.phone?('📞 '+esc(c.phone)+'<br>'):'')+(c.address?('📍 '+esc(c.address)+'<br>'):'')+(c.website?('🔗 '+esc(c.website)):'')+
+   '</div></div>';
+}
+async function requestCopies(){
+  var docs=[].slice.call(document.querySelectorAll('.dck:checked')).map(function(x){return x.value});
+  if(!docs.length){el('cmsg').innerHTML='<div class="err">Tick at least one document to receive.</div>';return}
+  el('copy').disabled=true; el('copy').textContent='Sending…'; el('cmsg').innerHTML='';
+  try{
+    var r=await fetch('/api/verify-credentials/copy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({},LAST,{docs:docs}))});
+    var d=await r.json();
+    el('cmsg').innerHTML=d.ok?('<div class="ok">✓ '+esc(d.message||'Sent.')+' Check your inbox (and spam).</div>'):('<div class="err">'+esc(d.error||'Could not send.')+'</div>');
+    if(d.ok){el('copy').textContent='✓ Sent';}else{el('copy').disabled=false;el('copy').textContent='✉ E-mail me the selected document(s)';}
+  }catch(e){el('cmsg').innerHTML='<div class="err">Network error. Please try again.</div>';el('copy').disabled=false;el('copy').textContent='✉ E-mail me the selected document(s)';}
+}
+el('go').onclick=verify;
+el('cgo').onclick=checkFile;
+el('vmatric').addEventListener('keydown',function(e){if(e.key==='Enter')verify()});
+el('cmatric').addEventListener('keydown',function(e){if(e.key==='Enter')checkFile()});
 </script></body></html>`;
 
 const VERIFY_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -5081,7 +6806,7 @@ ${RESULT_CSS}
 <div id="result"></div>
 <script>
 ${RESULT_JS}
-function resetView(){location.href='/scan';}
+function resetView(){location.href=(window.__B||'')+'/scan';}
 var el=document.getElementById('result');
 var q=new URLSearchParams(location.search);var rr=q.get('r');var pp=q.get('p');var st=q.get('student');var rsq=q.get('res');var c=q.get('c')||q.get('ref');
 document.getElementById('lk').onclick=function(){doVerify(el,extractCode(document.getElementById('code').value));};

@@ -94,6 +94,36 @@ It's a real Linux server that never sleeps with a persistent disk — ideal for 
 when no desktop is online. (Avoid **Cloud Run** for the hub: it scales to zero and has an
 ephemeral filesystem, so the data store wouldn't persist.)
 
+> ### ⚠️ LIVE EXAM PROCTORING on Google Cloud Run — read this
+> The live camera/audio relay is held in the **server instance's memory**. Cloud Run **autoscales to
+> many instances**, so by default the student's camera upload and the officer's monitor land on
+> **different instances** and **no camera reaches the monitor** (you'll see *"NO live camera is
+> reaching this monitor"* even though everything else works). Two fixes — pick one:
+>
+> **A) Pin to ONE instance (simplest, zero setup).** The relay is light; one instance handles a whole
+> class easily:
+> ```
+> gcloud run services update YOUR_SERVICE --region=YOUR_REGION \
+>   --min-instances=1 --max-instances=1 --concurrency=200
+> ```
+> (For the URL `https://uni-lab-XXXX.europe-west1.run.app` the service is `uni-lab`, region `europe-west1`.)
+>
+> **B) Shared cross-instance relay (keep autoscaling).** Set env **`EXAM_RELAY=1`** (plus the existing
+> `SUPABASE_URL`/`SUPABASE_KEY`) and create the relay table **once** in the Supabase SQL editor:
+> ```sql
+> create table if not exists public.exam_live (
+>   exam_id text not null, student_id text not null, updated_at timestamptz default now(), ts int8,
+>   audio_level real, away int, risk real, risk_level text, identity text, forfeited bool, last_event jsonb,
+>   has_jpeg bool, has_kyc bool, has_audio bool, audio_mime text, audio_ts int8,
+>   has_clip bool, clip_mime text, clip_ts int8, jpeg text, kyc text, audio text, clip text,
+>   primary key (exam_id, student_id));
+> alter table public.exam_live enable row level security;   -- the service_role key bypasses RLS
+> ```
+> Confirm at `/health` → `examRelay: true`. The officer monitor also self-detects this: if it sees the
+> service answering from multiple instance IDs with no relay, it prints the exact fix in the diagnostic bar.
+>
+> Either way, every **student device must point at the SAME public URL** the officer's monitor uses.
+
 1. **Create the VM** — Console → **Compute Engine → VM instances → Create instance**:
    - Name `unibursar-hub`; **Region** `us-central1` (or us-west1/us-east1 for free tier);
      **Machine type** `e2-micro`.
